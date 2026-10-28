@@ -164,7 +164,9 @@ fn probe(host: &BtHost, id: bt_host::LeDeviceId) -> i32 {
     let until = Instant::now() + SETTLE;
     while let Some(left) = until.checked_duration_since(Instant::now()) {
         match responses.recv_timeout(left) {
-            Ok(value) => report(&value, &mut state),
+            Ok(value) => {
+                report(&value, &mut state);
+            }
             Err(_) => break,
         }
     }
