@@ -59,6 +59,11 @@ pub(crate) fn frame(opcode: u8, parameters: &[u8]) -> Vec<u8> {
     packet
 }
 
+/// "FF03FE0117", the form of the transcripts
+pub fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
 /// The blocks of a received packet; empty when it is not a well-formed frame
 /// (wrong start byte, length mismatch, a block running past the end)
 pub fn parse(packet: &[u8]) -> Vec<Command> {
@@ -90,6 +95,13 @@ pub fn parse(packet: &[u8]) -> Vec<Command> {
 mod tests {
     use super::*;
     use crate::test_util::hex;
+
+    #[test]
+    fn hex_form_of_the_transcripts() {
+        assert_eq!(to_hex(&hex("FF03FE0117")), "FF03FE0117");
+        assert_eq!(to_hex(&[]), "");
+        assert_eq!(to_hex(&[0x0A, 0xB0]), "0AB0");
+    }
 
     #[test]
     fn packs_a_request() {

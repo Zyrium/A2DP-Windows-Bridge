@@ -10,6 +10,7 @@
 mod cli;
 mod driver;
 mod logging;
+mod qcy_probe;
 mod quit;
 mod resident;
 mod server;

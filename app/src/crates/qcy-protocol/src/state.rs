@@ -204,6 +204,63 @@ impl QcyState {
         }
     }
 
+    /// The state as printable lines (the probe command and the log)
+    pub fn summary(&self) -> Vec<String> {
+        let flag = |v: Option<bool>| match v {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "?",
+        };
+        let level = |v: Option<u8>, charging: bool| {
+            let text = v.map_or_else(|| "?".to_string(), |v| format!("{v}%"));
+            if charging { format!("{text} (charging)") } else { text }
+        };
+        let b = &self.battery;
+        vec![
+            format!(
+                "battery: left {}, right {}, case {}",
+                level(b.left, b.left_charging),
+                level(b.right, b.right_charging),
+                level(b.case, b.case_charging)
+            ),
+            format!("firmware: {}", self.firmware_version.as_deref().unwrap_or("?")),
+            format!(
+                "noise control: {}",
+                self.noise_control.map_or_else(
+                    || "?".to_string(),
+                    |n| match n.scene {
+                        Some(scene) => format!("{:?} / {scene:?} ({n})", n.mode),
+                        None => format!("{:?} ({n})", n.mode),
+                    }
+                )
+            ),
+            format!("wear detection: {} ({:?})", flag(self.wear_detection_enabled), self.wear_detection_protocol),
+            format!(
+                "game mode: {}, sleep mode: {}, LDAC: {}, multipoint: {}, wind detection: {}",
+                flag(self.game_mode),
+                flag(self.sleep_mode),
+                flag(self.ldac),
+                flag(self.multipoint),
+                flag(self.wind_detection)
+            ),
+            format!(
+                "prompt volume: {} of {}",
+                self.prompt_volume.map_or_else(|| "?".to_string(), |v| v.to_string()),
+                self.prompt_volume_max
+            ),
+            format!(
+                "auto power-off: {}",
+                match self.auto_power_off_minutes {
+                    Some(0xFFFF) => "never".to_string(),
+                    Some(m) => format!("{m} min"),
+                    None => "?".to_string(),
+                }
+            ),
+            format!("key functions: {:?}", self.key_functions),
+            format!("equalizer: preset {:?}, gains {:?}", self.equalizer_preset, self.equalizer_gains),
+        ]
+    }
+
     /// Prompt volume as a 0-100 percentage of the device's maximum
     pub fn prompt_volume_percent(&self) -> Option<u8> {
         let max = u32::from(self.prompt_volume_max.max(1));
@@ -231,6 +288,21 @@ mod tests {
             changed |= state.apply(&command);
         }
         changed
+    }
+
+    #[test]
+    fn summary_of_the_transcript() {
+        let mut s = QcyState::default();
+        assert!(s.summary().iter().any(|l| l == "firmware: ?"));
+        feed(&mut s, "FF051703010302");
+        feed(&mut s, "FF03230101");
+        feed(&mut s, "FF061404FFFF0000");
+        s.apply_battery_characteristic(&[0x80 | 50, 40, 0]);
+        let text = s.summary().join("\n");
+        assert!(text.contains("battery: left 50% (charging), right 40%, case ?"), "{text}");
+        assert!(text.contains("noise control: NoiseCancellation / Noisy (010302)"), "{text}");
+        assert!(text.contains("LDAC: on"), "{text}");
+        assert!(text.contains("auto power-off: never"), "{text}");
     }
 
     #[test]

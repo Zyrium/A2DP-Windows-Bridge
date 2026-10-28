@@ -39,6 +39,25 @@ pub const REFRESH_QUERIES: [u8; 8] = [
     opcode::AUTO_POWER_OFF,
 ];
 
+/// Everything OpenQCY reads when it connects, as read-only requests (a
+/// request writes nothing to the earbuds): wearing detection, the refresh
+/// queries, battery, firmware, equalizer and key functions
+pub const STATE_QUERIES: [u8; 13] = [
+    opcode::WEARING_DETECTION,
+    opcode::NOISE_CONTROL,
+    opcode::GAME_MODE,
+    opcode::SLEEP_MODE,
+    opcode::LDAC,
+    opcode::MULTIPOINT,
+    opcode::WIND_DETECTION,
+    opcode::PROMPT_VOLUME,
+    opcode::AUTO_POWER_OFF,
+    opcode::BATTERY,
+    opcode::FIRMWARE,
+    opcode::EQUALIZER,
+    opcode::KEY_FUNCTIONS,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoiseMode {
     NoiseCancellation,
@@ -323,6 +342,24 @@ mod tests {
     use super::*;
     use crate::packet::parse;
     use crate::test_util::hex;
+
+    #[test]
+    fn state_queries_are_requests_only() {
+        // Every query is an FE request: nothing here changes a setting
+        for op in STATE_QUERIES {
+            let frame = request(op);
+            assert_eq!(&frame[..3], &[0xFF, 0x03, REQUEST_OPCODE]);
+            assert_eq!(frame[4], op);
+        }
+        // The refresh queries of OpenQCY are all in it
+        for op in REFRESH_QUERIES {
+            assert!(STATE_QUERIES.contains(&op));
+        }
+        let mut sorted = STATE_QUERIES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), STATE_QUERIES.len());
+    }
 
     #[test]
     fn requests_of_the_transcript() {

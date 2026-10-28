@@ -78,6 +78,10 @@ pub struct LeDevice {
     pub gatt_ready: bool,
     /// `le_connect` may return
     pub ready: bool,
+    /// A plain link ([`crate::BtHost::le_connect_plain`]): GATT only. No
+    /// pairing, no modules, no PACS / ASCS; the GATT cache is all that is
+    /// read. For peripherals with their own control channel (QCY earbuds).
+    pub plain: bool,
     /// Why it went down / failed (HCI / ATT / SM)
     pub last_error: u8,
 
@@ -114,6 +118,7 @@ impl LeDevice {
             secured: false,
             gatt_ready: false,
             ready: false,
+            plain: false,
             last_error: 0,
             services: Vec::new(),
             sink_pacs: Vec::new(),
@@ -771,6 +776,28 @@ impl<'a> LeCtx<'a> {
         result: Arc<Mutex<ConnectResult>>,
         done: LeDone,
     ) {
+        self.start_connect_as(addr, name, false, result, done);
+    }
+
+    /// le_connect_plain's work: the same, for a GATT-only link (no pairing)
+    pub(crate) fn start_connect_plain(
+        &mut self,
+        addr: LeAddr,
+        name: String,
+        result: Arc<Mutex<ConnectResult>>,
+        done: LeDone,
+    ) {
+        self.start_connect_as(addr, name, true, result, done);
+    }
+
+    fn start_connect_as(
+        &mut self,
+        addr: LeAddr,
+        name: String,
+        plain: bool,
+        result: Arc<Mutex<ConnectResult>>,
+        done: LeDone,
+    ) {
         if self.core.connect.is_some() {
             result.lock().unwrap_or_else(|e| e.into_inner()).error = "another LE connection is being set up".into();
             done(false);
@@ -796,6 +823,7 @@ impl<'a> LeCtx<'a> {
         if !in_progress {
             d.pair_attempts = 0;
             d.last_error = 0;
+            d.plain = plain;
             if target != addr || d.addr != addr {
                 tracing::info!(
                     "LE Audio: device {id} ({}): connecting with {target} (address type {})",
@@ -881,13 +909,50 @@ impl<'a> LeCtx<'a> {
         d.gatt_ready = false;
         d.ready = false;
         d.services.clear();
-        tracing::info!("LE Audio: LE link to {} up (handle 0x{handle:04x}), securing it", d.addr);
+        let plain = d.plain;
+        if plain {
+            tracing::info!("LE: link to {} up (handle 0x{handle:04x}), plain GATT (no pairing)", d.addr);
+        } else {
+            tracing::info!("LE Audio: LE link to {} up (handle 0x{handle:04x}), securing it", d.addr);
+        }
         self.core.gatt.attach(handle);
         if !self.stack.gatt_listen(handle) {
             tracing::warn!("LE Audio: cannot listen for notifications on 0x{handle:04x} (all slots in use)");
         }
+        if plain {
+            self.plain_discover(dev);
+            return;
+        }
         self.each_module(|m, ctx| m.on_connected(ctx, dev));
         self.stack.sm_request_pairing(handle);
+    }
+
+    /// A plain link is up: nothing secures it and no profile reads it, so
+    /// discover the GATT cache and finish the connect
+    fn plain_discover(&mut self, id: LeDeviceId) {
+        let Some(d) = self.device_mut(id) else { return };
+        // maybe_secured must not start a profile set-up if the peer encrypts
+        d.secured = true;
+        let con = d.acl;
+        self.core.gatt.discover_all(
+            con,
+            Box::new(move |ctx, status, services| {
+                if ctx.device_on(id, con).is_none() {
+                    return;
+                }
+                if status != 0 {
+                    ctx.fail_connect(id, format!("GATT discovery failed (0x{status:02x})"));
+                    return;
+                }
+                let Some(d) = ctx.device_on_mut(id, con) else { return };
+                d.services = services;
+                d.gatt_ready = true;
+                d.ready = true;
+                let chars: usize = d.services.iter().map(|s| s.chars.len()).sum();
+                tracing::info!("LE: {}: {} services, {chars} characteristics", d.addr, d.services.len());
+                ctx.finish_connect(id, true);
+            }),
+        );
     }
 
     fn fail_connect(&mut self, dev: LeDeviceId, why: String) {

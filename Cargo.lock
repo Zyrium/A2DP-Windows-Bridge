@@ -36,6 +36,7 @@ dependencies = [
  "embed-resource",
  "hci-transport",
  "ipc",
+ "qcy-protocol",
  "serde",
  "serde_json",
  "tao",

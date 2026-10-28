@@ -13,13 +13,14 @@
 //! false, empty results, errors).
 
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use le_audio::plan::StreamPlan;
 use le_audio::sdu_queue::{SduQueue, SduSet};
 
 use super::core::{ConnectResult, LeCtx, LeDone};
+use super::gatt_client::{GattChar, GattService, PROPERTY_INDICATE, PROPERTY_NOTIFY};
 use super::iso_send::queue_depth;
 use super::{
     LeAddr, LeDeviceId, LeDeviceInfo, LeScanResult, LeSduSink, LeStreamRequest, LeStreamStarted, LeStreamStats,
@@ -121,13 +122,32 @@ impl BtHost {
     /// once. `addr` may be an RPA or the identity of a bonded device: the id
     /// is the same for both. Err: why, for the log.
     pub fn le_connect(&self, addr: LeAddr, name: &str, timeout: Duration) -> Result<LeDeviceId, String> {
+        self.le_connect_as(addr, name, timeout, false)
+    }
+
+    /// Connects for GATT only: no pairing, no encryption request, no
+    /// profile modules, no PACS / ASCS. Returns once the GATT cache is read
+    /// ([`BtHost::le_gatt_services`]); use the `le_gatt_*` calls from there.
+    /// For peripherals with their own control channel that is open without
+    /// bonding. [`BtHost::le_disconnect`] ends it.
+    pub fn le_connect_plain(&self, addr: LeAddr, name: &str, timeout: Duration) -> Result<LeDeviceId, String> {
+        self.le_connect_as(addr, name, timeout, true)
+    }
+
+    fn le_connect_as(&self, addr: LeAddr, name: &str, timeout: Duration, plain: bool) -> Result<LeDeviceId, String> {
         if !self.le_ready() {
             return Err("LE Audio is not running".into());
         }
-        tracing::info!("LE Audio: connecting to {addr} (address type {})", addr.addr_type);
+        tracing::info!(
+            "LE Audio: connecting to {addr} (address type {}{})",
+            addr.addr_type,
+            if plain { ", plain GATT" } else { "" }
+        );
         let result = Arc::new(Mutex::new(ConnectResult::default()));
         let (r, name) = (result.clone(), name.to_string());
-        let ok = self.le_wait(timeout, true, move |ctx, done| ctx.start_connect(addr, name, r, done));
+        let ok = self.le_wait(timeout, true, move |ctx, done| {
+            if plain { ctx.start_connect_plain(addr, name, r, done) } else { ctx.start_connect(addr, name, r, done) }
+        });
         let (id, error) = {
             let r = result.lock().unwrap_or_else(|e| e.into_inner());
             (r.id, r.error.clone())
@@ -155,6 +175,119 @@ impl BtHost {
                 });
                 Err(error)
             }
+        }
+    }
+
+    /// The GATT cache of a connected device (services with their
+    /// characteristics); empty while it is not connected
+    pub fn le_gatt_services(&self, device: LeDeviceId) -> Vec<GattService> {
+        self.le_run(RUN_TIMEOUT, move |ctx| ctx.device(device).map(|d| d.services.clone()).unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// Reads a characteristic value (long reads included). Err: why.
+    pub fn le_gatt_read(&self, device: LeDeviceId, value_handle: u16, timeout: Duration) -> Result<Vec<u8>, String> {
+        let slot: Arc<Mutex<Option<(u8, Vec<u8>)>>> = Arc::default();
+        let s = slot.clone();
+        self.le_wait(timeout, true, move |ctx, done| {
+            let Some(con) = ctx.device(device).filter(|d| d.connected()).map(|d| d.acl) else {
+                done(false);
+                return;
+            };
+            ctx.gatt().read(
+                con,
+                value_handle,
+                Box::new(move |_ctx, status, value| {
+                    *s.lock().unwrap_or_else(|e| e.into_inner()) = Some((status, value.to_vec()));
+                    done(status == 0);
+                }),
+            );
+        });
+        let got = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match got {
+            Some((0, value)) => Ok(value),
+            Some((status, _)) => Err(format!("ATT error 0x{status:02x}")),
+            None => Err("no answer (not connected, timeout or cancelled)".into()),
+        }
+    }
+
+    /// Writes a characteristic value with response (a long write when it
+    /// does not fit the MTU). Err: why.
+    pub fn le_gatt_write(
+        &self,
+        device: LeDeviceId,
+        value_handle: u16,
+        value: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let slot: Arc<Mutex<Option<u8>>> = Arc::default();
+        let s = slot.clone();
+        self.le_wait(timeout, true, move |ctx, done| {
+            let Some(con) = ctx.device(device).filter(|d| d.connected()).map(|d| d.acl) else {
+                done(false);
+                return;
+            };
+            ctx.gatt().write(
+                con,
+                value_handle,
+                value,
+                Some(Box::new(move |_ctx, status| {
+                    *s.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
+                    done(status == 0);
+                })),
+            );
+        });
+        let got = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match got {
+            Some(0) => Ok(()),
+            Some(status) => Err(format!("ATT error 0x{status:02x}")),
+            None => Err("no answer (not connected, timeout or cancelled)".into()),
+        }
+    }
+
+    /// Turns notifications (or indications, for a characteristic that only
+    /// has those) of `characteristic` on; every value goes to `values` until
+    /// the link goes down. Err: why.
+    pub fn le_gatt_subscribe(
+        &self,
+        device: LeDeviceId,
+        characteristic: GattChar,
+        values: mpsc::Sender<Vec<u8>>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let slot: Arc<Mutex<Option<u8>>> = Arc::default();
+        let s = slot.clone();
+        self.le_wait(timeout, true, move |ctx, done| {
+            let Some(con) = ctx.device(device).filter(|d| d.connected()).map(|d| d.acl) else {
+                done(false);
+                return;
+            };
+            let indications =
+                characteristic.properties & PROPERTY_INDICATE != 0 && characteristic.properties & PROPERTY_NOTIFY == 0;
+            // Listen first: a value can arrive before the CCC write is
+            // confirmed
+            ctx.gatt().listen(
+                con,
+                characteristic.value_handle,
+                Box::new(move |_ctx, value| {
+                    let _ = values.send(value.to_vec());
+                }),
+            );
+            ctx.gatt().subscribe(
+                con,
+                &characteristic,
+                indications,
+                Some(Box::new(move |_ctx, status| {
+                    *s.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
+                    done(status == 0);
+                })),
+            );
+        });
+        let got = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match got {
+            Some(0) => Ok(()),
+            Some(status) => Err(format!("ATT error 0x{status:02x}")),
+            None => Err("no answer (not connected, timeout or cancelled)".into()),
         }
     }
 

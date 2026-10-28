@@ -55,6 +55,9 @@ LE Audio (experimental, LC3 over LE isochronous channels):
   --le-preset <name>    use only this BAP configuration (e.g. 48_2_2, 16_2_1)
   --le-low-latency      GMAP low latency (7.5 / 10 ms frames) for a gaming headset
   --le-scan [seconds]   list the LE Audio devices nearby and exit
+  --qcy-probe [seconds] QCY earbuds (MeloBuds N70): scan, connect for GATT only (no
+                        pairing) and read their state with read-only queries; -d <address>
+                        picks the earbuds instead of the first N70. Changes nothing.
 
 Development / testing:
   --hci-tcp <host:port> H4 over TCP to a virtual controller (tools/emu)
@@ -110,6 +113,8 @@ struct LeArgs {
     low_latency: bool,
     /// --le-scan [seconds]
     scan: Option<u32>,
+    /// --qcy-probe [seconds]
+    qcy_probe: Option<u32>,
     mcp_dry_run: bool,
     ccp_sim: Option<String>,
     ccp_console: bool,
@@ -117,6 +122,8 @@ struct LeArgs {
 
 /// --le-scan without a time (v1 scan_seconds)
 const LE_SCAN_SECONDS: u32 = 8;
+/// --qcy-probe without a time
+const QCY_PROBE_SECONDS: u32 = 10;
 
 impl LeArgs {
     /// The stream request: --le-preset tries only that preset. GMAP low
@@ -223,6 +230,16 @@ fn parse(args: &[String]) -> Result<Args, String> {
                     _ => LE_SCAN_SECONDS,
                 };
                 a.le.scan = Some(secs);
+            }
+            "--qcy-probe" => {
+                a.le.on = true;
+                let secs = match it.peek() {
+                    Some(s) if !s.starts_with('-') => {
+                        it.next().and_then(|s| s.parse().ok()).unwrap_or(QCY_PROBE_SECONDS)
+                    }
+                    _ => QCY_PROBE_SECONDS,
+                };
+                a.le.qcy_probe = Some(secs);
             }
             "--mcp-dry-run" => a.le.mcp_dry_run = true,
             "--ccp-sim" => a.le.ccp_sim = Some(value(&mut it, "--ccp-sim")?),
@@ -656,6 +673,18 @@ fn le_run(a: &Args, service: &Service, running: &Arc<AtomicBool>) -> i32 {
         return 0;
     }
 
+    if let Some(secs) = le.qcy_probe {
+        let address = match a.device.as_deref().map(|d| (d, parse_device_address(d))) {
+            Some((d, None)) => {
+                eprintln!("Invalid address: {d}");
+                return 2;
+            }
+            Some((_, parsed)) => parsed,
+            None => None,
+        };
+        return crate::qcy_probe::run(&host, secs, address);
+    }
+
     let devices: Vec<String> = a.device.iter().chain(le.devices.iter()).cloned().collect();
     if devices.is_empty() {
         eprintln!("No LE Audio device given (-d <address>; --le-scan lists them)");
@@ -909,6 +938,18 @@ mod tests {
         assert_eq!(parse(&args("--cli --le-preset")).err().as_deref(), Some("--le-preset needs a value"));
         assert_eq!(parse(&args("--cli --le-sim-volume")).err().as_deref(), Some("--le-sim-volume needs a value"));
         assert_eq!(parse(&args("--cli --ccp-sim")).err().as_deref(), Some("--ccp-sim needs a value"));
+    }
+
+    #[test]
+    fn qcy_probe_takes_optional_seconds_and_implies_le() {
+        let a = parse(&args("--cli --qcy-probe")).unwrap();
+        assert!(a.le.on);
+        assert_eq!(a.le.qcy_probe, Some(QCY_PROBE_SECONDS));
+        assert_eq!(parse(&args("--cli --qcy-probe 4")).unwrap().le.qcy_probe, Some(4));
+        let a = parse(&args("--cli --qcy-probe -d C4:33:96:11:0C:83")).unwrap();
+        assert_eq!(a.le.qcy_probe, Some(QCY_PROBE_SECONDS));
+        assert_eq!(a.device.as_deref(), Some("C4:33:96:11:0C:83"));
+        assert_eq!(parse(&args("--cli --le-scan")).unwrap().le.qcy_probe, None);
     }
 
     #[test]
