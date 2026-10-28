@@ -1,0 +1,10 @@
+[package]
+name = "qcy-protocol"
+description = "QCY earbud control protocol (MeloBuds N70): 0xFF command framing, typed commands, advertisement and state parsing. Pure logic, no Bluetooth or Windows dependency"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

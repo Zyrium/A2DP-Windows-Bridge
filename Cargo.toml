@@ -13,6 +13,7 @@ members = [
     "app/src/crates/codec",
     "app/src/crates/audio-capture",
     "app/src/crates/le-audio",
+    "app/src/crates/qcy-protocol",
     "app/src/crates/bt-host",
     "app/src/crates/pipeline",
     "app/src/crates/core",
@@ -43,6 +44,7 @@ win-sys = { path = "app/src/crates/win-sys" }
 audio-capture = { path = "app/src/crates/audio-capture" }
 ipc = { path = "app/src/crates/ipc" }
 le-audio = { path = "app/src/crates/le-audio" }
+qcy-protocol = { path = "app/src/crates/qcy-protocol" }
 lc3-sys = { path = "app/src/crates/lc3-sys" }
 
 cc = "1.2"
