@@ -667,5 +667,11 @@
   "fones.ldac_off.confirm": "Turn LDAC off",
   "fones.cancel": "Cancel",
   "fones.applied": "Applied to the earbuds",
-  "fones.unavailable.not_implemented": "Earbud control is in development: this version of A2DP Windows Bridge does not talk to the headset yet. The audio is not affected."
+  "fones.unavailable.not_implemented": "Earbud control is in development: this version of A2DP Windows Bridge does not talk to the headset yet. The audio is not affected.",
+  "fones.read_only.title": "Read only",
+  "fones.read_only.text": "Read only: the values come from the earbuds; changing them is not available yet.",
+  "fones.read_only.first": "Click Refresh to read them (nothing is changed on the earbuds).",
+  "fones.unavailable.le_off": "Reading the earbuds needs LE in the Bluetooth stack (Settings › LE Audio, experimental). Turning it on restarts Bluetooth and the audio drops for a few seconds, so A2DPWB never does it on its own.",
+  "fones.unavailable.not_found": "The earbuds were not found over BLE. Take them out of the case (or open it) and try again. The audio is not affected.",
+  "fones.error.read_only": "This version only reads the earbuds: changing a setting is not available yet."
 }

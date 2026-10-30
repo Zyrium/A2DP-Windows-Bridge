@@ -667,5 +667,11 @@
   "fones.ldac_off.confirm": "Desligar LDAC",
   "fones.cancel": "Cancelar",
   "fones.applied": "Aplicado nos fones",
-  "fones.unavailable.not_implemented": "Controle dos fones em desenvolvimento: esta versão do A2DP Windows Bridge ainda não se comunica com os fones. O áudio não é afetado."
+  "fones.unavailable.not_implemented": "Controle dos fones em desenvolvimento: esta versão do A2DP Windows Bridge ainda não se comunica com os fones. O áudio não é afetado.",
+  "fones.read_only.title": "Somente leitura",
+  "fones.read_only.text": "Somente leitura: os valores vêm dos fones; alterar ainda não está disponível.",
+  "fones.read_only.first": "Clique em Atualizar para ler os fones (nada é alterado neles).",
+  "fones.unavailable.le_off": "Para ler os fones, o Bluetooth precisa do LE ligado (Ajustes › LE Audio, experimental). Ligar reinicia o Bluetooth e o áudio cai por alguns segundos, por isso o A2DPWB nunca faz isso sozinho.",
+  "fones.unavailable.not_found": "Os fones não foram encontrados por BLE. Tire-os do estojo (ou abra o estojo) e tente de novo. O áudio não é afetado.",
+  "fones.error.read_only": "Esta versão só lê os fones: alterar um ajuste ainda não está disponível."
 }

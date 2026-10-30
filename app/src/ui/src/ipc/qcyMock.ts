@@ -9,6 +9,10 @@ import type { QcyChange, QcyProvider, QcyState } from "./qcy";
 export interface MockQcyOptions {
   /** Start with the BLE control link failed (the yellow banner) */
   unavailable?: boolean;
+  /** Like the real build of this version: values only, set() refused */
+  readOnly?: boolean;
+  /** Start with this unavailable reason instead of gatt_failed */
+  reason?: "le_off" | "not_found" | "gatt_failed";
   /** Multiplies every delay (0 in tests) */
   speed?: number;
 }
@@ -52,14 +56,18 @@ export class MockQcy implements QcyProvider {
   private s: QcyState;
   private subs = new Set<(s: QcyState) => void>();
   private speed: number;
+  private readOnly: boolean;
   /** Changes received, for the tests */
   readonly calls: QcyChange[] = [];
 
   constructor(o: MockQcyOptions = {}) {
     this.speed = o.speed ?? 1;
     this.s = sampleQcyState();
-    if (o.unavailable) {
-      this.s.link = { state: "unavailable", reason: "gatt_failed", detail: "GATT: 0x85" };
+    this.readOnly = o.readOnly === true;
+    if (this.readOnly) this.s.read_only = true;
+    if (o.unavailable || o.reason) {
+      const reason = o.reason ?? "gatt_failed";
+      this.s.link = reason === "gatt_failed" ? { state: "unavailable", reason, detail: "GATT: 0x85" } : { state: "unavailable", reason };
       this.s.synced_at = Date.now() - 12 * 60_000;
     }
   }
@@ -84,6 +92,7 @@ export class MockQcy implements QcyProvider {
 
   async set(c: QcyChange) {
     this.calls.push(c);
+    if (this.readOnly) throw { code: "qcy.read_only", msg: { key: "fones.error.read_only", args: [] } };
     this.requireLink();
     await this.wait(c.kind === "ldac" ? 2500 : 250);
     switch (c.kind) {

@@ -592,6 +592,9 @@ pub enum Event {
     /// Subscription (diag.subscribe receiver): the receiver test, once a
     /// second and on every change
     Receiver(Box<ReceiverState>),
+    /// The QCY earbuds' state (the Fones screen, read only): the QcyState
+    /// of app/src/ui/src/ipc/qcy.ts, after every qcy.refresh / qcy.reconnect
+    Qcy(serde_json::Value),
     /// The core is shutting down
     Bye,
 }
@@ -763,6 +766,17 @@ pub enum Method {
     /// failed
     #[serde(rename = "app.check_update")]
     AppCheckUpdate,
+    /// -> the QcyState of qcy.ts: the last read of the QCY earbuds (no
+    /// Bluetooth traffic)
+    #[serde(rename = "qcy.state")]
+    QcyState,
+    /// Reads the QCY earbuds now (read-only queries only, never pairs,
+    /// never restarts the stack) -> QcyState; also sent as Event::Qcy
+    #[serde(rename = "qcy.refresh")]
+    QcyRefresh,
+    /// The same read, for "Tentar de novo" -> QcyState
+    #[serde(rename = "qcy.reconnect")]
+    QcyReconnect,
     /// The UI hid its main window to the tray: the core shows v1's "still
     /// running in the tray" balloon the first time
     #[serde(rename = "app.hidden_to_tray")]

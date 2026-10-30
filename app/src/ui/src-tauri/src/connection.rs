@@ -22,6 +22,8 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tokio::sync::{mpsc, oneshot};
 
 /// Event with every server message (JSON as the core sent it)
+/// The QCY earbuds' state for the Fones screen
+pub const QCY_EVENT: &str = "qcy://state";
 pub const MESSAGE_EVENT: &str = "ipc://message";
 /// Event with the connection [`Status`]
 pub const STATUS_EVENT: &str = "ipc://status";
@@ -393,7 +395,14 @@ async fn session(app: &AppHandle, ipc: &Ipc, pipe: NamedPipeClient) -> Ended {
                 }
                 _ => {}
             }
-            let bye = msg.pointer("/event/kind").and_then(Value::as_str) == Some("bye");
+            let kind = msg.pointer("/event/kind").and_then(Value::as_str);
+            // The Fones screen listens to its own event (ipc/qcy.ts)
+            if kind == Some("qcy")
+                && let Some(state) = msg.pointer("/event/value")
+            {
+                let _ = app.emit(QCY_EVENT, state.clone());
+            }
+            let bye = kind == Some("bye");
             let _ = app.emit(MESSAGE_EVENT, msg);
             if bye {
                 return Ended::Bye;
