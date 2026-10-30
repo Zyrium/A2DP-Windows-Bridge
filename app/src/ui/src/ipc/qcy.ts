@@ -23,7 +23,7 @@ export type QcyLink =
   /** No QCY headset in the active profile */
   | { state: "none" };
 
-export type QcyUnavailableReason = "not_found" | "gatt_failed" | "timeout" | "adapter_busy" | "other";
+export type QcyUnavailableReason = "not_found" | "gatt_failed" | "timeout" | "adapter_busy" | "not_implemented" | "other";
 
 export type NoiseMode = "off" | "anc" | "transparency";
 export type NoiseScene = "adaptive" | "indoor" | "commuting" | "noisy" | "anti_wind";
@@ -130,8 +130,45 @@ export interface QcyProvider {
   onState(cb: (s: QcyState) => void): () => void;
 }
 
+/** What the real build shows while the core has no qcy_* commands: no
+ *  headset values (nothing is made up), link unavailable/not_implemented. */
+export function placeholderQcyState(): QcyState {
+  const none = { level: null, charging: false };
+  return {
+    link: { state: "unavailable", reason: "not_implemented" },
+    device_name: "",
+    address: "",
+    firmware: null,
+    battery: { left: { ...none }, right: { ...none }, case: { ...none } },
+    noise_mode: "off",
+    noise_scene: "adaptive",
+    game_mode: false,
+    sleep_mode: false,
+    wind_reduction: false,
+    wear_detection: false,
+    ldac: false,
+    multipoint: false,
+    prompt_volume: 0,
+    prompt_volume_max: 15,
+    auto_off: null,
+    eq: { preset: "custom", gains: EQ_BANDS_HZ.map(() => 0), master_gain: 0 },
+    gestures: { left: {}, right: {} },
+    supported_gestures: [],
+    reapply_on_connect: false,
+    profile_saved_at: null,
+    synced_at: null,
+  };
+}
+
 export async function createTauriQcy(): Promise<QcyProvider> {
-  const { invoke } = await import("@tauri-apps/api/core");
+  const { invoke: raw } = await import("@tauri-apps/api/core");
+  // A core without the qcy_* commands (not written yet) rejects every
+  // call: show the placeholder (the yellow banner) instead of failing.
+  const invoke = <T,>(cmd: string, args?: Record<string, unknown>) =>
+    raw<T>(cmd, args).catch((e) => {
+      if (cmd === QCY_COMMANDS.state) return placeholderQcyState() as T;
+      throw e;
+    });
   const { listen } = await import("@tauri-apps/api/event");
   return {
     state: () => invoke<QcyState>(QCY_COMMANDS.state),
@@ -150,6 +187,11 @@ export async function createTauriQcy(): Promise<QcyProvider> {
  *  browser (pnpm dev). Inside a2dpwb.exe without the flag: the real one. */
 export async function createQcy(insideTauri: boolean): Promise<QcyProvider> {
   const flag = typeof location !== "undefined" ? new URLSearchParams(location.search).get("qcy") : null;
+  if (flag === "placeholder") {
+    // the real build without qcy_* commands, seen in a browser
+    const rej = () => Promise.reject({ code: "qcy_unavailable", msg: { key: "fones.unavailable.not_implemented", args: [] } });
+    return { state: async () => placeholderQcyState(), set: rej, refresh: rej, reconnect: rej, saveProfile: rej, onState: () => () => {} };
+  }
   if (flag || !insideTauri || import.meta.env.VITE_QCY_MOCK === "1") {
     const { MockQcy } = await import("./qcyMock");
     return new MockQcy({ unavailable: flag === "unavailable" });

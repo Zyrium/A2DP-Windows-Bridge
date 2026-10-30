@@ -32,3 +32,14 @@ describe("fones", () => {
     expect((await off.reconnect()).link.state).toBe("connected");
   });
 });
+
+import { placeholderQcyState } from "../../ipc/qcy";
+describe("placeholder (real build, no qcy_* commands)", () => {
+  it("shows no headset data and the not_implemented reason", () => {
+    const s = placeholderQcyState();
+    expect(s.link).toEqual({ state: "unavailable", reason: "not_implemented" });
+    expect(s.device_name).toBe("");
+    expect(s.battery.left.level).toBeNull();
+    expect(s.synced_at).toBeNull();
+  });
+});

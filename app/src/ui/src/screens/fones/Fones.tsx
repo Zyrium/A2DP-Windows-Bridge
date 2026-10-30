@@ -101,17 +101,17 @@ export function Fones(props: { tab?: string }) {
                 kind="warn"
                 title={ft("unavailable.title")}
                 actions={
-                  <>
+                  <Show when={!(s().link.state === "unavailable" && (s().link as { reason?: string }).reason === "not_implemented")}>
                     <Button kind="strong" busy={s().link.state === "connecting"} onClick={() => void act((q) => q.reconnect())}>
                       {ft("unavailable.retry")}
                     </Button>
                     <Button kind="subtle" onClick={() => navigate({ name: "diagnostics" })}>
                       {ft("unavailable.diag")}
                     </Button>
-                  </>
+                  </Show>
                 }
               >
-                {ft("unavailable.text")}
+                {(s().link as { reason?: string }).reason === "not_implemented" ? ft("unavailable.not_implemented") : ft("unavailable.text")}
               </Banner>
             </Show>
             <div class="fones-body" classList={{ stale: !live() }} aria-disabled={!live()} inert={!live() ? true : undefined}>

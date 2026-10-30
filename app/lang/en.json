@@ -666,5 +666,6 @@
   "fones.ldac_off.text": "The audio reconnects: it stops for a few seconds and comes back in AAC or SBC.",
   "fones.ldac_off.confirm": "Turn LDAC off",
   "fones.cancel": "Cancel",
-  "fones.applied": "Applied to the earbuds"
+  "fones.applied": "Applied to the earbuds",
+  "fones.unavailable.not_implemented": "Earbud control is in development: this version of A2DP Windows Bridge does not talk to the headset yet. The audio is not affected."
 }

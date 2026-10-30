@@ -666,5 +666,6 @@
   "fones.ldac_off.text": "O áudio vai reconectar: para por alguns segundos e volta em AAC ou SBC.",
   "fones.ldac_off.confirm": "Desligar LDAC",
   "fones.cancel": "Cancelar",
-  "fones.applied": "Aplicado nos fones"
+  "fones.applied": "Aplicado nos fones",
+  "fones.unavailable.not_implemented": "Controle dos fones em desenvolvimento: esta versão do A2DP Windows Bridge ainda não se comunica com os fones. O áudio não é afetado."
 }
