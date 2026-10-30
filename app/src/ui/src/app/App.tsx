@@ -11,6 +11,8 @@ import { lang, setLanguage, t } from "../i18n";
 import type { Core } from "../ipc/store";
 import { Adapter } from "../screens/Adapter";
 import { Diagnostics } from "../screens/Diagnostics";
+import { Fones } from "../screens/fones/Fones";
+import { ft } from "../screens/fones/strings";
 import { Flyout } from "../screens/Flyout";
 import { Home } from "../screens/Home";
 import { Profiles } from "../screens/Profiles";
@@ -83,13 +85,27 @@ function ConnectionScreen(props: { compact?: boolean }) {
   );
 }
 
-const NAV: { name: RouteName; icon: IconName; label: string }[] = [
-  { name: "home", icon: "home", label: "ui.nav.home" },
-  { name: "profiles", icon: "headphones", label: "ui.nav.profiles" },
-  { name: "diagnostics", icon: "pulse", label: "ui.nav.diagnostics" },
-  { name: "adapter", icon: "usb_stick", label: "ui.nav.adapter" },
-  { name: "settings", icon: "settings", label: "ui.nav.settings" },
+const NAV: { name: RouteName; icon: IconName | "earbuds"; label: () => string }[] = [
+  { name: "home", icon: "home", label: () => t("ui.nav.home") },
+  { name: "profiles", icon: "headphones", label: () => t("ui.nav.profiles") },
+  // Its texts are the screen's own for now (screens/fones/strings.ts)
+  { name: "fones", icon: "earbuds", label: () => ft("nav") },
+  { name: "diagnostics", icon: "pulse", label: () => t("ui.nav.diagnostics") },
+  { name: "adapter", icon: "usb_stick", label: () => t("ui.nav.adapter") },
+  { name: "settings", icon: "settings", label: () => t("ui.nav.settings") },
 ];
+
+/** The Fluent icons, and the earbuds of the Fones item (none in the set) */
+function NavIcon(props: { name: IconName | "earbuds" }) {
+  return (
+    <Show when={props.name === "earbuds"} fallback={<Icon name={props.name as IconName} />}>
+      <svg class="icon" width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.1" aria-hidden="true">
+        <path d="M6 3.5a3.5 3.5 0 0 1 3.5 3.5v1.5a2.5 2.5 0 0 1-1.5 2.3V16a1 1 0 0 1-2 0v-5.2A3.5 3.5 0 0 1 6 3.5z" />
+        <path d="M14 3.5a3.5 3.5 0 0 0-3.5 3.5v1.5a2.5 2.5 0 0 0 1.5 2.3V16a1 1 0 0 0 2 0v-5.2A3.5 3.5 0 0 0 14 3.5z" />
+      </svg>
+    </Show>
+  );
+}
 
 function MainWindow() {
   const app = useApp();
@@ -172,10 +188,10 @@ function MainWindow() {
                       class="nav-item"
                       classList={{ on: route().name === item.name }}
                       aria-current={route().name === item.name ? "page" : undefined}
-                      title={t(item.label)}
+                      title={item.label()}
                     >
-                      <Icon name={item.icon} />
-                      <span class="nav-label">{t(item.label)}</span>
+                      <NavIcon name={item.icon} />
+                      <span class="nav-label">{item.label()}</span>
                     </a>
                   </li>
                 )}
@@ -194,6 +210,9 @@ function MainWindow() {
               </Match>
               <Match when={route().name === "profiles"}>
                 <Profiles />
+              </Match>
+              <Match when={route().name === "fones"}>
+                <Fones tab={route().arg} />
               </Match>
               <Match when={route().name === "diagnostics"}>
                 <Diagnostics />

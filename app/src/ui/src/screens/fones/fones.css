@@ -1,0 +1,50 @@
+/* The Fones screen (phase 4) */
+.fones .sync { display: inline-flex; gap: 6px; align-items: center; font-size: var(--fs-12); margin-left: auto; }
+.fones .sync .icon { width: 14px; height: 14px; }
+.fones .inline { display: flex; gap: var(--s2); flex-wrap: wrap; }
+.fones .dev { display: flex; justify-content: space-between; align-items: center; gap: var(--s6); padding: var(--s5) var(--s6); flex-wrap: wrap; }
+.fones .dev-l { display: flex; flex-direction: column; gap: var(--s2); }
+.fones .dev-name { font-size: var(--fs-20); font-weight: 600; font-family: var(--font-display); }
+.fones .dev-sub { display: flex; align-items: center; gap: var(--s2); color: var(--text-2); }
+.fones-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); display: inline-block; }
+.fones-dot.good { background: var(--good); }
+.fones-dot.warn { background: var(--warn); }
+.fones .bats { display: flex; gap: var(--s6); }
+.fones .bat { display: flex; align-items: center; gap: var(--s3); }
+.fones .bat-ring { position: relative; width: 56px; height: 56px; }
+.fones .bat-ring svg { width: 56px; height: 56px; transform: rotate(-90deg); }
+.fones .bat-ring circle { fill: none; stroke-width: 2.6; stroke-linecap: round; }
+.fones .trk { stroke: var(--surface-3); }
+.fones .bat-ic { position: absolute; inset: 0; display: grid; place-items: center; color: var(--text); }
+.fones .bat-ic svg { transform: none; width: 26px; height: 26px; }
+.fones .bat-txt { display: flex; flex-direction: column; }
+.fones .big { font-size: var(--fs-20); font-weight: 600; }
+.fones .scenes { display: grid; grid-template-columns: repeat(5, 1fr); gap: var(--s2); }
+.fones .scene { border: 1px solid var(--border); border-radius: var(--r); padding: var(--s3); background: var(--surface-2); display: flex; flex-direction: column; gap: 4px; color: var(--text-2); text-align: left; font: inherit; cursor: pointer; }
+.fones .scene b { color: var(--text); font-weight: 600; font-size: var(--fs-14); }
+.fones .scene.on { border-color: var(--text); background: var(--surface-3); }
+.fones .scene.on b::after { content: " ✓"; }
+.fones .scene:disabled { opacity: 0.5; cursor: default; }
+.fones .chips { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.fones .chip { display: inline-flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 12px; border-radius: var(--r); border: 1px solid var(--border-strong); color: var(--text-2); background: var(--surface-2); font: inherit; cursor: pointer; }
+.fones .chip.on { background: var(--strong-bg); color: var(--strong-fg); border-color: var(--strong-bg); }
+.fones .chip.custom { border-style: dashed; cursor: default; }
+.fones .eq { display: grid; grid-template-columns: repeat(10, 1fr); gap: var(--s2); padding-top: var(--s3); }
+.fones .band { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.fones .vslider { writing-mode: vertical-lr; direction: rtl; height: 170px; width: 24px; accent-color: var(--strong-bg); }
+.fones .gain { font-size: var(--fs-12); }
+.fones .freq { font-size: var(--fs-12); color: var(--text-2); }
+.fones table.gestures { width: 100%; border-collapse: collapse; }
+.fones table.gestures th { font-weight: 600; text-align: left; font-size: var(--fs-12); color: var(--text-2); padding: 6px 0; }
+.fones table.gestures td { padding: 8px 8px 8px 0; border-top: 1px solid var(--border); }
+.fones table.gestures td:first-child { width: 28%; }
+.fones .dis-row { opacity: 0.55; }
+.fones .tag { font-size: 11px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--border-strong); color: var(--text-3); margin-left: 8px; font-weight: 400; white-space: nowrap; }
+.fones .tag.warn { color: var(--warn-text, var(--warn)); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
+.fones .ldac-row { position: relative; }
+.fones .ldac-tag { position: absolute; top: 14px; left: 9.5rem; }
+.fones .range { display: flex; align-items: center; gap: var(--s3); }
+.fones .range input { width: 14rem; accent-color: var(--strong-bg); }
+.fones .lastval { font-size: 11px; color: var(--text-3); }
+.fones-body { display: flex; flex-direction: column; gap: var(--s4); }
+.fones-body.stale { opacity: 0.5; filter: grayscale(1); pointer-events: none; user-select: none; }
