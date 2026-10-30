@@ -1132,6 +1132,19 @@ impl<'a> LeCtx<'a> {
         }
         let Some(id) = self.device_by_handle(handle).map(|d| d.id) else { return };
         let addr = self.device(id).map(|d| d.addr).unwrap_or_default();
+        // A plain GATT link (le_connect_plain) never pairs or bonds: a
+        // pairing request from the peer is declined, every other SM event is
+        // ignored, and nothing below (confirm, retry) runs for it
+        if self.device(id).is_some_and(|d| d.plain) {
+            match plain_link_sm_action(ty) {
+                PlainSm::Decline => {
+                    tracing::warn!("LE: {addr}: peer asked to pair on a plain link, declined");
+                    self.stack.sm_bonding_decline(handle);
+                }
+                PlainSm::Ignore => tracing::info!("LE: {addr}: SM event 0x{ty:02x} on a plain link, ignored"),
+            }
+            return;
+        }
         match ty {
             SM_EVENT_JUST_WORKS_REQUEST => {
                 tracing::info!("LE Audio: {addr}: pairing (Just Works)");
@@ -1876,5 +1889,50 @@ mod tests {
         assert!(LeAddr { addr: [0x5A, 1, 2, 3, 4, 5], addr_type: LeAddr::RANDOM }.is_rpa());
         assert!(!LeAddr { addr: [0xDA, 1, 2, 3, 4, 5], addr_type: LeAddr::RANDOM }.is_rpa());
         assert!(!LeAddr { addr: [0x5A, 1, 2, 3, 4, 5], addr_type: LeAddr::PUBLIC }.is_rpa());
+    }
+}
+
+/// What a plain GATT link does with a Security Manager event
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlainSm {
+    /// The peer asks to pair: refuse
+    Decline,
+    /// Anything else: no answer, no retry
+    Ignore,
+}
+
+/// The no-pairing guard of plain links: every pairing request is declined,
+/// nothing is ever confirmed
+pub(crate) fn plain_link_sm_action(ty: u8) -> PlainSm {
+    match ty {
+        SM_EVENT_JUST_WORKS_REQUEST
+        | SM_EVENT_NUMERIC_COMPARISON_REQUEST
+        | SM_EVENT_PASSKEY_INPUT_NUMBER
+        | SM_EVENT_PASSKEY_DISPLAY_NUMBER => PlainSm::Decline,
+        _ => PlainSm::Ignore,
+    }
+}
+
+#[cfg(test)]
+mod plain_link_guard_tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_link_declines_every_pairing_request() {
+        for ty in [
+            SM_EVENT_JUST_WORKS_REQUEST,
+            SM_EVENT_NUMERIC_COMPARISON_REQUEST,
+            SM_EVENT_PASSKEY_INPUT_NUMBER,
+            SM_EVENT_PASSKEY_DISPLAY_NUMBER,
+        ] {
+            assert_eq!(plain_link_sm_action(ty), PlainSm::Decline, "0x{ty:02x}");
+        }
+    }
+
+    #[test]
+    fn a_plain_link_ignores_the_other_sm_events() {
+        for ty in [SM_EVENT_PAIRING_STARTED, SM_EVENT_PAIRING_COMPLETE] {
+            assert_eq!(plain_link_sm_action(ty), PlainSm::Ignore, "0x{ty:02x}");
+        }
     }
 }
