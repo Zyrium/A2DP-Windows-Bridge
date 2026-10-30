@@ -10,7 +10,8 @@ import { CodecBadge } from "../../components/stream";
 import { createQcy, EQ_BANDS_HZ, EQ_GAIN_MAX, EQ_GAIN_MIN, TOUCH_ACTIONS, type AutoOff, type Battery, type GestureKind, type NoiseMode, type NoiseScene, type QcyChange, type QcyProvider, type QcyState, type Side } from "../../ipc/qcy";
 import { insideTauri } from "../../ipc/tauri";
 import { EQ_PRESETS, matchPreset } from "../../lib/eqPresets";
-import { fonesLang, ft } from "./strings";
+import { lang } from "../../i18n";
+import { ft } from "./strings";
 import "./fones.css";
 
 let provider: Promise<QcyProvider> | undefined;
@@ -436,7 +437,7 @@ function SettingsTab(props: { s: QcyState; send: (c: QcyChange) => Promise<boole
   createEffect(() => setVol(s().prompt_volume));
   const savedAt = () => {
     const t = s().profile_saved_at;
-    return t === null ? ft("profile.none") : new Date(t).toLocaleString(fonesLang(), { dateStyle: "short", timeStyle: "short" });
+    return t === null ? ft("profile.none") : new Date(t).toLocaleString(lang(), { dateStyle: "short", timeStyle: "short" });
   };
   return (
     <>

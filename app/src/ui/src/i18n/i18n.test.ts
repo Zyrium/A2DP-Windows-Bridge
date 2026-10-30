@@ -60,3 +60,32 @@ describe("translations", () => {
     }
   });
 });
+
+describe("pt-BR", () => {
+  const files = import.meta.glob<Record<string, string>>("../../../../../app/lang/*.json", { import: "default", eager: true });
+  const file = (code: string) => files[Object.keys(files).find((p) => p.endsWith(`/${code}.json`))!];
+  const placeholders = (s: string) => s.match(/%[-+]?[0-9.]*(?:ll|z)?[sdufx%]/g) ?? [];
+
+  it("has every English key, with text and the same placeholders", () => {
+    const en = file("en");
+    const pt = file("pt-BR");
+    const missing = Object.keys(en).filter((k) => !(k in pt));
+    const extra = Object.keys(pt).filter((k) => !(k in en));
+    expect(missing).toEqual([]);
+    expect(extra).toEqual([]);
+    for (const k of Object.keys(en)) {
+      expect(pt[k].trim(), k).not.toBe("");
+      expect(placeholders(pt[k]), k).toEqual(placeholders(en[k]));
+    }
+  });
+
+  it("is used for the app and the Fones screen", async () => {
+    await setLanguage("pt-BR");
+    expect(lang()).toBe("pt-BR");
+    expect(t("ui.nav.home")).toBe("Início");
+    expect(t("fones.nav")).toBe("Fones");
+    expect(t("status.connecting_retry", 2, 3)).toBe("A conexão falhou, tentando de novo (2/3)...");
+    await setLanguage("en");
+    expect(t("fones.nav")).toBe("Earbuds");
+  });
+});
