@@ -53,6 +53,8 @@ export function IconButton(props: JSX.ButtonHTMLAttributes<HTMLButtonElement> & 
 
 export function Toggle(props: {
   label: string;
+  /** Inline after the label (e.g. a small tag) */
+  badge?: JSX.Element;
   hint?: string;
   checked: boolean;
   disabled?: boolean;
@@ -62,7 +64,10 @@ export function Toggle(props: {
   return (
     <div class="row toggle-row">
       <label class="row-text" for={id}>
-        <span class="row-label">{props.label}</span>
+        <span class="row-label">
+          {props.label}
+          {props.badge}
+        </span>
         <Show when={props.hint}>
           <span class="hint" id={`${id}-hint`}>
             {props.hint}

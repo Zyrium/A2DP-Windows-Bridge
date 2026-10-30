@@ -443,22 +443,20 @@ function SettingsTab(props: { s: QcyState; send: (c: QcyChange) => Promise<boole
     <>
       <Section title={ft("use.title")} actions={<LastValue s={s()} />}>
         <Toggle label={ft("wear")} hint={ft("wear.hint")} checked={s().wear_detection} onChange={(enabled) => void props.send({ kind: "wear_detection", enabled })} />
-        <div class="ldac-row">
-          <Toggle
-            label={ft("ldac")}
-            hint={ft("ldac.hint")}
-            checked={s().ldac && ldacUi()}
-            onChange={(enabled) => {
-              if (enabled) void props.send({ kind: "ldac", enabled });
-              else {
-                setLdacUi(false);
-                queueMicrotask(() => setLdacUi(true));
-                props.onLdacOff();
-              }
-            }}
-          />
-          <span class="tag warn ldac-tag">{ft("ldac.tag")}</span>
-        </div>
+        <Toggle
+          label={ft("ldac")}
+          badge={<span class="tag warn">{ft("ldac.tag")}</span>}
+          hint={ft("ldac.hint")}
+          checked={s().ldac && ldacUi()}
+          onChange={(enabled) => {
+            if (enabled) void props.send({ kind: "ldac", enabled });
+            else {
+              setLdacUi(false);
+              queueMicrotask(() => setLdacUi(true));
+              props.onLdacOff();
+            }
+          }}
+        />
         <Toggle label={ft("multipoint")} hint={ft("multipoint.hint")} checked={s().multipoint} onChange={(enabled) => void props.send({ kind: "multipoint", enabled })} />
         <div class="row">
           <div class="row-text">

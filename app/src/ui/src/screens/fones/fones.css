@@ -41,8 +41,6 @@
 .fones .dis-row { opacity: 0.55; }
 .fones .tag { font-size: 11px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--border-strong); color: var(--text-3); margin-left: 8px; font-weight: 400; white-space: nowrap; }
 .fones .tag.warn { color: var(--warn-text, var(--warn)); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
-.fones .ldac-row { position: relative; }
-.fones .ldac-tag { position: absolute; top: 14px; left: 9.5rem; }
 .fones .range { display: flex; align-items: center; gap: var(--s3); }
 .fones .range input { width: 14rem; accent-color: var(--strong-bg); }
 .fones .lastval { font-size: 11px; color: var(--text-3); }
