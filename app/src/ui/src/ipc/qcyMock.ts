@@ -1,0 +1,141 @@
+// A fake QCY MeloBuds N70 for the Fones screen in a plain browser and in
+// the tests: every change is "confirmed" after a short delay, LDAC
+// changes take longer (the headset reconnects the audio). Nothing here
+// talks to Bluetooth.
+
+import { EQ_PRESETS } from "../lib/eqPresets";
+import type { QcyChange, QcyProvider, QcyState } from "./qcy";
+
+export interface MockQcyOptions {
+  /** Start with the BLE control link failed (the yellow banner) */
+  unavailable?: boolean;
+  /** Multiplies every delay (0 in tests) */
+  speed?: number;
+}
+
+export function sampleQcyState(): QcyState {
+  const now = Date.now();
+  return {
+    link: { state: "connected" },
+    device_name: "QCY MeloBuds N70",
+    address: "F4:4E:FD:00:12:70",
+    firmware: "3.0.13",
+    battery: {
+      left: { level: 54, charging: false },
+      right: { level: 57, charging: false },
+      case: { level: 80, charging: true },
+    },
+    noise_mode: "anc",
+    noise_scene: "adaptive",
+    game_mode: false,
+    sleep_mode: false,
+    wind_reduction: true,
+    wear_detection: true,
+    ldac: true,
+    multipoint: false,
+    prompt_volume: 9,
+    prompt_volume_max: 15,
+    auto_off: 30,
+    eq: { preset: "spatial", gains: [...EQ_PRESETS[1].gains], master_gain: 0 },
+    gestures: {
+      left: { double_tap: "play_pause", long_press: "noise_control" },
+      right: { double_tap: "next", long_press: "voice_assistant" },
+    },
+    supported_gestures: ["double_tap", "long_press"],
+    reapply_on_connect: true,
+    profile_saved_at: now - 2 * 86400_000,
+    synced_at: now - 4000,
+  };
+}
+
+export class MockQcy implements QcyProvider {
+  private s: QcyState;
+  private subs = new Set<(s: QcyState) => void>();
+  private speed: number;
+  /** Changes received, for the tests */
+  readonly calls: QcyChange[] = [];
+
+  constructor(o: MockQcyOptions = {}) {
+    this.speed = o.speed ?? 1;
+    this.s = sampleQcyState();
+    if (o.unavailable) {
+      this.s.link = { state: "unavailable", reason: "gatt_failed", detail: "GATT: 0x85" };
+      this.s.synced_at = Date.now() - 12 * 60_000;
+    }
+  }
+
+  private wait(ms: number) {
+    return new Promise<void>((r) => setTimeout(r, ms * this.speed));
+  }
+  private push() {
+    const copy = structuredClone(this.s);
+    for (const f of this.subs) f(copy);
+    return copy;
+  }
+  private requireLink() {
+    if (this.s.link.state !== "connected") {
+      throw { code: "qcy_unavailable", msg: { key: "fones.unavailable.title", args: [] } };
+    }
+  }
+
+  async state() {
+    return structuredClone(this.s);
+  }
+
+  async set(c: QcyChange) {
+    this.calls.push(c);
+    this.requireLink();
+    await this.wait(c.kind === "ldac" ? 2500 : 250);
+    switch (c.kind) {
+      case "noise":
+        this.s.noise_mode = c.mode;
+        if (c.scene) this.s.noise_scene = c.scene;
+        break;
+      case "prompt_volume":
+        this.s.prompt_volume = Math.max(0, Math.min(this.s.prompt_volume_max, Math.round(c.value)));
+        break;
+      case "auto_off":
+        this.s.auto_off = c.minutes;
+        break;
+      case "eq":
+        this.s.eq = structuredClone(c.eq);
+        break;
+      case "gesture":
+        if (!this.s.supported_gestures.includes(c.gesture)) {
+          throw { code: "qcy_unsupported", msg: { key: "fones.gestures.unsupported", args: [] } };
+        }
+        this.s.gestures[c.side][c.gesture] = c.action;
+        break;
+      default:
+        this.s[c.kind] = c.enabled;
+    }
+    this.s.synced_at = Date.now();
+    return this.push();
+  }
+
+  async refresh() {
+    this.requireLink();
+    await this.wait(400);
+    this.s.synced_at = Date.now();
+    return this.push();
+  }
+
+  async reconnect() {
+    this.s.link = { state: "connecting" };
+    this.push();
+    await this.wait(1200);
+    this.s.link = { state: "connected" };
+    this.s.synced_at = Date.now();
+    return this.push();
+  }
+
+  async saveProfile() {
+    this.s.profile_saved_at = Date.now();
+    return this.push();
+  }
+
+  onState(cb: (s: QcyState) => void) {
+    this.subs.add(cb);
+    return () => void this.subs.delete(cb);
+  }
+}
