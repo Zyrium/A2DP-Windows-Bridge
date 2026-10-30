@@ -245,6 +245,40 @@ impl BtHost {
         }
     }
 
+    /// Writes a characteristic value without response (ATT Write Command),
+    /// for characteristics that only allow that. Ok once BTstack sent it.
+    pub fn le_gatt_write_without_response(
+        &self,
+        device: LeDeviceId,
+        value_handle: u16,
+        value: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let slot: Arc<Mutex<Option<u8>>> = Arc::default();
+        let s = slot.clone();
+        self.le_wait(timeout, true, move |ctx, done| {
+            let Some(con) = ctx.device(device).filter(|d| d.connected()).map(|d| d.acl) else {
+                done(false);
+                return;
+            };
+            ctx.gatt().write_without_response(
+                con,
+                value_handle,
+                value,
+                Some(Box::new(move |_ctx, status| {
+                    *s.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
+                    done(status == 0);
+                })),
+            );
+        });
+        let got = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match got {
+            Some(0) => Ok(()),
+            Some(status) => Err(format!("BTstack error 0x{status:02x}")),
+            None => Err("no answer (not connected, timeout or cancelled)".into()),
+        }
+    }
+
     /// Turns notifications (or indications, for a characteristic that only
     /// has those) of `characteristic` on; every value goes to `values` until
     /// the link goes down. Err: why.

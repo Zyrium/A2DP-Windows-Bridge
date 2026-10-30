@@ -81,6 +81,8 @@ pub(crate) trait GattBackend {
     fn read_long(&self, con: u16, value_handle: u16) -> u8;
     /// With response; a long write when the value does not fit the MTU
     fn write(&self, con: u16, value_handle: u16, value: &[u8]) -> u8;
+    /// Write command (ATT Write Without Response): no answer comes back
+    fn write_without_response(&self, con: u16, value_handle: u16, value: &[u8]) -> u8;
     fn write_ccc(&self, con: u16, chr: &GattChar, configuration: u16) -> u8;
     fn discover_primary(&self, con: u16) -> u8;
     fn find_included(&self, con: u16, start_handle: u16, end_handle: u16) -> u8;
@@ -94,6 +96,10 @@ impl GattBackend for Stack {
 
     fn write(&self, con: u16, value_handle: u16, value: &[u8]) -> u8 {
         self.gatt_write_value(con, value_handle, value)
+    }
+
+    fn write_without_response(&self, con: u16, value_handle: u16, value: &[u8]) -> u8 {
+        self.gatt_write_without_response(con, value_handle, value)
     }
 
     fn write_ccc(&self, con: u16, chr: &GattChar, configuration: u16) -> u8 {
@@ -191,6 +197,12 @@ enum Op {
         value: Vec<u8>,
         done: Option<GattDone>,
     },
+    /// Write command: done as soon as BTstack accepted it
+    WriteNoResponse {
+        handle: u16,
+        value: Vec<u8>,
+        done: Option<GattDone>,
+    },
     Subscribe {
         chr: GattChar,
         config: u16,
@@ -220,6 +232,7 @@ impl Op {
                 b.read_long(con, *handle)
             }
             Op::Write { handle, value, .. } => b.write(con, *handle, value),
+            Op::WriteNoResponse { handle, value, .. } => b.write_without_response(con, *handle, value),
             Op::Subscribe { chr, config, .. } => b.write_ccc(con, chr, *config),
             Op::Discover { .. } => b.discover_primary(con),
             Op::Barrier { .. } => ERROR_CODE_SUCCESS,
@@ -228,7 +241,7 @@ impl Op {
 
     /// Completes without a QUERY_COMPLETE event
     fn immediate(&self) -> bool {
-        matches!(self, Op::Barrier { .. })
+        matches!(self, Op::Barrier { .. } | Op::WriteNoResponse { .. })
     }
 
     /// A GATT event of the running query (not QUERY_COMPLETE)
@@ -325,7 +338,9 @@ impl Op {
     fn finish(self, status: u8) -> Option<Completion> {
         Some(match self {
             Op::Read { handle, value, done } => Completion::Value { done, status, value, handle },
-            Op::Write { handle, done, .. } => Completion::Done { done, status, handle },
+            Op::Write { handle, done, .. } | Op::WriteNoResponse { handle, done, .. } => {
+                Completion::Done { done, status, handle }
+            }
             Op::Subscribe { chr, done, .. } => Completion::Done { done, status, handle: chr.value_handle },
             Op::Discover { services, done, .. } => Completion::Discovered { done, status, services },
             Op::Barrier { done } => Completion::Done { done, status, handle: 0 },
@@ -362,6 +377,13 @@ impl GattClient {
     /// MTU)
     pub fn write(&mut self, con: u16, value_handle: u16, value: Vec<u8>, done: Option<GattDone>) {
         self.enqueue(con, Op::Write { handle: value_handle, value, done });
+    }
+
+    /// Write without response (ATT Write Command), for characteristics that
+    /// only list that property. `done` gets 0 once BTstack sent it, or the
+    /// BTstack status when it could not.
+    pub fn write_without_response(&mut self, con: u16, value_handle: u16, value: Vec<u8>, done: Option<GattDone>) {
+        self.enqueue(con, Op::WriteNoResponse { handle: value_handle, value, done });
     }
 
     /// Enable notifications (or indications) of a characteristic: writes its
@@ -567,6 +589,9 @@ mod tests {
         }
         fn write(&self, con: u16, h: u16, v: &[u8]) -> u8 {
             self.answer(format!("write {con:x} {h:x} {v:?}"))
+        }
+        fn write_without_response(&self, con: u16, h: u16, v: &[u8]) -> u8 {
+            self.answer(format!("wnr {con:x} {h:x} {v:?}"))
         }
         fn write_ccc(&self, con: u16, chr: &GattChar, cfg: u16) -> u8 {
             self.answer(format!("ccc {con:x} {:x} {cfg}", chr.value_handle))

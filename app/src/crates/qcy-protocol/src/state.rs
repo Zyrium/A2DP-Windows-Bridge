@@ -394,6 +394,18 @@ mod tests {
         assert_eq!(prompt_volume_value(-5.0, 15), 0);
     }
 
+    /// Values read from a MeloBuds N70 (firmware 3.0.13) on 2026-10-30:
+    /// left, right, case as plain percentages. 606139 came with a scan
+    /// response advertising the same 96 / 97 / 57.
+    #[test]
+    fn battery_characteristic_captured_from_an_n70() {
+        let b = Battery::parse(&[0x60, 0x61, 0x39]);
+        assert_eq!((b.left, b.right, b.case), (Some(96), Some(97), Some(57)));
+        assert!(!b.left_charging && !b.right_charging && !b.case_charging);
+        let b = Battery::parse(&[0x07, 0x09, 0x50]);
+        assert_eq!((b.left, b.right, b.case), (Some(7), Some(9), Some(80)));
+    }
+
     #[test]
     fn battery_values() {
         let b = Battery::parse(&[0x80 | 50, 40, 0x80 | 10]);
