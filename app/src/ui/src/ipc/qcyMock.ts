@@ -73,7 +73,7 @@ export class MockQcy implements QcyProvider {
     if (this.gameOnly) {
       this.s.read_only = false;
       this.s.writable = ["game_mode"];
-      this.s.verified = [];
+      this.s.verified = ["game_mode"];
       this.s.write = null;
     }
     if (o.unavailable || o.reason) {

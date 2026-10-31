@@ -556,8 +556,8 @@ fn write_view(w: &LastWrite) -> Value {
 }
 
 /// The QcyState of qcy.ts (app/src/ui/src/ipc/qcy.ts): read_only false,
-/// only the `writable` settings can change (game mode), still "testing"
-/// (not verified on the N70) in this version
+/// only the `writable` settings can change (game mode), verified on the
+/// N70 (Gabriel, 2026-10-31)
 pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option<&LastWrite>) -> Value {
     let link = match (link, last) {
         (Some(why), _) => json!({ "state": "unavailable", "reason": why.reason() }),
@@ -598,7 +598,7 @@ pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option
         "link": link,
         "read_only": false,
         "writable": write::ALLOWED.iter().filter(|o| **o == commands::opcode::GAME_MODE).map(|_| "game_mode").collect::<Vec<_>>(),
-        "verified": Vec::<&str>::new(),
+        "verified": ["game_mode"],
         "write": write.map_or(Value::Null, write_view),
         "device_name": last.map_or("", |r| r.name.as_str()),
         "address": last.map_or("", |r| r.address.as_str()),
@@ -652,7 +652,7 @@ mod tests {
         assert_eq!(v["link"]["state"], "none");
         assert_eq!(v["read_only"], false);
         assert_eq!(v["writable"], json!(["game_mode"]));
-        assert_eq!(v["verified"], json!([]));
+        assert_eq!(v["verified"], json!(["game_mode"]));
         assert_eq!(v["write"], Value::Null);
         assert_eq!(v["synced_at"], Value::Null);
         assert_eq!(v["battery"]["left"]["level"], Value::Null);

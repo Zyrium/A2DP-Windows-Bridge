@@ -62,6 +62,10 @@
   color: var(--warn-fg, #9a6700);
   border-color: currentColor;
 }
+.fones .fones-tag.tag-verified {
+  color: var(--good-text, var(--good));
+  border-color: currentColor;
+}
 .fones .write-steps {
   margin: 4px 0 8px 0;
   padding: 8px 12px 8px 32px;

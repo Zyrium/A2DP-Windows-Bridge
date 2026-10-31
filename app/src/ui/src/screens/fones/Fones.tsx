@@ -149,7 +149,7 @@ export function Fones(props: { tab?: string }) {
               inert={!editable() && !(tab() === "main" && partial()) ? true : undefined}
             >
               <Show when={tab() === "main"}>
-                <MainTab s={s()} send={send} can={can} partial={partial()} busy={busy()} />
+                <MainTab s={s()} send={send} can={can} partial={partial()} busy={busy()} verified={s().verified ?? []} />
               </Show>
               <Show when={tab() === "eq"}>
                 <EqTab s={s()} send={send} notify={notify} />
@@ -344,15 +344,21 @@ function MainTab(props: {
   can?: (kind: string) => boolean;
   partial?: boolean;
   busy?: boolean;
+  /** Writable settings already confirmed on the earbuds (tag Verificado) */
+  verified?: string[];
 }) {
   const s = () => props.s;
   const can = (k: string) => props.can?.(k) ?? true;
+  const ok = (k: string) => props.verified?.includes(k) === true;
   const locked = (k: string) => props.partial === true && !can(k);
   /** The tag of a control in the partial (write test) mode */
   const tag = (k: string) =>
     props.partial ? (
-      <span class="codec-badge fones-tag" classList={{ "tag-testing": can(k), "tag-unverified": !can(k) }}>
-        {ft(can(k) ? "tag.testing" : "tag.unverified")}
+      <span
+        class="codec-badge fones-tag"
+        classList={{ "tag-verified": can(k) && ok(k), "tag-testing": can(k) && !ok(k), "tag-unverified": !can(k) }}
+      >
+        {ft(!can(k) ? "tag.unverified" : ok(k) ? "tag.verified" : "tag.testing")}
       </span>
     ) : undefined;
   const gameWrite = () => (s().write?.setting === "game_mode" ? s().write : null);

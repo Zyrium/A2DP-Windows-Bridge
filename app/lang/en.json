@@ -676,6 +676,7 @@
   "fones.unavailable.not_found": "The earbuds were not found over BLE. Take them out of the case (or open it) and try again. The audio is not affected.",
   "fones.error.read_only": "This version only reads the earbuds: changing a setting is not available yet.",
   "fones.tag.testing": "Testing",
+  "fones.tag.verified": "Verified",
   "fones.tag.unverified": "Not verified yet",
   "fones.write_test.title": "Write test",
   "fones.write_test.text": "Only Game mode can be changed in this version: the app reads the current value, sends 1 command and checks it with the earbuds. Everything else stays read only.",

@@ -676,6 +676,7 @@
   "fones.unavailable.not_found": "Os fones não foram encontrados por BLE. Tire-os do estojo (ou abra o estojo) e tente de novo. O áudio não é afetado.",
   "fones.error.read_only": "Esta versão só lê os fones: alterar um ajuste ainda não está disponível.",
   "fones.tag.testing": "Em teste",
+  "fones.tag.verified": "Verificado",
   "fones.tag.unverified": "Ainda não verificado",
   "fones.write_test.title": "Teste de escrita",
   "fones.write_test.text": "Só o Modo jogo pode ser mudado nesta versão: o app lê o valor atual, envia 1 comando e confere com o fone. O resto continua só leitura.",
