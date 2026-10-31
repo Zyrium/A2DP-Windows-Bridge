@@ -92,6 +92,41 @@ impl BtHost {
         self.le_run(RUN_TIMEOUT, |ctx| ctx.stop_scan()).unwrap_or_default()
     }
 
+    /// A low duty cycle active scan (window `window` of every `interval`,
+    /// 0.625 ms units) that ends as soon as `done` accepts what was seen,
+    /// or after `duration`. For a known advertiser next to an A2DP stream.
+    pub fn le_scan_until(
+        &self,
+        duration: Duration,
+        interval: u16,
+        window: u16,
+        done: impl Fn(&[LeScanResult]) -> bool,
+    ) -> Vec<LeScanResult> {
+        if !self.le_ready() {
+            return Vec::new();
+        }
+        self.le_fresh_operation();
+        tracing::info!(
+            "LE: scanning for up to {} ms (window {} of {} ms)",
+            duration.as_millis(),
+            u32::from(window) * 625 / 1000,
+            u32::from(interval) * 625 / 1000
+        );
+        let started = Instant::now();
+        self.le_run(RUN_TIMEOUT, move |ctx| ctx.start_scan_with(interval, window));
+        let end = started + duration;
+        while Instant::now() < end && !self.le_cancelled() {
+            std::thread::sleep(POLL.min(end.saturating_duration_since(Instant::now())));
+            let seen = self.le_run(RUN_TIMEOUT, |ctx| ctx.scan_results()).unwrap_or_default();
+            if done(&seen) {
+                break;
+            }
+        }
+        let r = self.le_run(RUN_TIMEOUT, |ctx| ctx.stop_scan()).unwrap_or_default();
+        tracing::info!("LE: scan stopped after {} ms", started.elapsed().as_millis());
+        r
+    }
+
     /// Scans until `addr` is seen (to learn its address type and name).
     /// `addr` may be an identity address or an RPA of a bonded device: an
     /// advertiser whose RPA resolves to the same identity matches too, and
@@ -131,6 +166,31 @@ impl BtHost {
     /// For peripherals with their own control channel that is open without
     /// bonding. [`BtHost::le_disconnect`] ends it.
     pub fn le_connect_plain(&self, addr: LeAddr, name: &str, timeout: Duration) -> Result<LeDeviceId, String> {
+        self.le_connect_as(addr, name, timeout, true)
+    }
+
+    /// le_connect_plain that takes the GATT cache of an earlier link
+    /// (`cached`, from [`BtHost::le_gatt_services`]) instead of
+    /// discovering it again; empty: a full discovery. The handles must
+    /// still match (same device and firmware): a failed GATT operation
+    /// means the caller should forget them.
+    pub fn le_connect_plain_cached(
+        &self,
+        addr: LeAddr,
+        name: &str,
+        timeout: Duration,
+        cached: Vec<GattService>,
+    ) -> Result<LeDeviceId, String> {
+        let set = self.le_run(RUN_TIMEOUT, move |ctx| {
+            if let Some(id) = ctx.device_for_addr(addr, true)
+                && let Some(d) = ctx.device_mut(id)
+            {
+                d.cached_services = cached;
+            }
+        });
+        if set.is_none() {
+            return Err("LE Audio is not running".into());
+        }
         self.le_connect_as(addr, name, timeout, true)
     }
 

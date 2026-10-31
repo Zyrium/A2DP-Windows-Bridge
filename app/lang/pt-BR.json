@@ -574,6 +574,7 @@
   "fones.sync.never": "Ainda não sincronizado",
   "fones.sync.last": "Última leitura há %d min",
   "fones.refresh": "Atualizar",
+  "fones.refresh_hint": "Ler os fones pode causar um breve engasgo no áudio em LDAC 990 kbps.",
   "fones.link.connected": "Controle conectado (BLE)",
   "fones.link.connecting": "Conectando o controle…",
   "fones.link.unavailable": "Áudio conectado · controle indisponível",

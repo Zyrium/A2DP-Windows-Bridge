@@ -84,6 +84,7 @@ export function Fones(props: { tab?: string }) {
         <Button icon="arrow_sync" disabled={busy() || (!live() && !readOnly())} onClick={() => void act((q) => q.refresh())}>
           {ft("refresh")}
         </Button>
+        <span class="muted refresh-hint">{ft("refresh_hint")}</span>
       </header>
 
       <Segmented<FonesTab>

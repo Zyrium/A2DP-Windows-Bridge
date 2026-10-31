@@ -574,6 +574,7 @@
   "fones.sync.never": "Not synced yet",
   "fones.sync.last": "Last read %d min ago",
   "fones.refresh": "Refresh",
+  "fones.refresh_hint": "Reading the earbuds may cause a brief stutter in LDAC 990 kbps audio.",
   "fones.link.connected": "Control connected (BLE)",
   "fones.link.connecting": "Connecting the control…",
   "fones.link.unavailable": "Audio connected · control unavailable",

@@ -153,6 +153,36 @@ impl Stack {
         unsafe { ffi::gap_stop_scan() }
     }
 
+    /// Parameters of the next outgoing LE connections (gap_connect): the
+    /// initiator scan, interval, latency, supervision timeout, CE length.
+    /// Units: scan 0.625 ms, interval 1.25 ms, timeout 10 ms, CE 0.625 ms.
+    #[allow(clippy::too_many_arguments)]
+    pub fn le_set_connection_params(
+        &self,
+        scan_interval: u16,
+        scan_window: u16,
+        interval_min: u16,
+        interval_max: u16,
+        latency: u16,
+        supervision_timeout: u16,
+        min_ce: u16,
+        max_ce: u16,
+    ) {
+        // SAFETY: on the BTstack thread; plain values.
+        unsafe {
+            ffi::gap_set_connection_parameters(
+                scan_interval,
+                scan_window,
+                interval_min,
+                interval_max,
+                latency,
+                supervision_timeout,
+                min_ce,
+                max_ce,
+            )
+        }
+    }
+
     /// Ends with GAP_SUBEVENT_LE_CONNECTION_COMPLETE
     pub fn le_connect(&self, addr: &[u8; 6], addr_type: u8) -> u8 {
         // SAFETY: on the BTstack thread; addr is 6 bytes (copied).

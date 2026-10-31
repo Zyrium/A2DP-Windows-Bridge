@@ -11,13 +11,22 @@
 //! would restart BTstack and drop the audio, so the read is refused
 //! (`le_off`) instead. Nothing polls: a read happens only on an explicit
 //! qcy.refresh / qcy.reconnect (the "Atualizar" / "Tentar de novo" buttons).
+//!
+//! Airtime: on a single radio adapter every LE packet is time taken from
+//! the A2DP stream (LDAC 990 kbps has little slack), so a read keeps the LE
+//! side short: it connects straight to the earbuds' LE address of the last
+//! read (no scan), reuses that link's GATT handles (no discovery), asks
+//! for a long connection interval with short events, sends the 13 queries
+//! back to back and disconnects as soon as they are answered. Only the
+//! first read (or one after a failure) scans, with a 25 % window, and stops
+//! when the earbuds are seen.
 
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use a2dpwb_core::Service;
-use bt_host::{BtHost, GattChar, GattService, LeScanResult};
+use bt_host::{BtHost, GattChar, GattService, LeAddr, LeScanResult};
 use qcy_protocol::advertisement::{self, Advertisement};
 use qcy_protocol::commands::{self, NoiseMode, NoiseScene};
 use qcy_protocol::packet;
@@ -25,11 +34,19 @@ use qcy_protocol::state::QcyState;
 use qcy_protocol::uuids::{self, uuid16_matches};
 use serde_json::{Value, json};
 
+/// Longest scan (it stops as soon as the earbuds are seen)
 const SCAN: Duration = Duration::from_secs(4);
+/// Scan window 15 ms of every 60 ms (0.625 ms units): 25 % of the radio
+/// instead of the 100 % of a plain scan
+const SCAN_INTERVAL: u16 = 0x0060;
+const SCAN_WINDOW: u16 = 0x0018;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// A direct connect to the cached address: the earbuds advertise often,
+/// so a longer wait means they are gone or changed address (then scan)
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const GATT_TIMEOUT: Duration = Duration::from_secs(5);
-const RESPONSE_TIMEOUT: Duration = Duration::from_millis(2500);
-const SETTLE: Duration = Duration::from_millis(500);
+/// After the last query is sent: how long the answers may take in total
+const ANSWERS_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Touch actions in the protocol's order (qcy.ts TOUCH_ACTIONS)
 const TOUCH_ACTIONS: [&str; 9] = [
@@ -44,8 +61,12 @@ const TOUCH_ACTIONS: [&str; 9] = [
     "noise_control",
 ];
 /// (key id, side, gesture): double tap 0x03/0x04, long press 0x09/0x0A
-const GESTURE_KEYS: [(u8, &str, &str); 4] =
-    [(0x03, "left", "double_tap"), (0x04, "right", "double_tap"), (0x09, "left", "long_press"), (0x0A, "right", "long_press")];
+const GESTURE_KEYS: [(u8, &str, &str); 4] = [
+    (0x03, "left", "double_tap"),
+    (0x04, "right", "double_tap"),
+    (0x09, "left", "long_press"),
+    (0x0A, "right", "long_press"),
+];
 
 /// Why no read happened (QcyUnavailableReason of qcy.ts)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +104,17 @@ pub struct Reading {
     pub at_ms: u64,
 }
 
+/// Where the last read found the earbuds: their LE address and that
+/// link's GATT cache (a read connects straight there, no scan, no
+/// discovery)
+#[derive(Clone)]
+struct Known {
+    addr: LeAddr,
+    name: String,
+    address: String,
+    services: Vec<GattService>,
+}
+
 #[derive(Default)]
 struct Cache {
     last: Option<Reading>,
@@ -90,6 +122,7 @@ struct Cache {
 }
 
 static CACHE: Mutex<Cache> = Mutex::new(Cache { last: None, link: None });
+static KNOWN: Mutex<Option<Known>> = Mutex::new(None);
 /// One read at a time
 static READING: Mutex<()> = Mutex::new(());
 
@@ -137,20 +170,44 @@ fn host_for_read(service: &Service) -> Result<std::sync::Arc<BtHost>, Unavailabl
 }
 
 fn read(host: &BtHost) -> Result<Reading, Unavailable> {
+    let known = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(k) = known {
+        match read_at(host, &k, None) {
+            Ok(r) => return Ok(r),
+            Err(why) => {
+                // Moved, changed address or firmware: forget it, find it again
+                tracing::info!("QCY: the known LE address failed ({}), scanning", why.reason());
+                *KNOWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+    }
     let found: Vec<(LeScanResult, Advertisement)> = host
-        .le_scan(SCAN)
+        .le_scan_until(SCAN, SCAN_INTERVAL, SCAN_WINDOW, |seen| seen.iter().any(|r| n70_in(r).is_some()))
         .into_iter()
-        .filter_map(|r| {
-            let a = advertisement::find_in_ad(&r.adv).or_else(|| advertisement::find_in_ad(&r.scan_rsp))?;
-            Some((r, a))
-        })
+        .filter_map(|r| n70_in(&r).map(|a| (r, a)))
         .collect();
-    let Some((target, adv)) = found.into_iter().find(|(_, a)| uuids::is_n70(a.vendor_id)) else {
+    let Some((target, adv)) = found.into_iter().next() else {
         return Err(Unavailable::NotFound);
     };
     let name = if target.name.is_empty() { "QCY MeloBuds N70".to_string() } else { target.name.clone() };
     let address = adv.control_address.map_or_else(|| target.addr.to_string(), advertisement::format_address);
-    let id = host.le_connect_plain(target.addr, &name, CONNECT_TIMEOUT).map_err(|e| {
+    let k = Known { addr: target.addr, name, address, services: Vec::new() };
+    read_at(host, &k, Some(&adv))
+}
+
+/// The N70 advertisement of a scan result
+fn n70_in(r: &LeScanResult) -> Option<Advertisement> {
+    advertisement::find_in_ad(&r.adv)
+        .or_else(|| advertisement::find_in_ad(&r.scan_rsp))
+        .filter(|a| uuids::is_n70(a.vendor_id))
+}
+
+/// Connects to `k` (with its cached GATT handles when it has them), reads,
+/// disconnects at once; remembers where it worked
+fn read_at(host: &BtHost, k: &Known, adv: Option<&Advertisement>) -> Result<Reading, Unavailable> {
+    let timeout = if adv.is_none() { DIRECT_CONNECT_TIMEOUT } else { CONNECT_TIMEOUT };
+    let started = Instant::now();
+    let id = host.le_connect_plain_cached(k.addr, &k.name, timeout, k.services.clone()).map_err(|e| {
         tracing::warn!("QCY: connection failed: {e}");
         if e.to_lowercase().contains("timeout") || e.to_lowercase().contains("timed out") {
             Unavailable::Timeout
@@ -158,29 +215,38 @@ fn read(host: &BtHost) -> Result<Reading, Unavailable> {
             Unavailable::GattFailed
         }
     })?;
-    let r = query(host, id);
+    let connected = started.elapsed();
+    let services = host.le_gatt_services(id);
+    let r = query(host, id, &services);
     host.le_disconnect(id);
+    tracing::info!(
+        "QCY: connected in {} ms, link up {} ms in total{}",
+        connected.as_millis(),
+        started.elapsed().as_millis(),
+        if k.services.is_empty() { "" } else { " (cached GATT handles)" }
+    );
     let (mut state, answered) = r?;
-    if state.battery.left.is_none() {
+    if state.battery.left.is_none()
+        && let Some(adv) = adv
+    {
         // The advertisement's battery when the characteristic said nothing
         state.battery.left = Some(adv.left_battery);
         state.battery.right = Some(adv.right_battery);
         state.battery.case = (adv.case_battery > 0).then_some(adv.case_battery);
     }
-    Ok(Reading { state, name, address, answered, at_ms: now_ms() })
+    *KNOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Known { services, ..k.clone() });
+    Ok(Reading { state, name: k.name.clone(), address: k.address.clone(), answered, at_ms: now_ms() })
 }
 
-fn query(host: &BtHost, id: bt_host::LeDeviceId) -> Result<(QcyState, usize), Unavailable> {
-    let services = host.le_gatt_services(id);
-    let command = find_char(&services, uuids::MAIN_SERVICE, uuids::COMMAND).ok_or(Unavailable::GattFailed)?;
-    let notification =
-        find_char(&services, uuids::MAIN_SERVICE, uuids::NOTIFICATION).ok_or(Unavailable::GattFailed)?;
+fn query(host: &BtHost, id: bt_host::LeDeviceId, services: &[GattService]) -> Result<(QcyState, usize), Unavailable> {
+    let command = find_char(services, uuids::MAIN_SERVICE, uuids::COMMAND).ok_or(Unavailable::GattFailed)?;
+    let notification = find_char(services, uuids::MAIN_SERVICE, uuids::NOTIFICATION).ok_or(Unavailable::GattFailed)?;
     let mut state = QcyState::default();
     let (tx, responses) = mpsc::channel::<Vec<u8>>();
     host.le_gatt_subscribe(id, notification, tx, GATT_TIMEOUT).map_err(|_| Unavailable::GattFailed)?;
 
     for uuid in [uuids::FIRMWARE_VERSION, uuids::BATTERY, uuids::KEY_FUNCTIONS] {
-        let Some(chr) = find_char(&services, uuids::MAIN_SERVICE, uuid) else { continue };
+        let Some(chr) = find_char(services, uuids::MAIN_SERVICE, uuid) else { continue };
         if chr.properties & 0x02 == 0 {
             continue;
         }
@@ -193,48 +259,57 @@ fn query(host: &BtHost, id: bt_host::LeDeviceId) -> Result<(QcyState, usize), Un
         }
     }
 
-    let mut answered = 0;
+    // All queries back to back, then the answers: the link is busy for a
+    // few connection events instead of one wait per query
+    let mut pending: Vec<u8> = Vec::new();
     for op in commands::STATE_QUERIES {
         // Read-only requests only (FF 03 FE <op>)
         let frame = commands::request(op);
         debug_assert_eq!(frame[2], packet::REQUEST_OPCODE);
-        while responses.try_recv().is_ok() {}
         let written = if command.properties & 0x04 != 0 {
             host.le_gatt_write_without_response(id, command.value_handle, frame, GATT_TIMEOUT)
         } else {
             host.le_gatt_write(id, command.value_handle, frame, GATT_TIMEOUT)
         };
-        if written.is_err() {
-            continue;
+        if written.is_ok() {
+            pending.push(op);
         }
-        if wait_for(&responses, op, &mut state) {
-            answered += 1;
-        }
-    }
-    let until = Instant::now() + SETTLE;
-    while let Some(left) = until.checked_duration_since(Instant::now()) {
-        match responses.recv_timeout(left) {
-            Ok(v) => {
-                apply(&v, &mut state);
-            }
-            Err(_) => break,
+        while let Ok(v) = responses.try_recv() {
+            answer(&v, &mut state, &mut pending);
         }
     }
+    let sent = commands::STATE_QUERIES.len();
+    let mut answered = collect(&responses, &mut state, &mut pending, ANSWERS_TIMEOUT);
+    answered = answered.min(sent);
     if answered == 0 && state.battery.left.is_none() && state.firmware_version.is_none() {
         return Err(Unavailable::Timeout);
     }
     Ok((state, answered))
 }
 
-fn wait_for(responses: &mpsc::Receiver<Vec<u8>>, opcode: u8, state: &mut QcyState) -> bool {
-    let deadline = Instant::now() + RESPONSE_TIMEOUT;
-    loop {
-        let Some(left) = deadline.checked_duration_since(Instant::now()) else { return false };
+/// Waits for the answers to `pending` (until all came or `timeout`); the
+/// number of queries answered in total
+fn collect(
+    responses: &mpsc::Receiver<Vec<u8>>,
+    state: &mut QcyState,
+    pending: &mut Vec<u8>,
+    timeout: Duration,
+) -> usize {
+    let deadline = Instant::now() + timeout;
+    while !pending.is_empty() {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
         match responses.recv_timeout(left) {
-            Ok(v) if apply(&v, state).contains(&opcode) => return true,
-            Ok(_) => {}
-            Err(_) => return false,
+            Ok(v) => answer(&v, state, pending),
+            Err(_) => break,
         }
+    }
+    commands::STATE_QUERIES.len() - pending.len()
+}
+
+/// Applies a notification; the queries it answers leave `pending`
+fn answer(value: &[u8], state: &mut QcyState, pending: &mut Vec<u8>) {
+    for op in apply(value, state) {
+        pending.retain(|p| *p != op);
     }
 }
 
@@ -382,6 +457,18 @@ mod tests {
         assert_eq!(v["link"]["state"], "unavailable");
         assert_eq!(v["link"]["reason"], "le_off");
         assert_eq!(v["battery"]["right"]["level"], 97);
+    }
+
+    #[test]
+    fn answers_leave_the_pending_list() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let mut pending: Vec<u8> = commands::STATE_QUERIES.to_vec();
+        let mut state = QcyState::default();
+        // No answer at all: nothing answered, the wait ends at the timeout
+        assert_eq!(collect(&rx, &mut state, &mut pending.clone(), Duration::from_millis(10)), 0);
+        drop(tx);
+        // A closed channel ends the wait too
+        assert_eq!(collect(&rx, &mut state, &mut pending, Duration::from_secs(5)), 0);
     }
 
     #[test]
