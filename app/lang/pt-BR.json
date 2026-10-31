@@ -679,7 +679,7 @@
   "fones.tag.verified": "Verificado",
   "fones.tag.unverified": "Ainda não verificado",
   "fones.write_test.title": "Teste de escrita",
-  "fones.write_test.text": "Nesta versão dá para mudar Modo jogo, Modo sono e Redução de vento (o Volume dos avisos aparece só para leitura). Cada toque lê o valor atual, envia 1 comando e confere com o fone. O resto continua só leitura.",
+  "fones.write_test.text": "Nesta versão dá para mudar Modo jogo, Modo sono, Redução de vento e o Controle de ruído (Cancelamento e Transparência, em teste); o Volume dos avisos aparece só para leitura. Cada toque lê o valor atual, envia 1 comando e confere com o fone. O resto continua só leitura.",
   "fones.write.sending": "Enviando… (lendo o valor atual, 1 comando, conferindo)",
   "fones.write.ok_on": "%s ligado — confirmado pelo fone",
   "fones.write.ok_off": "%s desligado — confirmado pelo fone",
@@ -710,5 +710,14 @@
   "fones.write.step.refused": "Fora do limite do fone ✕ (nada enviado)",
   "fones.sleep.warn": "Atenção: com o Modo sono ligado, os controles de toque dos fones ficam bloqueados até você desligar aqui.",
   "fones.wind.needs_anc": "Ligue o Cancelamento de ruído para usar a Redução de vento.",
+  "fones.noise.warn.title": "Desligar a Redução de vento?",
+  "fones.noise.warn.text": "Transparência desliga a Redução de vento. Continuar?",
+  "fones.noise.warn.text_off": "Desligar o cancelamento também desliga a Redução de vento. Continuar?",
+  "fones.noise.warn.confirm": "Continuar",
+  "fones.noise.testing": "Cancelamento e Transparência estão em teste: cada toque lê o modo atual, envia 1 comando e confere os 3 bytes com o fone.",
+  "fones.write.ok_noise": "%s — confirmado pelo fone",
+  "fones.write.step.sent_noise": "Enviado: %s (1 comando)",
+  "fones.write.step.read_wind": "Redução de vento lida de novo: %s",
+  "fones.write.step.read_wind_failed": "Redução de vento: sem resposta na releitura",
   "fones.prompt_volume.readonly": "O fone ainda não aceita a mudança por aqui; só leitura."
 }

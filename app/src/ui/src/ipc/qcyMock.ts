@@ -4,7 +4,7 @@
 // talks to Bluetooth.
 
 import { EQ_PRESETS } from "../lib/eqPresets";
-import type { QcyChange, QcyProvider, QcyState } from "./qcy";
+import { NOISE_CODES, noiseCode, type QcyChange, type QcyProvider, type QcyState } from "./qcy";
 
 export interface MockQcyOptions {
   /** Start with the BLE control link failed (the yellow banner) */
@@ -59,7 +59,7 @@ export function sampleQcyState(): QcyState {
 
 /** The phase-2 allowlist, as in qcy_protocol::write::ALLOWED (the prompt
  *  volume 0x1D is read-only since fase 2b) */
-export const F2_OPCODES = { game_mode: 0x09, sleep_mode: 0x10, wind_reduction: 0x2a } as const;
+export const F2_OPCODES = { game_mode: 0x09, sleep_mode: 0x10, wind_reduction: 0x2a, noise_control: 0x17 } as const;
 type F2Kind = keyof typeof F2_OPCODES;
 export const F2_WRITABLE = Object.keys(F2_OPCODES) as F2Kind[];
 
@@ -121,6 +121,14 @@ export class MockQcy implements QcyProvider {
         this.s.noise_mode = c.mode;
         if (c.scene) this.s.noise_scene = c.scene;
         break;
+      case "noise_control": {
+        const n = NOISE_CODES.find((x) => x.code === c.value);
+        if (n) {
+          this.s.noise_mode = n.mode;
+          if (n.scene) this.s.noise_scene = n.scene;
+        }
+        break;
+      }
       case "prompt_volume":
         this.s.prompt_volume = Math.max(0, Math.min(this.s.prompt_volume_max, Math.round(c.value)));
         break;
@@ -151,6 +159,7 @@ export class MockQcy implements QcyProvider {
     this.requireLink();
     const hex = (n: number) => n.toString(16).toUpperCase().padStart(2, "0");
     const at_ms = Date.now();
+    if (c.kind === "noise_control") return this.setNoise(c.value);
     if (!("enabled" in c)) throw { code: "qcy.read_only", msg: { key: "fones.error.read_only", args: [] } };
     const kind = c.kind as "game_mode" | "sleep_mode" | "wind_reduction";
     const previous = this.s[kind];
@@ -169,6 +178,37 @@ export class MockQcy implements QcyProvider {
       this.s[kind] = c.enabled;
       this.s.synced_at = Date.now();
       this.s.write = { setting: kind, enabled: c.enabled, previous, status: "confirmed", failure: null, sent, read_back, steps, at_ms };
+    }
+    return this.push();
+  }
+
+  /** Phase F3: 0x17, one of the seven states; confirmed by the three bytes
+   *  read back, then 0x2A is read again (transparency/off turn wind
+   *  reduction off on the N70). A timeout is never re-sent. */
+  private async setNoise(code: number) {
+    const want = NOISE_CODES.find((n) => n.code === code);
+    if (!want) throw { code: "qcy.read_only", msg: { key: "fones.error.read_only", args: [] } };
+    const at_ms = Date.now();
+    const previous = this.s.noise_mode ? noiseCode(this.s.noise_mode, this.s.noise_scene) : null;
+    const prev = NOISE_CODES.find((n) => n.code === previous);
+    const sent = `FF051703${want.bytes}`;
+    const steps = [
+      { what: "read_previous", detail: `FF03FE0117 -> ${prev?.name ?? "?"} (${prev?.bytes ?? ""})` },
+      { what: "sent", detail: sent },
+    ];
+    await this.wait(this.gameOnly === "fail" ? 3000 : 400);
+    const base = { setting: "noise_control", enabled: null, value: code, previous, preset: want.name, previous_preset: prev?.name ?? null, sent, steps, at_ms };
+    if (this.gameOnly === "fail") {
+      steps.push({ what: "no_read_back", detail: "3000 ms" });
+      this.s.write = { ...base, status: "failed", failure: "timeout", read_back: null };
+    } else {
+      steps.push({ what: "read_back", detail: want.bytes });
+      this.s.noise_mode = want.mode;
+      if (want.scene) this.s.noise_scene = want.scene;
+      if (want.mode !== "anc") this.s.wind_reduction = false;
+      steps.push({ what: "read_wind", detail: `2A01${this.s.wind_reduction ? "01" : "00"}` });
+      this.s.synced_at = Date.now();
+      this.s.write = { ...base, status: "confirmed", failure: null, read_back: want.bytes };
     }
     return this.push();
   }

@@ -132,8 +132,12 @@ export interface QcyWrite {
   setting: string;
   /** On/off settings: the value asked for (null for the prompt volume) */
   enabled: boolean | null;
-  /** The prompt volume asked for (null/absent for on/off settings) */
+  /** The prompt volume asked for, or the noise_control code (null/absent
+   *  for on/off settings) */
   value?: number | null;
+  /** noise_control: the names of value / previous (NOISE_CODES) */
+  preset?: string | null;
+  previous_preset?: string | null;
   /** The value read before the write (what "Desfazer" goes back to):
    *  boolean for on/off settings, a number for the prompt volume */
   previous: boolean | number | null;
@@ -148,11 +152,33 @@ export interface QcyWrite {
   at_ms: number;
 }
 
+/** The codes of { kind: "noise_control" } (qcy_protocol::write::NOISE_PRESETS):
+ *  code -> mode + scene, and the 0x17 bytes written */
+export const NOISE_CODES: { code: number; name: string; mode: NoiseMode; scene: NoiseScene | null; bytes: string }[] = [
+  { code: 0, name: "off", mode: "off", scene: null, bytes: "020000" },
+  { code: 1, name: "anc_adaptive", mode: "anc", scene: "adaptive", bytes: "010500" },
+  { code: 2, name: "anc_indoor", mode: "anc", scene: "indoor", bytes: "010102" },
+  { code: 3, name: "anc_commuting", mode: "anc", scene: "commuting", bytes: "010202" },
+  { code: 4, name: "anc_noisy", mode: "anc", scene: "noisy", bytes: "010302" },
+  { code: 5, name: "anc_anti_wind", mode: "anc", scene: "anti_wind", bytes: "010400" },
+  { code: 6, name: "transparency", mode: "transparency", scene: null, bytes: "030104" },
+];
+
+/** The noise_control code of a mode (+ scene for ANC; adaptive by default) */
+export function noiseCode(mode: NoiseMode, scene?: NoiseScene | null): number {
+  if (mode === "off") return 0;
+  if (mode === "transparency") return 6;
+  return NOISE_CODES.find((n) => n.mode === "anc" && n.scene === (scene ?? "adaptive"))?.code ?? 1;
+}
+
 /** One change. The values stay as they are until the headset confirms. */
 export type QcyChange =
   | { kind: "noise"; mode: NoiseMode; scene?: NoiseScene }
   | { kind: "game_mode" | "sleep_mode" | "wind_reduction" | "wear_detection" | "ldac" | "multipoint" | "reapply_on_connect"; enabled: boolean }
   | { kind: "prompt_volume"; value: number }
+  /** Phase F3: one of the seven 0x17 states of NOISE_CODES (the earbuds'
+   *  noise control as qcy_protocol::write::NOISE_PRESETS) */
+  | { kind: "noise_control"; value: number }
   | { kind: "auto_off"; minutes: AutoOff }
   | { kind: "eq"; eq: Equalizer }
   | { kind: "gesture"; side: Side; gesture: GestureKind; action: TouchAction };
@@ -244,7 +270,8 @@ export async function createQcy(insideTauri: boolean): Promise<QcyProvider> {
     const ro = flag?.startsWith("readonly") === true;
     const reason = flag?.split("-")[1] as "le_off" | "not_found" | undefined;
     // ?qcy=game (phase-2 writes confirm), ?qcy=game-fail (3 s timeout),
-    // ?qcy=game-noanc (noise cancelling off: wind reduction greyed)
+    // ?qcy=game-noanc (noise cancelling off: wind reduction greyed); the
+    // phase-3 noise writes go the same way (game: confirmed, game-fail: timeout)
     const gameOnly = flag === "game" || flag === "game-noanc" ? true : flag === "game-fail" ? "fail" : false;
     return new MockQcy({ unavailable: flag === "unavailable", readOnly: ro, reason: gameOnly ? undefined : reason, gameOnly, ancOff: flag === "game-noanc" });
   }
