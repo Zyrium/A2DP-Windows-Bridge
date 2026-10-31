@@ -1,9 +1,10 @@
 //! The Fones screen's QCY reads (MeloBuds N70): `qcy.state`, `qcy.refresh`,
-//! `qcy.reconnect` and the `qcy` event, plus ONE write: `qcy.set` for game
-//! mode (phase F1). The reads only send the `FF 03 FE <op>` state requests
+//! `qcy.reconnect` and the `qcy` event, plus ONE write per click: `qcy.set`
+//! for game mode, sleep mode, wind reduction or the prompt volume (phase
+//! F2). The reads only send the `FF 03 FE <op>` state requests
 //! of [`commands::STATE_QUERIES`] (opcode 0xFE). The write goes through
-//! [`qcy_protocol::write`] (allowlist: opcode 0x09 with 01/02 only; every
-//! other change is refused before any Bluetooth traffic) and only on an
+//! [`qcy_protocol::write`] (allowlist: 0x09 / 0x10 / 0x2A with 01/02, 0x1D
+//! with one level byte; every other change is refused before any Bluetooth traffic) and only on an
 //! explicit qcy.set: never when the app opens or the link comes up.
 //! `le_connect_plain` never pairs.
 //!
@@ -128,8 +129,14 @@ struct Known {
 #[derive(Debug, Clone)]
 pub struct LastWrite {
     pub setting: &'static str,
-    pub enabled: bool,
-    pub previous: Option<bool>,
+    /// On/off setting (value 01/02) rather than a level
+    pub toggle: bool,
+    /// The write's parameter byte: 01/02 for a toggle, the level otherwise
+    pub value: u8,
+    /// Same encoding, read before the write
+    pub previous: Option<u8>,
+    /// The maximum the earbuds reported (prompt volume)
+    pub max: Option<u8>,
     pub sent: Option<String>,
     pub read_back: Option<String>,
     /// None: confirmed by the read-back
@@ -177,23 +184,36 @@ pub fn refresh(service: &Service) -> Value {
     view_all(c.last.as_ref(), c.link, c.write.as_ref())
 }
 
-/// A change the UI asked for (`qcy.set`) that this version refuses: only
-/// `{ "kind": "game_mode", "enabled": bool }` passes. Nothing is sent.
-pub fn allowed_change(change: &Value) -> Option<(Setting, bool)> {
+/// A change the UI asked for (`qcy.set`) that this version accepts, as the
+/// setting and its write parameter byte; None (nothing sent) for anything
+/// else. Only `{ "kind": "game_mode" | "sleep_mode" | "wind_reduction",
+/// "enabled": bool }` and `{ "kind": "prompt_volume", "value": 0..=100 }`
+/// pass (the reported maximum is checked again before the write).
+pub fn allowed_change(change: &Value) -> Option<(Setting, u8)> {
     let setting = Setting::from_kind(change.get("kind")?.as_str()?)?;
-    let enabled = change.get("enabled")?.as_bool()?;
-    // Exactly kind + enabled: no extra parameters ride along
+    // Exactly kind + one value: no extra parameters ride along
     if change.as_object()?.len() != 2 {
         return None;
     }
-    Some((setting, enabled))
+    let value = if setting.is_toggle() {
+        write::on_off(change.get("enabled")?.as_bool()?)
+    } else {
+        let v = change.get("value")?.as_u64()?;
+        if v > u64::from(write::PROMPT_VOLUME_LIMIT) {
+            return None;
+        }
+        v as u8
+    };
+    // The same check the frame builder makes
+    write::frame_for(setting, value).ok()?;
+    Some((setting, value))
 }
 
 /// Changes one allowed setting (blocking: run off the async runtime). Err
 /// only when the change is refused (nothing sent); a write that is not
 /// confirmed is Ok with `write.status = "failed"` in the state.
 pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
-    let Some((setting, enabled)) = allowed_change(change) else {
+    let Some((setting, value)) = allowed_change(change) else {
         tracing::warn!("QCY write: refused (not allowed in this version): {change}");
         return Err(());
     };
@@ -201,15 +221,26 @@ pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
     tracing::info!(
         "QCY write: {} -> {} (one command, confirmed by a read-back)",
         setting.key(),
-        if enabled { "on" } else { "off" }
+        if setting.is_toggle() { (if value == 0x01 { "on" } else { "off" }).to_string() } else { value.to_string() }
     );
-    let outcome = host_for_read(service).and_then(|h| write_at(&h, service.config_dir(), setting, enabled));
+    let outcome = host_for_read(service).and_then(|h| write_at(&h, service.config_dir(), setting, value));
     let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let w = match outcome {
         Ok(o) => {
-            if let (Some(r), Some(on)) = (c.last.as_mut(), o.read_back.as_deref().and_then(write::read_on)) {
+            if let (Some(r), Some(p)) = (c.last.as_mut(), o.read_back.as_deref()) {
+                let on = write::read_on(p);
                 match setting {
-                    Setting::GameMode => r.state.game_mode = Some(on),
+                    Setting::GameMode => r.state.game_mode = on.or(r.state.game_mode),
+                    Setting::SleepMode => r.state.sleep_mode = on.or(r.state.sleep_mode),
+                    Setting::WindReduction => r.state.wind_detection = on.or(r.state.wind_detection),
+                    Setting::PromptVolume => {
+                        if let Some(v) = p.first() {
+                            r.state.prompt_volume = Some(*v);
+                        }
+                        if let Some(m) = write::read_max(p) {
+                            r.state.prompt_volume_max = m;
+                        }
+                    }
                 }
                 r.at_ms = now_ms();
             }
@@ -220,8 +251,10 @@ pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
             tracing::warn!("QCY write: no link ({}), nothing sent", why.reason());
             LastWrite {
                 setting: setting.key(),
-                enabled,
+                toggle: setting.is_toggle(),
+                value,
                 previous: None,
+                max: None,
                 sent: None,
                 read_back: None,
                 failure: Some(why.reason()),
@@ -232,7 +265,7 @@ pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
     };
     match w.failure {
         None => tracing::info!("QCY write: confirmed by the earbuds ({})", w.read_back.as_deref().unwrap_or("")),
-        Some(f) => tracing::warn!("QCY write: NOT confirmed ({f}); the switch goes back, nothing is re-sent"),
+        Some(f) => tracing::warn!("QCY write: NOT confirmed ({f}); the control goes back, nothing is re-sent"),
     }
     c.write = Some(w);
     Ok(view_all(c.last.as_ref(), c.link, c.write.as_ref()))
@@ -241,8 +274,10 @@ pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
 fn last_write(o: &write::Outcome) -> LastWrite {
     LastWrite {
         setting: o.setting.key(),
-        enabled: o.enabled,
+        toggle: o.setting.is_toggle(),
+        value: o.value,
         previous: o.previous,
+        max: o.max,
         sent: o.sent.as_deref().map(packet::to_hex),
         read_back: o.read_back.as_deref().map(packet::to_hex),
         failure: o.failure.map(write::Failure::code),
@@ -276,7 +311,7 @@ impl write::Transport for GattLink<'_> {
 
 /// Connects straight to where the last read found the earbuds (no scan:
 /// a write needs a read first), runs the write flow, disconnects
-fn write_at(host: &BtHost, dir: &Path, setting: Setting, enabled: bool) -> Result<write::Outcome, Unavailable> {
+fn write_at(host: &BtHost, dir: &Path, setting: Setting, value: u8) -> Result<write::Outcome, Unavailable> {
     load_known(dir);
     let Some(k) = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         // Never scan for a write: "Atualizar" finds them first
@@ -289,7 +324,7 @@ fn write_at(host: &BtHost, dir: &Path, setting: Setting, enabled: bool) -> Resul
             Unavailable::Timeout
         })?;
     let services = host.le_gatt_services(id);
-    let r = write_on(host, id, &services, setting, enabled);
+    let r = write_on(host, id, &services, setting, value);
     host.le_disconnect(id);
     tracing::info!("QCY write: link up {} ms in total", started.elapsed().as_millis());
     let o = r?;
@@ -297,7 +332,8 @@ fn write_at(host: &BtHost, dir: &Path, setting: Setting, enabled: bool) -> Resul
         tracing::info!("QCY write step: {} {}", s.what, s.detail);
     }
     if let Some(p) = o.previous {
-        crate::qcy_cache::save_previous(dir, &k.address, setting.key(), p);
+        let saved = if setting.is_toggle() { json!(p == 0x01) } else { json!(p) };
+        crate::qcy_cache::save_previous(dir, &k.address, setting.key(), saved);
     }
     Ok(o)
 }
@@ -307,7 +343,7 @@ fn write_on(
     id: bt_host::LeDeviceId,
     services: &[GattService],
     setting: Setting,
-    enabled: bool,
+    value: u8,
 ) -> Result<write::Outcome, Unavailable> {
     let command = find_char(services, uuids::MAIN_SERVICE, uuids::COMMAND).ok_or(Unavailable::GattFailed)?;
     let notification = find_char(services, uuids::MAIN_SERVICE, uuids::NOTIFICATION).ok_or(Unavailable::GattFailed)?;
@@ -316,7 +352,7 @@ fn write_on(
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     host.le_gatt_subscribe(id, notification, tx, GATT_TIMEOUT).map_err(|_| Unavailable::GattFailed)?;
     let mut link = GattLink { host, id, command, rx };
-    Ok(write::run(&mut link, setting, enabled, WRITE_TIMEOUT))
+    Ok(write::run(&mut link, setting, value, WRITE_TIMEOUT))
 }
 
 /// The stack to read with, never restarting one that streams
@@ -542,10 +578,19 @@ pub fn view(last: Option<&Reading>, link: Option<Unavailable>) -> Value {
 }
 
 fn write_view(w: &LastWrite) -> Value {
+    // Toggles: enabled / previous as booleans; the level: value / previous
+    // as numbers, with the reported maximum
+    let (enabled, value, previous) = if w.toggle {
+        (json!(w.value == 0x01), Value::Null, w.previous.map_or(Value::Null, |p| json!(p == 0x01)))
+    } else {
+        (Value::Null, json!(w.value), w.previous.map_or(Value::Null, |p| json!(p)))
+    };
     json!({
         "setting": w.setting,
-        "enabled": w.enabled,
-        "previous": w.previous,
+        "enabled": enabled,
+        "value": value,
+        "previous": previous,
+        "max": w.max,
         "status": if w.failure.is_none() { "confirmed" } else { "failed" },
         "failure": w.failure,
         "sent": w.sent,
@@ -556,8 +601,9 @@ fn write_view(w: &LastWrite) -> Value {
 }
 
 /// The QcyState of qcy.ts (app/src/ui/src/ipc/qcy.ts): read_only false,
-/// only the `writable` settings can change (game mode), verified on the
-/// N70 (Gabriel, 2026-10-31)
+/// only the `writable` settings can change (game mode, sleep mode, wind
+/// reduction, prompt volume); `verified` lists those confirmed on the N70
+/// (game mode: Gabriel, 2026-10-31); the others show "Em teste"
 pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option<&LastWrite>) -> Value {
     let link = match (link, last) {
         (Some(why), _) => json!({ "state": "unavailable", "reason": why.reason() }),
@@ -597,7 +643,7 @@ pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option
     json!({
         "link": link,
         "read_only": false,
-        "writable": write::ALLOWED.iter().filter(|o| **o == commands::opcode::GAME_MODE).map(|_| "game_mode").collect::<Vec<_>>(),
+        "writable": Setting::ALL.iter().filter(|s| write::ALLOWED.contains(&s.opcode())).map(|s| s.key()).collect::<Vec<_>>(),
         "verified": ["game_mode"],
         "write": write.map_or(Value::Null, write_view),
         "device_name": last.map_or("", |r| r.name.as_str()),
@@ -651,7 +697,7 @@ mod tests {
         let v = current_of(None, None);
         assert_eq!(v["link"]["state"], "none");
         assert_eq!(v["read_only"], false);
-        assert_eq!(v["writable"], json!(["game_mode"]));
+        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction", "prompt_volume"]));
         assert_eq!(v["verified"], json!(["game_mode"]));
         assert_eq!(v["write"], Value::Null);
         assert_eq!(v["synced_at"], Value::Null);
@@ -701,18 +747,34 @@ mod tests {
     }
 
     #[test]
-    fn only_game_mode_changes_pass() {
-        assert_eq!(allowed_change(&json!({ "kind": "game_mode", "enabled": true })), Some((Setting::GameMode, true)));
-        assert_eq!(allowed_change(&json!({ "kind": "game_mode", "enabled": false })), Some((Setting::GameMode, false)));
+    fn only_the_f2_changes_pass() {
+        assert_eq!(allowed_change(&json!({ "kind": "game_mode", "enabled": true })), Some((Setting::GameMode, 0x01)));
+        assert_eq!(allowed_change(&json!({ "kind": "game_mode", "enabled": false })), Some((Setting::GameMode, 0x02)));
+        assert_eq!(allowed_change(&json!({ "kind": "sleep_mode", "enabled": true })), Some((Setting::SleepMode, 0x01)));
+        assert_eq!(
+            allowed_change(&json!({ "kind": "wind_reduction", "enabled": false })),
+            Some((Setting::WindReduction, 0x02))
+        );
+        assert_eq!(allowed_change(&json!({ "kind": "prompt_volume", "value": 12 })), Some((Setting::PromptVolume, 12)));
+        assert_eq!(allowed_change(&json!({ "kind": "prompt_volume", "value": 0 })), Some((Setting::PromptVolume, 0)));
         for c in [
             json!({ "kind": "ldac", "enabled": false }),
             json!({ "kind": "multipoint", "enabled": true }),
-            json!({ "kind": "sleep_mode", "enabled": true }),
+            json!({ "kind": "wear_detection", "enabled": true }),
+            json!({ "kind": "reapply_on_connect", "enabled": true }),
             json!({ "kind": "noise", "mode": "anc" }),
             json!({ "kind": "auto_off", "minutes": 5 }),
             json!({ "kind": "game_mode" }),
             json!({ "kind": "game_mode", "enabled": 1 }),
             json!({ "kind": "game_mode", "enabled": true, "opcode": 3 }),
+            json!({ "kind": "sleep_mode", "value": 1 }),
+            json!({ "kind": "prompt_volume", "enabled": true }),
+            json!({ "kind": "prompt_volume", "value": 101 }),
+            json!({ "kind": "prompt_volume", "value": 256 }),
+            json!({ "kind": "prompt_volume", "value": -1 }),
+            json!({ "kind": "prompt_volume", "value": 1.5 }),
+            json!({ "kind": "prompt_volume", "value": "9" }),
+            json!({ "kind": "prompt_volume", "value": 9, "max": 15 }),
             json!(null),
         ] {
             assert_eq!(allowed_change(&c), None, "{c}");
@@ -720,12 +782,42 @@ mod tests {
     }
 
     #[test]
+    fn writable_and_verified() {
+        let v = view_all(Some(&reading()), None, None);
+        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction", "prompt_volume"]));
+        assert_eq!(v["verified"], json!(["game_mode"]));
+    }
+
+    #[test]
+    fn a_volume_write_shows_numbers() {
+        let w = LastWrite {
+            setting: "prompt_volume",
+            toggle: false,
+            value: 12,
+            previous: Some(9),
+            max: Some(15),
+            sent: Some("FF031D010C".into()),
+            read_back: Some("0C0F".into()),
+            failure: None,
+            steps: vec![],
+            at_ms: 7,
+        };
+        let v = view_all(Some(&reading()), None, Some(&w));
+        assert_eq!(v["write"]["value"], 12);
+        assert_eq!(v["write"]["previous"], 9);
+        assert_eq!(v["write"]["max"], 15);
+        assert_eq!(v["write"]["enabled"], Value::Null);
+    }
+
+    #[test]
     fn a_write_shows_in_the_state() {
         let r = reading();
         let w = LastWrite {
             setting: "game_mode",
-            enabled: true,
-            previous: Some(false),
+            toggle: true,
+            value: 0x01,
+            previous: Some(0x02),
+            max: None,
             sent: Some("FF03090101".into()),
             read_back: Some("0100".into()),
             failure: None,

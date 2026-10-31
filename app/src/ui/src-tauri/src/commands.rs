@@ -130,9 +130,11 @@ pub fn update_install(app: AppHandle, manifest_url: String) -> Result<(), String
 }
 
 // The Fones screen's QCY earbuds (ipc/qcy.ts): state, refresh and reconnect
-// go to the core (qcy.*). qcy_set forwards ONLY { kind: "game_mode",
-// enabled: bool } (the core checks again); every other change and
-// save_profile are refused here, before the core.
+// go to the core (qcy.*). qcy_set forwards ONLY { kind: "game_mode" |
+// "sleep_mode" | "wind_reduction", enabled: bool } or { kind:
+// "prompt_volume", value: 0..=100 } (the core and the protocol crate check
+// again); every other change and save_profile are refused here, before the
+// core.
 
 fn qcy_read_only() -> ErrorInfo {
     ErrorInfo { code: "qcy.read_only".into(), message: ipc::Msg::new("fones.error.read_only") }
@@ -153,14 +155,23 @@ pub async fn qcy_reconnect(window: WebviewWindow, ipc: State<'_, Arc<Ipc>>) -> R
     ipc.request(window.label(), "qcy.reconnect", None).await
 }
 
-/// The only change this version sends to the core: game mode on/off
+/// The only changes this version sends to the core (phase F2)
 fn qcy_allowed(change: Option<&Value>) -> Option<Value> {
     let c = change?.as_object()?;
-    if c.len() != 2 || c.get("kind")?.as_str()? != "game_mode" {
+    if c.len() != 2 {
         return None;
     }
-    let enabled = c.get("enabled")?.as_bool()?;
-    Some(serde_json::json!({ "kind": "game_mode", "enabled": enabled }))
+    match c.get("kind")?.as_str()? {
+        kind @ ("game_mode" | "sleep_mode" | "wind_reduction") => {
+            let enabled = c.get("enabled")?.as_bool()?;
+            Some(serde_json::json!({ "kind": kind, "enabled": enabled }))
+        }
+        "prompt_volume" => {
+            let value = c.get("value")?.as_u64().filter(|v| *v <= 100)?;
+            Some(serde_json::json!({ "kind": "prompt_volume", "value": value }))
+        }
+        _ => None,
+    }
 }
 
 #[tauri::command]
@@ -192,10 +203,26 @@ mod qcy_tests {
             json!({ "kind": "game_mode" }),
             json!({ "kind": "game_mode", "enabled": "yes" }),
             json!({ "kind": "game_mode", "enabled": true, "raw": "FF03030101" }),
+            json!({ "kind": "wear_detection", "enabled": true }),
+            json!({ "kind": "reapply_on_connect", "enabled": true }),
+            json!({ "kind": "sleep_mode", "value": 1 }),
+            json!({ "kind": "prompt_volume", "enabled": true }),
+            json!({ "kind": "prompt_volume", "value": 101 }),
+            json!({ "kind": "prompt_volume", "value": -3 }),
+            json!({ "kind": "prompt_volume", "value": 2.5 }),
+            json!({ "kind": "prompt_volume", "value": 9, "opcode": 1 }),
         ] {
             assert_eq!(qcy_allowed(Some(&c)), None, "{c}");
         }
         assert_eq!(qcy_allowed(None), None);
+        for c in [
+            json!({ "kind": "game_mode", "enabled": true }),
+            json!({ "kind": "sleep_mode", "enabled": false }),
+            json!({ "kind": "wind_reduction", "enabled": true }),
+            json!({ "kind": "prompt_volume", "value": 12 }),
+        ] {
+            assert_eq!(qcy_allowed(Some(&c)), Some(c.clone()), "{c}");
+        }
         assert_eq!(qcy_save_profile().unwrap_err().code, "qcy.read_only");
     }
 

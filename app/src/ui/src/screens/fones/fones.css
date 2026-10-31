@@ -75,3 +75,22 @@
 .fones .write-steps li {
   margin: 2px 0;
 }
+
+.fones .stepper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.fones .stepper .btn {
+  min-width: 36px;
+  justify-content: center;
+  font-size: 16px;
+}
+.fones .stepper .num {
+  min-width: 48px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.fones .needs-anc .toggle-row {
+  opacity: 0.55;
+}

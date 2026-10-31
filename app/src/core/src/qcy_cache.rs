@@ -53,9 +53,9 @@ pub struct Entry {
     /// Unix ms
     pub saved_at: u64,
     /// The value a setting had before the last confirmed write (key ->
-    /// on/off), for "Desfazer" after a restart too
+    /// on/off, or the level), for "Desfazer" after a restart too
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub previous: BTreeMap<String, bool>,
+    pub previous: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +113,7 @@ pub fn remember(dir: &Path, classic: &str, entry: Entry) {
 
 /// Keeps the value `key` had before a write (no-op when `classic` has no
 /// entry yet)
-pub fn save_previous(dir: &Path, classic: &str, key: &str, value: bool) {
+pub fn save_previous(dir: &Path, classic: &str, key: &str, value: serde_json::Value) {
     let mut f = load(dir);
     let Some(e) = f.devices.get_mut(&classic.to_uppercase()) else { return };
     e.previous.insert(key.to_string(), value);

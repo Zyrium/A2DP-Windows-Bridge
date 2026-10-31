@@ -13,9 +13,11 @@ export interface MockQcyOptions {
   readOnly?: boolean;
   /** Start with this unavailable reason instead of gatt_failed */
   reason?: "le_off" | "not_found" | "gatt_failed";
-  /** Like this version: only game mode can change, with the write flow;
+  /** Like this version: only the phase-2 settings can change, with the write flow;
    *  "fail" never confirms (the 3 s timeout) */
   gameOnly?: boolean | "fail";
+  /** Start with noise cancelling off (wind reduction needs it) */
+  ancOff?: boolean;
   /** Multiplies every delay (0 in tests) */
   speed?: number;
 }
@@ -55,6 +57,11 @@ export function sampleQcyState(): QcyState {
   };
 }
 
+/** The phase-2 allowlist, as in qcy_protocol::write::ALLOWED */
+export const F2_OPCODES = { game_mode: 0x09, sleep_mode: 0x10, wind_reduction: 0x2a, prompt_volume: 0x1d } as const;
+type F2Kind = keyof typeof F2_OPCODES;
+export const F2_WRITABLE = Object.keys(F2_OPCODES) as F2Kind[];
+
 export class MockQcy implements QcyProvider {
   private s: QcyState;
   private subs = new Set<(s: QcyState) => void>();
@@ -70,9 +77,10 @@ export class MockQcy implements QcyProvider {
     this.readOnly = o.readOnly === true;
     if (this.readOnly) this.s.read_only = true;
     this.gameOnly = o.gameOnly ?? false;
+    if (o.ancOff) this.s.noise_mode = "off";
     if (this.gameOnly) {
       this.s.read_only = false;
-      this.s.writable = ["game_mode"];
+      this.s.writable = [...F2_WRITABLE];
       this.s.verified = ["game_mode"];
       this.s.write = null;
     }
@@ -134,26 +142,56 @@ export class MockQcy implements QcyProvider {
     return this.push();
   }
 
-  /** The write flow of the core (qcy_protocol::write), faked */
+  /** The write flow of the core (qcy_protocol::write), faked: read the old
+   *  value, send ONE frame, read it back; a timeout is never re-sent */
   private async setGame(c: QcyChange) {
-    if (c.kind !== "game_mode") throw { code: "qcy.read_only", msg: { key: "fones.error.read_only", args: [] } };
+    const op = F2_OPCODES[c.kind as F2Kind];
+    if (op === undefined) throw { code: "qcy.read_only", msg: { key: "fones.error.read_only", args: [] } };
     this.requireLink();
-    const previous = this.s.game_mode;
-    const sent = c.enabled ? "FF03090101" : "FF03090102";
+    const hex = (n: number) => n.toString(16).toUpperCase().padStart(2, "0");
+    const at_ms = Date.now();
+    if (c.kind === "prompt_volume") {
+      const previous = this.s.prompt_volume;
+      const max = this.s.prompt_volume_max;
+      const steps = [{ what: "read_previous", detail: `FF03FE011D -> ${previous}/${max}` }];
+      if (!Number.isInteger(c.value) || c.value < 0 || c.value > max) {
+        steps.push({ what: "refused", detail: `${c.value} > ${max}` });
+        this.s.write = { setting: "prompt_volume", enabled: null, value: c.value, previous, max, status: "failed", failure: "out_of_range", sent: null, read_back: null, steps, at_ms };
+        return this.push();
+      }
+      const sent = `FF031D01${hex(c.value)}`;
+      steps.push({ what: "sent", detail: sent });
+      await this.wait(this.gameOnly === "fail" ? 3000 : 400);
+      if (this.gameOnly === "fail") {
+        steps.push({ what: "no_read_back", detail: "3000 ms" });
+        this.s.write = { setting: "prompt_volume", enabled: null, value: c.value, previous, max, status: "failed", failure: "timeout", sent, read_back: null, steps, at_ms };
+      } else {
+        const read_back = `1D02${hex(c.value)}${hex(max)}`;
+        steps.push({ what: "read_back", detail: read_back });
+        this.s.prompt_volume = c.value;
+        this.s.synced_at = Date.now();
+        this.s.write = { setting: "prompt_volume", enabled: null, value: c.value, previous, max, status: "confirmed", failure: null, sent, read_back, steps, at_ms };
+      }
+      return this.push();
+    }
+    if (!("enabled" in c)) throw { code: "qcy.read_only", msg: { key: "fones.error.read_only", args: [] } };
+    const kind = c.kind as "game_mode" | "sleep_mode" | "wind_reduction";
+    const previous = this.s[kind];
+    const sent = `FF03${hex(op)}01${c.enabled ? "01" : "02"}`;
     const steps = [
-      { what: "read_previous", detail: `FF03FE0109 -> ${previous ? "on" : "off"}` },
+      { what: "read_previous", detail: `FF03FE01${hex(op)} -> ${previous ? "on" : "off"}` },
       { what: "sent", detail: sent },
     ];
     await this.wait(this.gameOnly === "fail" ? 3000 : 400);
     if (this.gameOnly === "fail") {
       steps.push({ what: "no_read_back", detail: "3000 ms" });
-      this.s.write = { setting: "game_mode", enabled: c.enabled, previous, status: "failed", failure: "timeout", sent, read_back: null, steps, at_ms: Date.now() };
+      this.s.write = { setting: kind, enabled: c.enabled, previous, status: "failed", failure: "timeout", sent, read_back: null, steps, at_ms };
     } else {
-      const read_back = c.enabled ? "090101" : "090102";
+      const read_back = `${hex(op)}01${c.enabled ? "01" : "02"}`;
       steps.push({ what: "read_back", detail: read_back });
-      this.s.game_mode = c.enabled;
+      this.s[kind] = c.enabled;
       this.s.synced_at = Date.now();
-      this.s.write = { setting: "game_mode", enabled: c.enabled, previous, status: "confirmed", failure: null, sent, read_back, steps, at_ms: Date.now() };
+      this.s.write = { setting: kind, enabled: c.enabled, previous, status: "confirmed", failure: null, sent, read_back, steps, at_ms };
     }
     return this.push();
   }

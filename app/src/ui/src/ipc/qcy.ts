@@ -1,8 +1,9 @@
 // The contract between the "Fones" screen and the QCY headset control
 // (BLE/GATT, crates/qcy-protocol). The Rust side: src-tauri/commands.rs
 // (qcy_*) and the core's qcy.* requests (core/src/qcy_live.rs). This
-// version reads everything and changes ONE setting: game mode (`writable`,
-// still "testing"). Any other qcy_set and qcy_save_profile reject with
+// version reads everything and changes four settings, one command per
+// click (`writable`): game mode (verified on the N70), sleep mode, wind
+// reduction and the prompt volume ("Em teste"). Any other qcy_set and qcy_save_profile reject with
 // qcy.read_only. In a plain browser, or with ?qcy=mock, the mock provider of
 // qcyMock.ts stands in for it.
 //
@@ -81,10 +82,11 @@ export interface QcyState {
   /** The values are read from the headset but cannot be changed (this
    *  version): the controls stay greyed, "Atualizar" reads again */
   read_only?: boolean;
-  /** The only settings that can change (this version: ["game_mode"]);
+  /** The only settings that can change (this version: game_mode,
+   *  sleep_mode, wind_reduction, prompt_volume);
    *  absent: every control works (the mock's full mode) */
   writable?: string[];
-  /** Writable settings already checked on real earbuds (none yet: the
+  /** Writable settings already checked on real earbuds (game_mode; the
    *  others carry the "Em teste" tag) */
   verified?: string[];
   /** The last write, null before the first */
@@ -127,11 +129,17 @@ export interface QcyWriteStep {
  *  re-sent: "failed" leaves the switch at the value read. */
 export interface QcyWrite {
   setting: string;
-  enabled: boolean;
-  /** The value read before the write (what "Desfazer" goes back to) */
-  previous: boolean | null;
+  /** On/off settings: the value asked for (null for the prompt volume) */
+  enabled: boolean | null;
+  /** The prompt volume asked for (null/absent for on/off settings) */
+  value?: number | null;
+  /** The value read before the write (what "Desfazer" goes back to):
+   *  boolean for on/off settings, a number for the prompt volume */
+  previous: boolean | number | null;
+  /** The prompt volume's maximum the earbuds reported */
+  max?: number | null;
   status: "confirmed" | "failed";
-  failure: "no_previous" | "send_failed" | "timeout" | "mismatch" | QcyUnavailableReason | null;
+  failure: "no_previous" | "send_failed" | "timeout" | "mismatch" | "out_of_range" | QcyUnavailableReason | null;
   /** Hex of the frame sent (e.g. FF03090101), null when nothing was sent */
   sent: string | null;
   read_back: string | null;
@@ -234,9 +242,10 @@ export async function createQcy(insideTauri: boolean): Promise<QcyProvider> {
     // ?qcy=readonly, readonly-le_off, readonly-not_found: like this version
     const ro = flag?.startsWith("readonly") === true;
     const reason = flag?.split("-")[1] as "le_off" | "not_found" | undefined;
-    // ?qcy=game (game mode writes confirm) or ?qcy=game-fail (3 s timeout)
-    const gameOnly = flag === "game" ? true : flag === "game-fail" ? "fail" : false;
-    return new MockQcy({ unavailable: flag === "unavailable", readOnly: ro, reason: gameOnly ? undefined : reason, gameOnly });
+    // ?qcy=game (phase-2 writes confirm), ?qcy=game-fail (3 s timeout),
+    // ?qcy=game-noanc (noise cancelling off: wind reduction greyed)
+    const gameOnly = flag === "game" || flag === "game-noanc" ? true : flag === "game-fail" ? "fail" : false;
+    return new MockQcy({ unavailable: flag === "unavailable", readOnly: ro, reason: gameOnly ? undefined : reason, gameOnly, ancOff: flag === "game-noanc" });
   }
   return createTauriQcy();
 }
