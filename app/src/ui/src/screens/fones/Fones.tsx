@@ -7,7 +7,7 @@ import { useApp, errorText } from "../../app/context";
 import { Banner, Button, Dialog, Section, Segmented, Select, Toggle, type Option } from "../../components/controls";
 import { Icon } from "../../components/Icon";
 import { CodecBadge } from "../../components/stream";
-import { createQcy, EQ_BANDS_HZ, EQ_GAIN_MAX, EQ_GAIN_MIN, TOUCH_ACTIONS, type AutoOff, type Battery, type GestureKind, type NoiseMode, type NoiseScene, type QcyChange, type QcyProvider, type QcyState, type Side } from "../../ipc/qcy";
+import { createQcy, EQ_BANDS_HZ, EQ_GAIN_MAX, EQ_GAIN_MIN, TOUCH_ACTIONS, type AutoOff, type Battery, type GestureKind, type NoiseMode, type NoiseScene, type QcyChange, type QcyProvider, type QcyState, type QcyWrite, type Side } from "../../ipc/qcy";
 import { insideTauri } from "../../ipc/tauri";
 import { EQ_PRESETS, matchPreset } from "../../lib/eqPresets";
 import { lang } from "../../i18n";
@@ -46,8 +46,14 @@ export function Fones(props: { tab?: string }) {
   const tab = (): FonesTab => (props.tab === "eq" || props.tab === "settings" ? props.tab : "main");
   const live = () => state()?.link.state === "connected";
   const readOnly = () => state()?.read_only === true;
+  /** Only these settings can change (absent: all of them) */
+  const writable = () => state()?.writable;
   /** Controls usable: connected and not a read-only build */
-  const editable = () => live() && !readOnly();
+  const editable = () => live() && !readOnly() && writable() === undefined;
+  /** This one setting can be changed now */
+  const can = (kind: string) => live() && !readOnly() && (writable() === undefined || writable()!.includes(kind));
+  /** Some, not all, settings can change: the rest is greyed with its tag */
+  const partial = () => live() && !readOnly() && (writable()?.length ?? 0) > 0;
   const reason = () => (state()?.link as { reason?: string } | undefined)?.reason;
 
   const act = async (f: (q: QcyProvider) => Promise<QcyState>) => {
@@ -81,7 +87,7 @@ export function Fones(props: { tab?: string }) {
         <span class="muted sync">
           <Icon name="arrow_sync" /> {syncText()}
         </span>
-        <Button icon="arrow_sync" disabled={busy() || (!live() && !readOnly())} onClick={() => void act((q) => q.refresh())}>
+        <Button icon="arrow_sync" disabled={!canRefresh(state(), busy())} onClick={() => void act((q) => q.refresh())}>
           {ft("refresh")}
         </Button>
         <span class="muted refresh-hint">{ft("refresh_hint")}</span>
@@ -130,9 +136,20 @@ export function Fones(props: { tab?: string }) {
                 {s().link.state === "none" ? `${ft("read_only.text")} ${ft("read_only.first")}` : ft("read_only.text")}
               </Banner>
             </Show>
-            <div class="fones-body" classList={{ stale: !live(), readonly: live() && readOnly() }} aria-disabled={!editable()} inert={!editable() ? true : undefined}>
+            <Show when={s().writable !== undefined && !s().read_only && (s().writable?.length ?? 0) > 0}>
+              <Banner kind="info" title={ft("write_test.title")}>
+                {ft("write_test.text")}
+              </Banner>
+            </Show>
+            <WriteBanner s={s()} busy={busy()} send={send} diag={() => navigate({ name: "diagnostics" })} />
+            <div
+              class="fones-body"
+              classList={{ stale: !live(), readonly: live() && readOnly() }}
+              aria-disabled={!editable() && !(tab() === "main" && partial())}
+              inert={!editable() && !(tab() === "main" && partial()) ? true : undefined}
+            >
               <Show when={tab() === "main"}>
-                <MainTab s={s()} send={send} />
+                <MainTab s={s()} send={send} can={can} partial={partial()} busy={busy()} verified={s().verified ?? []} />
               </Show>
               <Show when={tab() === "eq"}>
                 <EqTab s={s()} send={send} notify={notify} />
@@ -229,8 +246,122 @@ function BatteryRing(props: { b: Battery; label: string; icon: JSX.Element }) {
 
 const SCENES: NoiseScene[] = ["adaptive", "indoor", "commuting", "noisy", "anti_wind"];
 
-function MainTab(props: { s: QcyState; send: (c: QcyChange) => Promise<boolean> }) {
+/** The result of the last write: confirmed (with "Desfazer") or failed
+ *  (with "Tentar de novo" and the Diagnóstico link) */
+function WriteBanner(props: { s: QcyState; busy: boolean; send: (c: QcyChange) => Promise<boolean>; diag: () => void }) {
+  const onOff = (v: boolean) => ft(v ? "write.on" : "write.off");
+  const offline = () => props.s.link.state !== "connected";
+  return (
+    <Show when={props.s.write}>
+      {(w) => (
+        <Show
+          when={w().status === "confirmed"}
+          fallback={
+            <Banner
+              kind="error"
+              title={ft("write.fail_title")}
+              actions={
+                <>
+                  <Button kind="strong" busy={props.busy} disabled={props.busy || offline()} onClick={() => void props.send({ kind: "game_mode", enabled: w().enabled })}>
+                    {ft("write.retry")}
+                  </Button>
+                  <Button kind="subtle" onClick={props.diag}>
+                    {ft("write.diag")}
+                  </Button>
+                </>
+              }
+            >
+              {failureText(w().failure)}
+            </Banner>
+          }
+        >
+          <Banner
+            kind="good"
+            title={ft(w().enabled ? "write.ok_on" : "write.ok_off")}
+            actions={
+              <Show when={w().previous !== null && w().previous !== w().enabled}>
+                <Button busy={props.busy} disabled={props.busy || offline()} onClick={() => void props.send({ kind: "game_mode", enabled: w().previous === true })}>
+                  {ft("write.undo", onOff(w().previous === true))}
+                </Button>
+              </Show>
+            }
+          >
+            <Show when={w().previous !== null}>{ft("write.previous", onOff(w().previous === true))}</Show>
+          </Banner>
+        </Show>
+      )}
+    </Show>
+  );
+}
+
+function failureText(f: QcyWrite["failure"]) {
+  switch (f) {
+    case "timeout":
+    case "mismatch":
+    case "no_previous":
+    case "send_failed":
+      return ft(`write.fail.${f}`);
+    default:
+      return ft("write.fail.link");
+  }
+}
+
+/** The steps of the last game mode write, under its switch */
+export function writeStepLines(w: QcyWrite): string[] {
+  const onOff = (v: boolean) => ft(v ? "write.on" : "write.off");
+  const line = (st: QcyWrite["steps"][number]): string | null => {
+    switch (st.what) {
+      case "read_previous":
+        return w.previous === null ? null : ft("write.step.read_previous", onOff(w.previous));
+      case "read_previous_failed":
+        return ft("write.step.no_previous");
+      case "sent":
+        return ft("write.step.sent", ft(w.enabled ? "write.turn_on" : "write.turn_off"));
+      case "send_failed":
+        return ft("write.step.send_failed");
+      case "read_back":
+        return w.status === "confirmed" ? ft("write.step.read_back", onOff(w.enabled)) : ft("write.step.read_back_bad", st.detail);
+      case "no_read_back":
+        return ft("write.step.no_read_back");
+      default:
+        return null;
+    }
+  };
+  return w.steps.map(line).filter((l): l is string => l !== null);
+}
+
+function WriteSteps(props: { w: QcyWrite }) {
+  return (
+    <ol class="write-steps hint">
+      <For each={writeStepLines(props.w)}>{(l) => <li>{l}</li>}</For>
+    </ol>
+  );
+}
+
+function MainTab(props: {
+  s: QcyState;
+  send: (c: QcyChange) => Promise<boolean>;
+  can?: (kind: string) => boolean;
+  partial?: boolean;
+  busy?: boolean;
+  /** Writable settings already confirmed on the earbuds (tag Verificado) */
+  verified?: string[];
+}) {
   const s = () => props.s;
+  const can = (k: string) => props.can?.(k) ?? true;
+  const ok = (k: string) => props.verified?.includes(k) === true;
+  const locked = (k: string) => props.partial === true && !can(k);
+  /** The tag of a control in the partial (write test) mode */
+  const tag = (k: string) =>
+    props.partial ? (
+      <span
+        class="codec-badge fones-tag"
+        classList={{ "tag-verified": can(k) && ok(k), "tag-testing": can(k) && !ok(k), "tag-unverified": !can(k) }}
+      >
+        {ft(!can(k) ? "tag.unverified" : ok(k) ? "tag.verified" : "tag.testing")}
+      </span>
+    ) : undefined;
+  const gameWrite = () => (s().write?.setting === "game_mode" ? s().write : null);
   return (
     <>
       <section class="card dev">
@@ -251,7 +382,15 @@ function MainTab(props: { s: QcyState; send: (c: QcyChange) => Promise<boolean> 
         </div>
       </section>
 
-      <Section title={ft("noise.title")} actions={<span class="hint">{live(s()) ? ft("noise.synced") : ft("last_value")}</span>}>
+      <Section
+        title={ft("noise.title")}
+        actions={
+          <span class="hint">
+            {tag("noise")} {live(s()) ? ft("noise.synced") : ft("last_value")}
+          </span>
+        }
+      >
+        <div class="fones-lock" classList={{ locked: locked("noise") }} inert={locked("noise") ? true : undefined}>
         <Segmented<NoiseMode>
           label={ft("noise.title")}
           value={s().noise_mode}
@@ -281,12 +420,25 @@ function MainTab(props: { s: QcyState; send: (c: QcyChange) => Promise<boolean> 
             )}
           </For>
         </div>
+        </div>
       </Section>
 
       <Section title={ft("modes.title")} actions={<LastValue s={s()} />}>
-        <Toggle label={ft("game")} hint={ft("game.hint")} checked={s().game_mode} onChange={(enabled) => void props.send({ kind: "game_mode", enabled })} />
-        <Toggle label={ft("sleep")} hint={ft("sleep.hint")} checked={s().sleep_mode} onChange={(enabled) => void props.send({ kind: "sleep_mode", enabled })} />
-        <Toggle label={ft("wind")} hint={ft("wind.hint")} checked={s().wind_reduction} onChange={(enabled) => void props.send({ kind: "wind_reduction", enabled })} />
+        <Toggle
+          label={ft("game")}
+          badge={tag("game_mode")}
+          hint={props.busy && props.partial ? ft("write.sending") : ft("game.hint")}
+          checked={s().game_mode}
+          disabled={props.partial === true && (props.busy === true || !can("game_mode"))}
+          onChange={(enabled) => void props.send({ kind: "game_mode", enabled })}
+        />
+        <Show when={props.partial ? gameWrite() : null}>{(w) => <WriteSteps w={w()} />}</Show>
+        <div class="fones-lock" classList={{ locked: locked("sleep_mode") }} inert={locked("sleep_mode") ? true : undefined}>
+          <Toggle label={ft("sleep")} badge={tag("sleep_mode")} hint={ft("sleep.hint")} checked={s().sleep_mode} onChange={(enabled) => void props.send({ kind: "sleep_mode", enabled })} />
+        </div>
+        <div class="fones-lock" classList={{ locked: locked("wind_reduction") }} inert={locked("wind_reduction") ? true : undefined}>
+          <Toggle label={ft("wind")} badge={tag("wind_reduction")} hint={ft("wind.hint")} checked={s().wind_reduction} onChange={(enabled) => void props.send({ kind: "wind_reduction", enabled })} />
+        </div>
       </Section>
     </>
   );
@@ -295,6 +447,13 @@ function MainTab(props: { s: QcyState; send: (c: QcyChange) => Promise<boolean> 
 const live = (s: QcyState) => s.link.state === "connected";
 
 /** The small curve of a preset chip */
+/** Atualizar: always usable unless busy or already connecting. It is the
+ *  only way to open the headset link after a core restart (link "none"),
+ *  in read-only and writable builds alike; refresh only reads. */
+export function canRefresh(s: QcyState | null | undefined, busy: boolean): boolean {
+  return !busy && s?.link.state !== "connecting";
+}
+
 export function curvePath(gains: number[], w = 56, h = 18): string {
   const y = (g: number) => h / 2 - (g / EQ_GAIN_MAX) * (h / 2 - 1);
   return gains.map((g, i) => `${i ? "L" : "M"}${((i * w) / (gains.length - 1)).toFixed(1)} ${y(g).toFixed(1)}`).join(" ");

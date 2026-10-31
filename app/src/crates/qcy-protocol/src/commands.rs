@@ -200,7 +200,9 @@ impl EqualizerState {
             return None;
         }
         let bands = parameters[3..]
-            .chunks_exact(7)
+            .as_chunks::<7>()
+            .0
+            .iter()
             .map(|b| EqualizerBand {
                 frequency: u16::from_le_bytes([b[0], b[1]]),
                 gain: f64::from(i16::from_le_bytes([b[2], b[3]])) / 100.0,
@@ -298,7 +300,7 @@ pub fn parse_key_functions(value: &[u8]) -> BTreeMap<u8, u8> {
     if !value.len().is_multiple_of(2) {
         return BTreeMap::new();
     }
-    value.chunks_exact(2).map(|pair| (pair[0], pair[1])).collect()
+    value.as_chunks::<2>().0.iter().map(|&[a, b]| (a, b)).collect()
 }
 
 /// The N70 equalizer needs exactly ten gains

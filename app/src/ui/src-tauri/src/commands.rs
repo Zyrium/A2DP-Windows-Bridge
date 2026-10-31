@@ -129,9 +129,10 @@ pub fn update_install(app: AppHandle, manifest_url: String) -> Result<(), String
     update::start(&app, manifest_url)
 }
 
-// The Fones screen's QCY earbuds (ipc/qcy.ts), READ ONLY in this version:
-// state, refresh and reconnect go to the core (qcy.*); set and
-// save_profile are refused here, so nothing is ever written to the earbuds.
+// The Fones screen's QCY earbuds (ipc/qcy.ts): state, refresh and reconnect
+// go to the core (qcy.*). qcy_set forwards ONLY { kind: "game_mode",
+// enabled: bool } (the core checks again); every other change and
+// save_profile are refused here, before the core.
 
 fn qcy_read_only() -> ErrorInfo {
     ErrorInfo { code: "qcy.read_only".into(), message: ipc::Msg::new("fones.error.read_only") }
@@ -152,11 +153,24 @@ pub async fn qcy_reconnect(window: WebviewWindow, ipc: State<'_, Arc<Ipc>>) -> R
     ipc.request(window.label(), "qcy.reconnect", None).await
 }
 
-/// Changing a setting of the earbuds is not available in this version
+/// The only change this version sends to the core: game mode on/off
+fn qcy_allowed(change: Option<&Value>) -> Option<Value> {
+    let c = change?.as_object()?;
+    if c.len() != 2 || c.get("kind")?.as_str()? != "game_mode" {
+        return None;
+    }
+    let enabled = c.get("enabled")?.as_bool()?;
+    Some(serde_json::json!({ "kind": "game_mode", "enabled": enabled }))
+}
+
 #[tauri::command]
-pub fn qcy_set(change: Option<Value>) -> Result<Value, ErrorInfo> {
-    let _ = change;
-    Err(qcy_read_only())
+pub async fn qcy_set(
+    window: WebviewWindow,
+    ipc: State<'_, Arc<Ipc>>,
+    change: Option<Value>,
+) -> Result<Value, ErrorInfo> {
+    let Some(params) = qcy_allowed(change.as_ref()) else { return Err(qcy_read_only()) };
+    ipc.request(window.label(), "qcy.set", Some(params)).await
 }
 
 #[tauri::command]
@@ -170,7 +184,24 @@ mod qcy_tests {
 
     #[test]
     fn writes_to_the_earbuds_are_refused() {
-        assert_eq!(qcy_set(Some(serde_json::json!({ "kind": "ldac", "enabled": false }))).unwrap_err().code, "qcy.read_only");
+        use serde_json::json;
+        for c in [
+            json!({ "kind": "ldac", "enabled": false }),
+            json!({ "kind": "multipoint", "enabled": true }),
+            json!({ "kind": "noise", "mode": "anc" }),
+            json!({ "kind": "game_mode" }),
+            json!({ "kind": "game_mode", "enabled": "yes" }),
+            json!({ "kind": "game_mode", "enabled": true, "raw": "FF03030101" }),
+        ] {
+            assert_eq!(qcy_allowed(Some(&c)), None, "{c}");
+        }
+        assert_eq!(qcy_allowed(None), None);
         assert_eq!(qcy_save_profile().unwrap_err().code, "qcy.read_only");
+    }
+
+    #[test]
+    fn game_mode_is_forwarded() {
+        let on = serde_json::json!({ "kind": "game_mode", "enabled": true });
+        assert_eq!(qcy_allowed(Some(&on)), Some(on));
     }
 }

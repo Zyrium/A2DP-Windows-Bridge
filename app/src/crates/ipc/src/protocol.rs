@@ -777,6 +777,13 @@ pub enum Method {
     /// The same read, for "Tentar de novo" -> QcyState
     #[serde(rename = "qcy.reconnect")]
     QcyReconnect,
+    /// Changes ONE setting of the QCY earbuds: only kind "game_mode" in
+    /// this version (opcode 0x09, 01/02); anything else is refused with
+    /// qcy.read_only before any Bluetooth traffic. Reads the old value,
+    /// sends one command, reads it back (3 s each) -> QcyState with `write`
+    /// (confirmed or failed, never re-sent); also sent as Event::Qcy
+    #[serde(rename = "qcy.set")]
+    QcySet { kind: String, enabled: bool },
     /// The UI hid its main window to the tray: the core shows v1's "still
     /// running in the tray" balloon the first time
     #[serde(rename = "app.hidden_to_tray")]

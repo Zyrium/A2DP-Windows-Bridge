@@ -52,6 +52,10 @@ pub struct Entry {
     pub firmware: Option<String>,
     /// Unix ms
     pub saved_at: u64,
+    /// The value a setting had before the last confirmed write (key ->
+    /// on/off), for "Desfazer" after a restart too
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub previous: BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,7 +99,24 @@ pub fn save(dir: &Path, f: &CacheFile) -> std::io::Result<()> {
 /// Stores `entry` for `classic`, replacing the old one
 pub fn remember(dir: &Path, classic: &str, entry: Entry) {
     let mut f = load(dir);
+    let mut entry = entry;
+    if let Some(old) = f.devices.get(&classic.to_uppercase())
+        && entry.previous.is_empty()
+    {
+        entry.previous = old.previous.clone();
+    }
     f.devices.insert(classic.to_uppercase(), entry);
+    if let Err(e) = save(dir, &f) {
+        tracing::warn!("QCY: could not write {FILE}: {e}");
+    }
+}
+
+/// Keeps the value `key` had before a write (no-op when `classic` has no
+/// entry yet)
+pub fn save_previous(dir: &Path, classic: &str, key: &str, value: bool) {
+    let mut f = load(dir);
+    let Some(e) = f.devices.get_mut(&classic.to_uppercase()) else { return };
+    e.previous.insert(key.to_string(), value);
     if let Err(e) = save(dir, &f) {
         tracing::warn!("QCY: could not write {FILE}: {e}");
     }
@@ -128,6 +149,7 @@ pub fn entry(name: &str, addr: LeAddr, services: &[GattService], firmware: Optio
         handles: services.iter().map(from_service).collect(),
         firmware,
         saved_at,
+        previous: BTreeMap::new(),
     }
 }
 

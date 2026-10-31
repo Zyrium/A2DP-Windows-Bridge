@@ -1362,6 +1362,19 @@ impl CoreState {
                 }))
                 .await
             }
+            Method::QcySet { kind, enabled } => {
+                let change = serde_json::json!({ "kind": kind, "enabled": enabled });
+                if crate::qcy_live::allowed_change(&change).is_none() {
+                    return Err(err("qcy.read_only", "fones.error.read_only"));
+                }
+                blocking(Box::new(move |me| {
+                    let v = crate::qcy_live::set(&me.service, &change)
+                        .map_err(|()| err("qcy.read_only", "fones.error.read_only"))?;
+                    me.publish(Event::Qcy(v.clone()));
+                    Ok(v)
+                }))
+                .await
+            }
             Method::AppCheckUpdate => blocking(Box::new(|me| me.check_update().map(|u| json(&u)))).await,
             Method::AppHiddenToTray => {
                 self.hidden_to_tray();

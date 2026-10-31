@@ -13,6 +13,9 @@ export interface MockQcyOptions {
   readOnly?: boolean;
   /** Start with this unavailable reason instead of gatt_failed */
   reason?: "le_off" | "not_found" | "gatt_failed";
+  /** Like this version: only game mode can change, with the write flow;
+   *  "fail" never confirms (the 3 s timeout) */
+  gameOnly?: boolean | "fail";
   /** Multiplies every delay (0 in tests) */
   speed?: number;
 }
@@ -57,6 +60,7 @@ export class MockQcy implements QcyProvider {
   private subs = new Set<(s: QcyState) => void>();
   private speed: number;
   private readOnly: boolean;
+  private gameOnly: boolean | "fail";
   /** Changes received, for the tests */
   readonly calls: QcyChange[] = [];
 
@@ -65,6 +69,13 @@ export class MockQcy implements QcyProvider {
     this.s = sampleQcyState();
     this.readOnly = o.readOnly === true;
     if (this.readOnly) this.s.read_only = true;
+    this.gameOnly = o.gameOnly ?? false;
+    if (this.gameOnly) {
+      this.s.read_only = false;
+      this.s.writable = ["game_mode"];
+      this.s.verified = ["game_mode"];
+      this.s.write = null;
+    }
     if (o.unavailable || o.reason) {
       const reason = o.reason ?? "gatt_failed";
       this.s.link = reason === "gatt_failed" ? { state: "unavailable", reason, detail: "GATT: 0x85" } : { state: "unavailable", reason };
@@ -93,6 +104,7 @@ export class MockQcy implements QcyProvider {
   async set(c: QcyChange) {
     this.calls.push(c);
     if (this.readOnly) throw { code: "qcy.read_only", msg: { key: "fones.error.read_only", args: [] } };
+    if (this.gameOnly) return this.setGame(c);
     this.requireLink();
     await this.wait(c.kind === "ldac" ? 2500 : 250);
     switch (c.kind) {
@@ -119,6 +131,30 @@ export class MockQcy implements QcyProvider {
         this.s[c.kind] = c.enabled;
     }
     this.s.synced_at = Date.now();
+    return this.push();
+  }
+
+  /** The write flow of the core (qcy_protocol::write), faked */
+  private async setGame(c: QcyChange) {
+    if (c.kind !== "game_mode") throw { code: "qcy.read_only", msg: { key: "fones.error.read_only", args: [] } };
+    this.requireLink();
+    const previous = this.s.game_mode;
+    const sent = c.enabled ? "FF03090101" : "FF03090102";
+    const steps = [
+      { what: "read_previous", detail: `FF03FE0109 -> ${previous ? "on" : "off"}` },
+      { what: "sent", detail: sent },
+    ];
+    await this.wait(this.gameOnly === "fail" ? 3000 : 400);
+    if (this.gameOnly === "fail") {
+      steps.push({ what: "no_read_back", detail: "3000 ms" });
+      this.s.write = { setting: "game_mode", enabled: c.enabled, previous, status: "failed", failure: "timeout", sent, read_back: null, steps, at_ms: Date.now() };
+    } else {
+      const read_back = c.enabled ? "090101" : "090102";
+      steps.push({ what: "read_back", detail: read_back });
+      this.s.game_mode = c.enabled;
+      this.s.synced_at = Date.now();
+      this.s.write = { setting: "game_mode", enabled: c.enabled, previous, status: "confirmed", failure: null, sent, read_back, steps, at_ms: Date.now() };
+    }
     return this.push();
   }
 

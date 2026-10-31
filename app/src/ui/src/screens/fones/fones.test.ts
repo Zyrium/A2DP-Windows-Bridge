@@ -3,7 +3,7 @@ import { parseRoute, routeHash } from "../../app/context";
 import { MockQcy } from "../../ipc/qcyMock";
 import { EQ_BANDS_HZ } from "../../ipc/qcy";
 import { EQ_PRESETS, matchPreset } from "../../lib/eqPresets";
-import { curvePath } from "./Fones";
+import { canRefresh, curvePath, writeStepLines } from "./Fones";
 
 describe("fones", () => {
   it("routes the three views", () => {
@@ -48,11 +48,49 @@ describe("read only (this version)", () => {
 
 import { placeholderQcyState } from "../../ipc/qcy";
 describe("placeholder (real build, no qcy_* commands)", () => {
+  it("game mode only: reads, one command, read-back; the rest is refused", async () => {
+    const q = new MockQcy({ speed: 0, gameOnly: true });
+    expect((await q.state()).writable).toEqual(["game_mode"]);
+    const on = await q.set({ kind: "game_mode", enabled: true });
+    expect(on.game_mode).toBe(true);
+    expect(on.write).toMatchObject({ status: "confirmed", previous: false, sent: "FF03090101", failure: null });
+    expect(on.write!.steps.map((s) => s.what)).toEqual(["read_previous", "sent", "read_back"]);
+    expect(writeStepLines(on.write!)).toHaveLength(3);
+    // Desfazer: the same flow back to the saved value
+    const undo = await q.set({ kind: "game_mode", enabled: on.write!.previous! });
+    expect(undo.game_mode).toBe(false);
+    expect(undo.write).toMatchObject({ status: "confirmed", previous: true, sent: "FF03090102" });
+    for (const c of [{ kind: "sleep_mode", enabled: true }, { kind: "ldac", enabled: false }, { kind: "noise", mode: "off" }] as const) {
+      await expect(q.set(c)).rejects.toMatchObject({ code: "qcy.read_only" });
+    }
+  });
+
+  it("game mode timeout: the switch keeps the value read, nothing re-sent", async () => {
+    const q = new MockQcy({ speed: 0, gameOnly: "fail" });
+    const s = await q.set({ kind: "game_mode", enabled: true });
+    expect(s.game_mode).toBe(false);
+    expect(s.write).toMatchObject({ status: "failed", failure: "timeout", read_back: null });
+    expect(s.write!.steps.filter((x) => x.what === "sent")).toHaveLength(1);
+    expect(q.calls).toHaveLength(1);
+  });
+
   it("shows no headset data and the not_implemented reason", () => {
     const s = placeholderQcyState();
     expect(s.link).toEqual({ state: "unavailable", reason: "not_implemented" });
     expect(s.device_name).toBe("");
     expect(s.battery.left.level).toBeNull();
     expect(s.synced_at).toBeNull();
+  });
+});
+
+describe("Atualizar", () => {
+  it("is enabled with link none in the game-mode build (read_only false)", async () => {
+    const s = { ...(await new MockQcy({ speed: 0, gameOnly: true }).state()), read_only: false, writable: ["game_mode"], link: { state: "none" as const } };
+    expect(canRefresh(s, false)).toBe(true);
+    expect(canRefresh(s, true)).toBe(false);
+    expect(canRefresh({ ...s, link: { state: "connecting" as const } }, false)).toBe(false);
+    const off = await new MockQcy({ speed: 0, unavailable: true }).state();
+    expect(off.link.state).toBe("unavailable");
+    expect(canRefresh(off, false)).toBe(true);
   });
 });
