@@ -535,6 +535,7 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0))
 }
 
+#[cfg(test)]
 /// [`view_all`] without a write
 pub fn view(last: Option<&Reading>, link: Option<Unavailable>) -> Value {
     view_all(last, link, None)

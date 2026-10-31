@@ -247,6 +247,7 @@ impl BtHost {
 
     /// Reads a characteristic value (long reads included). Err: why.
     pub fn le_gatt_read(&self, device: LeDeviceId, value_handle: u16, timeout: Duration) -> Result<Vec<u8>, String> {
+        #[allow(clippy::type_complexity)]
         let slot: Arc<Mutex<Option<(u8, Vec<u8>)>>> = Arc::default();
         let s = slot.clone();
         self.le_wait(timeout, true, move |ctx, done| {
