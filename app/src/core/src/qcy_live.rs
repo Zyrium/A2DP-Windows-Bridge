@@ -19,9 +19,12 @@
 //! for a long connection interval with short events, sends the 13 queries
 //! back to back and disconnects as soon as they are answered. Only the
 //! first read (or one after a failure) scans, with a 25 % window, and stops
-//! when the earbuds are seen.
+//! when the earbuds are seen. Where the last read found them is kept in
+//! qcy-cache.json ([`crate::qcy_cache`]), so this holds after a restart too.
 
+use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -123,6 +126,8 @@ struct Cache {
 
 static CACHE: Mutex<Cache> = Mutex::new(Cache { last: None, link: None });
 static KNOWN: Mutex<Option<Known>> = Mutex::new(None);
+/// qcy-cache.json was read into KNOWN (once per process)
+static LOADED: AtomicBool = AtomicBool::new(false);
 /// One read at a time
 static READING: Mutex<()> = Mutex::new(());
 
@@ -135,7 +140,7 @@ pub fn current() -> Value {
 /// Reads the earbuds now (blocking: run off the async runtime)
 pub fn refresh(service: &Service) -> Value {
     let _one = READING.lock().unwrap_or_else(|e| e.into_inner());
-    let result = host_for_read(service).and_then(|h| read(&h));
+    let result = host_for_read(service).and_then(|h| read(&h, service.config_dir()));
     let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     match result {
         Ok(r) => {
@@ -169,15 +174,36 @@ fn host_for_read(service: &Service) -> Result<std::sync::Arc<BtHost>, Unavailabl
     if host.le_ready() { Ok(host) } else { Err(Unavailable::LeOff) }
 }
 
-fn read(host: &BtHost) -> Result<Reading, Unavailable> {
+/// Fills KNOWN from qcy-cache.json the first time (no Bluetooth traffic)
+fn load_known(dir: &Path) {
+    if LOADED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let file = crate::qcy_cache::load(dir);
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if known.is_none()
+        && let Some((classic, addr, services, e)) = crate::qcy_cache::latest(&file)
+    {
+        tracing::info!("QCY: {} from {} (LE {}, {} services)", classic, crate::qcy_cache::FILE, addr, services.len());
+        *known = Some(Known { addr, name: e.name.clone(), address: classic, services });
+    }
+}
+
+fn read(host: &BtHost, dir: &Path) -> Result<Reading, Unavailable> {
+    load_known(dir);
     let known = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some(k) = known {
         match read_at(host, &k, None) {
-            Ok(r) => return Ok(r),
+            Ok(r) => {
+                remember(dir, &k.address, &r);
+                return Ok(r);
+            }
             Err(why) => {
-                // Moved, changed address or firmware: forget it, find it again
+                // Moved, changed address or firmware: forget it (memory and
+                // qcy-cache.json), find it again
                 tracing::info!("QCY: the known LE address failed ({}), scanning", why.reason());
                 *KNOWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                crate::qcy_cache::invalidate(dir, &k.address);
             }
         }
     }
@@ -192,7 +218,19 @@ fn read(host: &BtHost) -> Result<Reading, Unavailable> {
     let name = if target.name.is_empty() { "QCY MeloBuds N70".to_string() } else { target.name.clone() };
     let address = adv.control_address.map_or_else(|| target.addr.to_string(), advertisement::format_address);
     let k = Known { addr: target.addr, name, address, services: Vec::new() };
-    read_at(host, &k, Some(&adv))
+    let r = read_at(host, &k, Some(&adv))?;
+    remember(dir, &k.address, &r);
+    Ok(r)
+}
+
+/// Writes where `r` was read (KNOWN, set by read_at) to qcy-cache.json
+fn remember(dir: &Path, classic: &str, r: &Reading) {
+    let Some(k) = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
+    if k.services.is_empty() {
+        return;
+    }
+    let e = crate::qcy_cache::entry(&k.name, k.addr, &k.services, r.state.firmware_version.clone(), now_ms());
+    crate::qcy_cache::remember(dir, classic, e);
 }
 
 /// The N70 advertisement of a scan result
