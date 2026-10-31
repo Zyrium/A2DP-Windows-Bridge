@@ -69,13 +69,8 @@ use crate::commands::{self, opcode};
 use crate::packet;
 
 /// The opcodes this build may write (exactly these five)
-pub const ALLOWED: [u8; 5] = [
-    opcode::GAME_MODE,
-    opcode::SLEEP_MODE,
-    opcode::WIND_DETECTION,
-    opcode::NOISE_CONTROL,
-    opcode::WEARING_DETECTION,
-];
+pub const ALLOWED: [u8; 5] =
+    [opcode::GAME_MODE, opcode::SLEEP_MODE, opcode::WIND_DETECTION, opcode::NOISE_CONTROL, opcode::WEARING_DETECTION];
 
 /// The highest music / ANC action byte copied into a 0x2C write (the N70
 /// reports `01`; anything above is not a known action and is never
@@ -194,13 +189,8 @@ pub enum Setting {
 
 impl Setting {
     /// The writable settings (prompt volume is read-only)
-    pub const ALL: [Setting; 5] = [
-        Setting::GameMode,
-        Setting::SleepMode,
-        Setting::WindReduction,
-        Setting::NoiseControl,
-        Setting::WearDetection,
-    ];
+    pub const ALL: [Setting; 5] =
+        [Setting::GameMode, Setting::SleepMode, Setting::WindReduction, Setting::NoiseControl, Setting::WearDetection];
 
     pub fn opcode(self) -> u8 {
         match self {
@@ -1276,10 +1266,7 @@ mod tests {
         assert_eq!(m.sent[0], hex("FF03FE012C"), "read first");
         assert_eq!(m.writes(), [&hex("FF052C03020101")], "exactly one write");
         assert_eq!(o.read_back, Some(vec![0x00, 0x01, 0x01]));
-        assert_eq!(
-            o.steps.iter().map(|s| s.what).collect::<Vec<_>>(),
-            ["read_previous", "sent", "read_back"]
-        );
+        assert_eq!(o.steps.iter().map(|s| s.what).collect::<Vec<_>>(), ["read_previous", "sent", "read_back"]);
         // Desfazer: the saved value, the same flow
         let undo = run(&mut m, Setting::WearDetection, o.previous.unwrap(), T);
         assert!(undo.confirmed());

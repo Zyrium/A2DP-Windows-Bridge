@@ -757,7 +757,10 @@ mod tests {
         let v = current_of(None, None);
         assert_eq!(v["link"]["state"], "none");
         assert_eq!(v["read_only"], false);
-        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"]));
+        assert_eq!(
+            v["writable"],
+            json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"])
+        );
         assert_eq!(v["verified"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
         assert_eq!(v["write"], Value::Null);
         assert_eq!(v["synced_at"], Value::Null);
@@ -941,7 +944,10 @@ mod tests {
     #[test]
     fn writable_and_verified() {
         let v = view_all(Some(&reading()), None, None);
-        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"]));
+        assert_eq!(
+            v["writable"],
+            json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"])
+        );
         assert_eq!(v["verified"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
     }
 
