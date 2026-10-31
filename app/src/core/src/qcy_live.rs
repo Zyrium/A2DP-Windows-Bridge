@@ -1278,7 +1278,7 @@ mod tests {
         assert_eq!(v["write"]["setting"], "equalizer");
         assert_eq!(v["write"]["status"], "failed");
         assert_eq!(v["write"]["gains"], json!([2.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.5]));
-        assert_eq!(v["write"]["previous_gains"], json!([0.0; 10]));
+        assert_eq!(v["write"]["previous_gains"], json!(vec![0.0; 10]));
         assert_eq!(v["write"]["previous_preset_index"], 1);
         let o = EqOriginal { preset: 1, curve: [0, 0, 0, 0, 0, 0, 0, 0, 0, 25], saved_at: 5 };
         assert_eq!(EqOriginal::from_json(&o.to_json()), Some(o));
