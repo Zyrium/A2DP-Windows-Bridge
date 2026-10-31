@@ -7,7 +7,7 @@ import { useApp, errorText } from "../../app/context";
 import { Banner, Button, Dialog, Section, Segmented, Select, Toggle, type Option } from "../../components/controls";
 import { Icon } from "../../components/Icon";
 import { CodecBadge } from "../../components/stream";
-import { createQcy, EQ_BANDS_HZ, EQ_GAIN_MAX, EQ_GAIN_MIN, TOUCH_ACTIONS, type AutoOff, type Battery, type GestureKind, NOISE_CODES, noiseCode, type NoiseMode, type NoiseScene, type QcyChange, type QcyProvider, type QcyState, type QcyWrite, type Side } from "../../ipc/qcy";
+import { createQcy, eqWritable, EQ_BANDS_HZ, EQ_GAIN_MAX, EQ_GAIN_MIN, TOUCH_ACTIONS, type AutoOff, type Battery, type GestureKind, NOISE_CODES, noiseCode, type NoiseMode, type NoiseScene, type QcyChange, type QcyProvider, type QcyState, type QcyWrite, type Side } from "../../ipc/qcy";
 import { insideTauri } from "../../ipc/tauri";
 import { EQ_PRESETS, matchPreset } from "../../lib/eqPresets";
 import { lang } from "../../i18n";
@@ -56,6 +56,9 @@ export function Fones(props: { tab?: string }) {
   const can = (kind: string) => live() && !readOnly() && (writable() === undefined || writable()!.includes(kind));
   /** Some, not all, settings can change: the rest is greyed with its tag */
   const partial = () => live() && !readOnly() && (writable()?.length ?? 0) > 0;
+  /** The open tab takes input: everything editable, or the write test with
+   *  something writable on it (the EQ tab only once 0x22 is writable) */
+  const usable = () => editable() || (partial() && (tab() !== "eq" || can("equalizer")));
   const reason = () => (state()?.link as { reason?: string } | undefined)?.reason;
 
   const act = async (f: (q: QcyProvider) => Promise<QcyState>) => {
@@ -139,16 +142,26 @@ export function Fones(props: { tab?: string }) {
               </Banner>
             </Show>
             <Show when={s().writable !== undefined && !s().read_only && (s().writable?.length ?? 0) > 0}>
-              <Banner kind="info" title={ft("write_test.title")}>
-                {ft("write_test.text")}
-              </Banner>
+              <Show
+                when={tab() === "eq" && can("equalizer")}
+                fallback={
+                  <Banner kind="info" title={ft("write_test.title")}>
+                    {ft("write_test.text")}
+                  </Banner>
+                }
+              >
+                {/* Phase F4: the equalizer write test */}
+                <Banner kind="info" title={ft("write_test.title_eq")}>
+                  {ft("write_test.text_eq")}
+                </Banner>
+              </Show>
             </Show>
             <WriteBanner s={s()} busy={busy()} send={send} diag={() => navigate({ name: "diagnostics" })} />
             <div
               class="fones-body"
               classList={{ stale: !live(), readonly: live() && readOnly() }}
-              aria-disabled={!editable() && !(tab() !== "eq" && partial())}
-              inert={!editable() && !(tab() !== "eq" && partial()) ? true : undefined}
+              aria-disabled={!usable()}
+              inert={!usable() ? true : undefined}
             >
               <Show when={tab() === "main"}>
                 <MainTab
@@ -166,7 +179,9 @@ export function Fones(props: { tab?: string }) {
                 />
               </Show>
               <Show when={tab() === "eq"}>
-                <EqTab s={s()} send={send} notify={notify} />
+                <Show when={partial()} fallback={<EqTab s={s()} send={send} notify={notify} />}>
+                  <EqWriteTab s={s()} send={send} busy={busy()} />
+                </Show>
               </Show>
               <Show when={tab() === "settings"}>
                 <SettingsTab
@@ -297,7 +312,7 @@ function WriteBanner(props: { s: QcyState; busy: boolean; send: (c: QcyChange) =
           fallback={
             <Banner
               kind="error"
-              title={ft("write.fail_title", settingName(w().setting))}
+              title={isEq(w()) ? ft("write.fail_title_eq") : ft("write.fail_title", settingName(w().setting))}
               actions={
                 <>
                   <Show when={writeChange(w(), "retry")}>
@@ -313,7 +328,7 @@ function WriteBanner(props: { s: QcyState; busy: boolean; send: (c: QcyChange) =
                 </>
               }
             >
-              {failureText(w().failure)}
+              {failureText(w().failure, isEq(w()))}
             </Banner>
           }
         >
@@ -324,13 +339,15 @@ function WriteBanner(props: { s: QcyState; busy: boolean; send: (c: QcyChange) =
               <Show when={writeChange(w(), "undo")}>
                 {(c) => (
                   <Button busy={props.busy} disabled={props.busy || offline()} onClick={() => void props.send(c())}>
-                    {ft("write.undo", valueText(w(), w().previous))}
+                    {isEq(w()) ? ft("write.undo_eq") : ft("write.undo", valueText(w(), w().previous))}
                   </Button>
                 )}
               </Show>
             }
           >
-            <Show when={w().previous !== null}>{ft("write.previous", valueText(w(), w().previous))}</Show>
+            <Show when={isEq(w())} fallback={<Show when={w().previous !== null}>{ft("write.previous", valueText(w(), w().previous))}</Show>}>
+              <Show when={w().previous_gains}>{(g) => ft("write.previous_eq", curveText(g(), w().previous_preset_index ?? null))}</Show>
+            </Show>
           </Banner>
         </Show>
       )}
@@ -390,6 +407,8 @@ export function settingName(k: string): string {
       return ft("noise.title");
     case "wear_detection":
       return ft("wear");
+    case "equalizer":
+      return ft("eq.title");
     default:
       return k;
   }
@@ -397,6 +416,20 @@ export function settingName(k: string): string {
 
 const isLevel = (w: QcyWrite) => w.setting === "prompt_volume";
 const isNoise = (w: QcyWrite) => w.setting === "noise_control";
+const isEq = (w: QcyWrite) => w.setting === "equalizer";
+const sameCurve = (a: readonly number[], b: readonly number[]) => a.length === b.length && a.every((g, i) => Math.abs(g - b[i]) < 0.005);
+
+/** An app preset's name, or null for a curve no preset has */
+function presetName(gains: readonly number[]): string | null {
+  const id = matchPreset([...gains], 0);
+  return id === "custom" ? null : ft(`eq.preset.${id}` as Parameters<typeof ft>[0]);
+}
+
+/** A curve as text: "preset 1, plana", "Rock", "personalizada" */
+export function curveText(gains: readonly number[], preset: number | null): string {
+  const shape = gains.every((g) => g === 0) ? ft("eq.flat") : (presetName(gains) ?? ft("eq.custom_curve"));
+  return preset === null ? shape : ft("eq.curve_of", preset, shape);
+}
 /** What the write asked for: a boolean, the prompt volume level or the noise code */
 const target = (w: QcyWrite): boolean | number | null => (isLevel(w) || isNoise(w) ? (w.value ?? null) : w.enabled);
 
@@ -411,6 +444,7 @@ export function valueText(w: QcyWrite, v: boolean | number | null | undefined): 
 }
 
 function writeTitle(w: QcyWrite): string {
+  if (isEq(w)) return ft("write.ok_eq");
   if (isNoise(w)) return ft("write.ok_noise", valueText(w, w.value));
   if (isLevel(w)) return ft("write.ok_level", settingName(w.setting), valueText(w, w.value));
   if (w.setting === "wear_detection") return ft(w.enabled ? "write.ok_on_f" : "write.ok_off_f", settingName(w.setting));
@@ -420,6 +454,13 @@ function writeTitle(w: QcyWrite): string {
 /** The one change "Tentar de novo" (same value) or "Desfazer" (back to the
  *  value read before) sends; null when there is none. Only F2 settings. */
 export function writeChange(w: QcyWrite, which: "retry" | "undo"): QcyChange | null {
+  if (isEq(w)) {
+    // Phase F4: the same ten gains again, or the curve read before
+    const g = which === "retry" ? w.gains : w.previous_gains;
+    if (!g || !eqWritable(g)) return null;
+    if (which === "undo" && w.gains && sameCurve(g, w.gains)) return null;
+    return { kind: "equalizer", gains: [...g] };
+  }
   const v = which === "retry" ? target(w) : w.previous;
   if (v === null || v === undefined) return null;
   if (which === "undo" && v === target(w)) return null;
@@ -442,7 +483,8 @@ export function promptMax(s: QcyState): number {
   return s.prompt_volume_max > 0 ? s.prompt_volume_max : 15;
 }
 
-function failureText(f: QcyWrite["failure"]) {
+function failureText(f: QcyWrite["failure"], eq = false) {
+  if (eq && (f === "timeout" || f === "mismatch" || f === "no_previous" || f === "out_of_range")) return ft(`write.fail.${f}_eq`);
   switch (f) {
     case "timeout":
     case "mismatch":
@@ -458,6 +500,7 @@ function failureText(f: QcyWrite["failure"]) {
 /** The steps of the last write, under its control */
 export function writeStepLines(w: QcyWrite): string[] {
   const line = (st: QcyWrite["steps"][number]): string | null => {
+    if (isEq(w)) return eqStepLine(w, st);
     switch (st.what) {
       case "read_previous":
         return w.previous === null ? null : ft("write.step.read_previous", valueText(w, w.previous));
@@ -487,6 +530,28 @@ export function writeStepLines(w: QcyWrite): string[] {
     }
   };
   return w.steps.map(line).filter((l): l is string => l !== null);
+}
+
+/** A step of an equalizer write (phase F4) */
+function eqStepLine(w: QcyWrite, st: QcyWrite["steps"][number]): string | null {
+  switch (st.what) {
+    case "read_previous":
+      return w.previous_gains ? ft("write.step.read_previous_eq", curveText(w.previous_gains, w.previous_preset_index ?? null)) : null;
+    case "read_previous_failed":
+      return ft("write.step.no_previous_eq");
+    case "sent":
+      return ft("write.step.sent_eq", w.gains ? (presetName(w.gains) ?? ft("eq.custom_curve")) : "?");
+    case "send_failed":
+      return ft("write.step.send_failed");
+    case "read_back":
+      return w.status === "confirmed" ? ft("write.step.read_back_eq") : ft("write.step.read_back_bad_eq", st.detail.split(" ")[0]);
+    case "no_read_back":
+      return ft("write.step.no_read_back_eq");
+    case "refused":
+      return ft("write.step.refused_eq");
+    default:
+      return null;
+  }
 }
 
 function WriteSteps(props: { w: QcyWrite }) {
@@ -740,6 +805,146 @@ function EqTab(props: { s: QcyState; send: (c: QcyChange) => Promise<boolean>; n
       </Section>
 
       <GesturesSection s={props.s} send={props.send} />
+    </>
+  );
+}
+
+/** Phase F4 ("Em teste"): the equalizer of the write test. Presets and
+ *  sliders only change the draft; "Aplicar no fone" sends ONE 0x22 frame
+ *  (the core reads and keeps the curve first and reads it back). A new
+ *  state from the earbuds (the read-back, or the curve read after a
+ *  failure) replaces the draft. Gestures stay read-only. */
+function EqWriteTab(props: { s: QcyState; send: (c: QcyChange) => Promise<boolean>; busy: boolean }) {
+  const read = () => props.s.eq.gains.slice(0, EQ_BANDS_HZ.length);
+  const known = () => props.s.eq_known !== false;
+  const [draft, setDraft] = createSignal<number[]>(read());
+  createEffect(() => setDraft(read()));
+  const changed = (i: number) => Math.abs(draft()[i] - read()[i]) >= 0.005;
+  const changedCount = () => draft().filter((_, i) => changed(i)).length;
+  const dirty = () => changedCount() > 0;
+  const w = () => (props.s.write?.setting === "equalizer" ? props.s.write : null);
+  const pIndex = () => props.s.eq_preset_index ?? null;
+  /** The select: an app preset, the curve read, or "changed, not sent" */
+  const choice = () => {
+    const m = matchPreset(draft(), 0);
+    if (dirty()) return m === "custom" ? "custom" : m;
+    const last = w();
+    return last?.status === "confirmed" && m !== "custom" ? m : "read";
+  };
+  const options = (): Option<string>[] => [
+    ...EQ_PRESETS.map((p) => ({ value: p.id as string, label: ft(`eq.preset.${p.id}` as Parameters<typeof ft>[0]) })),
+    { value: "read", label: pIndex() === null ? ft("eq.read_curve") : ft("eq.read_preset", pIndex()!) },
+    ...(choice() === "custom" ? [{ value: "custom", label: ft("eq.custom_unsent") }] : []),
+  ];
+  const pick = (v: string) => {
+    if (v === "read") setDraft(read());
+    const p = EQ_PRESETS.find((x) => x.id === v);
+    if (p) setDraft([...p.gains]);
+  };
+  const original = () => props.s.eq_original ?? null;
+  const fmt = (g: number) => (g > 0 ? "+" : g < 0 ? "−" : "+") + Math.abs(g).toFixed(Number.isInteger(g) ? 0 : 1) + " dB";
+
+  return (
+    <>
+      <Section
+        title={ft("eq.title")}
+        actions={
+          <span class="codec-badge fones-tag tag-testing">{ft("tag.testing")}</span>
+        }
+      >
+        <div class="row eq-preset">
+          <div class="row-text">
+            <span class="row-label">{ft("eq.preset")}</span>
+            <span class="hint">{ft("eq.preset_hint")}</span>
+          </div>
+          <Select<string> label={ft("eq.preset")} value={choice()} options={options()} disabled={!known() || props.busy} onChange={pick} />
+        </div>
+        <div class="eq eq-write" classList={{ busy: props.busy }}>
+          <For each={[...EQ_BANDS_HZ]}>
+            {(hz, i) => (
+              <label class="band" classList={{ changed: changed(i()) }}>
+                <span class="gain num">{fmt(draft()[i()])}</span>
+                <input
+                  type="range"
+                  class="vslider"
+                  min={EQ_GAIN_MIN}
+                  max={EQ_GAIN_MAX}
+                  step={0.5}
+                  value={draft()[i()]}
+                  disabled={!known() || props.busy}
+                  aria-label={`${freqLabel(hz)} Hz`}
+                  onInput={(e) => {
+                    const v = Number(e.currentTarget.value);
+                    setDraft(draft().map((g, j) => (j === i() ? v : g)));
+                  }}
+                />
+                <span class="freq">{freqLabel(hz)} Hz</span>
+              </label>
+            )}
+          </For>
+        </div>
+        <div class="eq-actions">
+          <Button
+            kind="strong"
+            busy={props.busy}
+            disabled={!dirty() || !known() || props.busy || !eqWritable(draft())}
+            onClick={() => void props.send({ kind: "equalizer", gains: [...draft()] })}
+          >
+            {ft("eq.apply_write")}
+          </Button>
+          <Show when={dirty()}>
+            <Button kind="subtle" disabled={props.busy} onClick={() => setDraft(read())}>
+              {ft("eq.discard")}
+            </Button>
+          </Show>
+        </div>
+        <div class="eq-log hint">
+          <Show
+            when={known()}
+            fallback={<p class="eq-unknown">{ft("eq.unknown")}</p>}
+          >
+            <Show
+              when={!dirty() && w()}
+              fallback={
+                <>
+                  <p class="eq-read">{ft("eq.read_line", pIndex() ?? "?", curveText(read(), null))}</p>
+                  <Show when={dirty()}>
+                    <p>{ft(changedCount() === 1 ? "eq.changed_one" : "eq.changed", changedCount())}</p>
+                  </Show>
+                </>
+              }
+            >
+              {(last) => <WriteSteps w={last()} />}
+            </Show>
+          </Show>
+        </div>
+        <Show when={original()}>
+          {(o) => (
+            <div class="eq-original hint">
+              <span>
+                {ft(
+                  "eq.original",
+                  new Date(o().saved_at).toLocaleString(lang(), { dateStyle: "short", timeStyle: "short" }),
+                  curveText(o().gains, o().preset),
+                )}
+              </span>
+              <Button
+                kind="subtle"
+                icon="arrow_reset"
+                disabled={props.busy || !known() || sameCurve(o().gains, read()) || !eqWritable(o().gains)}
+                onClick={() => void props.send({ kind: "equalizer", gains: [...o().gains] })}
+              >
+                {ft("eq.restore")}
+              </Button>
+            </div>
+          )}
+        </Show>
+      </Section>
+
+      {/* Gestures: read-only in this version (phase 5) */}
+      <div class="fones-lock locked" inert>
+        <GesturesSection s={props.s} send={props.send} />
+      </div>
     </>
   );
 }

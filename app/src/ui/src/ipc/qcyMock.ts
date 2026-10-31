@@ -3,8 +3,10 @@
 // changes take longer (the headset reconnects the audio). Nothing here
 // talks to Bluetooth.
 
-import { EQ_PRESETS } from "../lib/eqPresets";
-import { NOISE_CODES, noiseCode, type QcyChange, type QcyProvider, type QcyState } from "./qcy";
+import { EQ_PRESETS, matchPreset } from "../lib/eqPresets";
+
+const matchPresetId = (g: number[]) => matchPreset(g, 0);
+import { NOISE_CODES, eqFrameHex, eqWritable, noiseCode, type QcyChange, type QcyProvider, type QcyState } from "./qcy";
 
 export interface MockQcyOptions {
   /** Start with the BLE control link failed (the yellow banner) */
@@ -60,7 +62,14 @@ export function sampleQcyState(): QcyState {
 
 /** The phase-2 allowlist, as in qcy_protocol::write::ALLOWED (the prompt
  *  volume 0x1D is read-only since fase 2b) */
-export const F2_OPCODES = { game_mode: 0x09, sleep_mode: 0x10, wind_reduction: 0x2a, noise_control: 0x17, wear_detection: 0x2c } as const;
+export const F2_OPCODES = {
+  game_mode: 0x09,
+  sleep_mode: 0x10,
+  wind_reduction: 0x2a,
+  noise_control: 0x17,
+  wear_detection: 0x2c,
+  equalizer: 0x22,
+} as const;
 type F2Kind = keyof typeof F2_OPCODES;
 export const F2_WRITABLE = Object.keys(F2_OPCODES) as F2Kind[];
 
@@ -84,8 +93,13 @@ export class MockQcy implements QcyProvider {
       this.s.read_only = false;
       this.s.writable = [...F2_WRITABLE];
       this.s.verified = ["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"];
-      this.s.experimental = [];
+      this.s.experimental = ["equalizer"];
       this.s.write = null;
+      // The N70 as read: preset 1, a flat curve (20 slots, the first ten shown)
+      this.s.eq = { preset: "custom", gains: Array(10).fill(0), master_gain: 0 };
+      this.s.eq_preset_index = 1;
+      this.s.eq_known = true;
+      this.s.eq_original = null;
     }
     if (o.unavailable || o.reason) {
       const reason = o.reason ?? "gatt_failed";
@@ -146,6 +160,10 @@ export class MockQcy implements QcyProvider {
         }
         this.s.gestures[c.side][c.gesture] = c.action;
         break;
+      case "equalizer":
+        // The full mock: the curve only (the write flow is setEq)
+        this.s.eq = { preset: matchPresetId(c.gains), gains: [...c.gains], master_gain: 0 };
+        break;
       default:
         this.s[c.kind] = c.enabled;
     }
@@ -163,6 +181,7 @@ export class MockQcy implements QcyProvider {
     const at_ms = Date.now();
     if (c.kind === "noise_control") return this.setNoise(c.value);
     if (c.kind === "wear_detection") return this.setWear(c.enabled);
+    if (c.kind === "equalizer") return this.setEq(c.gains);
     if (!("enabled" in c)) throw { code: "qcy.read_only", msg: { key: "fones.error.read_only", args: [] } };
     const kind = c.kind as "game_mode" | "sleep_mode" | "wind_reduction";
     const previous = this.s[kind];
@@ -242,6 +261,40 @@ export class MockQcy implements QcyProvider {
       this.s.wear_read = { ...r, enabled };
       this.s.synced_at = Date.now();
       this.s.write = { ...base, status: "confirmed", failure: null, read_back: readHex(enabled) };
+    }
+    return this.push();
+  }
+
+  /** Phase F4: 0x22; read and keep the curve (the first time also as the
+   *  "original"), ONE frame, the ten bands read back (20 slots, preset 1).
+   *  "fail": no read-back in 3 s, the screen goes back to the curve read. */
+  private async setEq(gains: number[]) {
+    if (!eqWritable(gains)) throw { code: "qcy.read_only", msg: { key: "fones.error.read_only", args: [] } };
+    if (this.s.eq_known === false) {
+      this.s.write = { setting: "equalizer", enabled: null, previous: null, status: "failed", failure: "no_previous", sent: null, read_back: null, steps: [{ what: "read_previous_failed", detail: "FF03FE0122" }], at_ms: Date.now(), gains: [...gains], previous_gains: null, previous_preset_index: null };
+      return this.push();
+    }
+    const at_ms = Date.now();
+    const prev = [...this.s.eq.gains];
+    const preset = this.s.eq_preset_index ?? 1;
+    const db = (g: number[]) => g.map((x) => (x >= 0 ? "+" : "") + x.toFixed(2)).join(" ");
+    const sent = eqFrameHex(gains);
+    const steps = [
+      { what: "read_previous", detail: `FF03FE0122 -> preset ${preset} [${db(prev)}] (143 bytes)` },
+      { what: "sent", detail: sent },
+    ];
+    this.s.eq_original ??= { preset, gains: prev, saved_at: at_ms };
+    await this.wait(this.gameOnly === "fail" ? 3000 : 400);
+    const base = { setting: "equalizer", enabled: null, previous: null, sent, steps, at_ms, gains: [...gains], previous_gains: prev, previous_preset_index: preset };
+    if (this.gameOnly === "fail") {
+      steps.push({ what: "no_read_back", detail: "3000 ms" });
+      this.s.write = { ...base, status: "failed", failure: "timeout", read_back: null };
+    } else {
+      const read_back = `01 0000 ${sent.slice(14)} …`;
+      steps.push({ what: "read_back", detail: `10/10 ${read_back}` });
+      this.s.eq = { preset: "custom", gains: [...gains], master_gain: 0 };
+      this.s.synced_at = Date.now();
+      this.s.write = { ...base, status: "confirmed", failure: null, read_back };
     }
     return this.push();
   }

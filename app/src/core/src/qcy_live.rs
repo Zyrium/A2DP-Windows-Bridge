@@ -1,7 +1,9 @@
 //! The Fones screen's QCY reads (MeloBuds N70): `qcy.state`, `qcy.refresh`,
 //! `qcy.reconnect` and the `qcy` event, plus ONE write per click: `qcy.set`
 //! for game mode, sleep mode or wind reduction (phase F2; the prompt
-//! volume is read-only since fase 2b: the N70 did not take 0x1D). The reads only send the `FF 03 FE <op>` state requests
+//! volume is read-only since fase 2b: the N70 did not take 0x1D), noise
+//! control (F3), wear detection (F3b) and, "Em teste", the ten-band
+//! equalizer (F4, opcode 0x22, [`write::run_eq`]). The reads only send the `FF 03 FE <op>` state requests
 //! of [`commands::STATE_QUERIES`] (opcode 0xFE). The write goes through
 //! [`qcy_protocol::write`] (allowlist: 0x09 / 0x10 / 0x2A with 01/02;
 //! every other change is refused before any Bluetooth traffic) and only on an
@@ -143,6 +145,49 @@ pub struct LastWrite {
     pub failure: Option<&'static str>,
     pub steps: Vec<(String, String)>,
     pub at_ms: u64,
+    /// Phase F4: the equalizer write's curves
+    pub eq: Option<EqWrite>,
+}
+
+/// An equalizer write (1/100 dB)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EqWrite {
+    pub curve: write::EqCurve,
+    /// Preset byte and curve read before the write (None: not read)
+    pub previous: Option<(u8, write::EqCurve)>,
+}
+
+/// The curve read before the FIRST equalizer write ("Restaurar curva
+/// original"): preset byte, curve, Unix ms. Kept in qcy-cache.json too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EqOriginal {
+    pub preset: u8,
+    pub curve: write::EqCurve,
+    pub saved_at: u64,
+}
+
+/// The qcy-cache.json key of [`EqOriginal`]
+const EQ_ORIGINAL_KEY: &str = "equalizer_original";
+
+static EQ_ORIGINAL: Mutex<Option<EqOriginal>> = Mutex::new(None);
+
+impl EqOriginal {
+    fn to_json(&self) -> Value {
+        json!({ "preset": self.preset, "gains": db(&self.curve), "saved_at": self.saved_at })
+    }
+    fn from_json(v: &Value) -> Option<EqOriginal> {
+        let gains: Vec<f64> = v.get("gains")?.as_array()?.iter().map(Value::as_f64).collect::<Option<_>>()?;
+        Some(EqOriginal {
+            preset: u8::try_from(v.get("preset")?.as_u64()?).ok()?,
+            curve: write::eq_curve_from_db(&gains)?,
+            saved_at: v.get("saved_at")?.as_u64()?,
+        })
+    }
+}
+
+/// 1/100 dB -> dB
+fn db(c: &write::EqCurve) -> Vec<f64> {
+    c.iter().map(|g| f64::from(*g) / 100.0).collect()
 }
 
 #[derive(Default)]
@@ -229,6 +274,13 @@ pub fn allowed_change(change: &Value) -> Option<(Setting, u8)> {
 /// only when the change is refused (nothing sent); a write that is not
 /// confirmed is Ok with `write.status = "failed"` in the state.
 pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
+    if change.get("kind").and_then(Value::as_str) == Some("equalizer") {
+        let Some(curve) = allowed_eq(change) else {
+            tracing::warn!("QCY write: refused (equalizer curve not allowed): {change}");
+            return Err(());
+        };
+        return Ok(set_eq(service, &curve));
+    }
     let Some((setting, value)) = allowed_change(change) else {
         tracing::warn!("QCY write: refused (not allowed in this version): {change}");
         return Err(());
@@ -263,6 +315,8 @@ pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
                             r.state.wear_detection_enabled = Some(w.enabled);
                         }
                     }
+                    // Written only by set_eq
+                    Setting::Equalizer => {}
                     Setting::PromptVolume => {
                         if let Some(v) = p.first() {
                             r.state.prompt_volume = Some(*v);
@@ -294,6 +348,7 @@ pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
                 failure: Some(why.reason()),
                 steps: vec![("no_link".into(), why.reason().into())],
                 at_ms: now_ms(),
+                eq: None,
             }
         }
     };
@@ -317,7 +372,117 @@ fn last_write(o: &write::Outcome) -> LastWrite {
         failure: o.failure.map(write::Failure::code),
         steps: o.steps.iter().map(|s| (s.what.to_string(), s.detail.clone())).collect(),
         at_ms: now_ms(),
+        eq: None,
     }
+}
+
+/// Phase F4: the equalizer change the UI may ask for, exactly
+/// `{ "kind": "equalizer", "gains": [10 numbers] }` in dB, each a whole
+/// number of hundredths within ±8 dB (refused, never clamped). Preset,
+/// master gain, Q and type are not the UI's: always 8 / 0 / 1.00 / 0.
+pub fn allowed_eq(change: &Value) -> Option<write::EqCurve> {
+    let c = change.as_object()?;
+    if c.len() != 2 || c.get("kind")?.as_str()? != "equalizer" {
+        return None;
+    }
+    let gains: Vec<f64> = c.get("gains")?.as_array()?.iter().map(Value::as_f64).collect::<Option<_>>()?;
+    let curve = write::eq_curve_from_db(&gains)?;
+    // The same check the frame builder makes
+    write::eq_frame(&curve).ok()?;
+    Some(curve)
+}
+
+/// The equalizer write (blocking): read + keep the curve, ONE 0x22 frame,
+/// read back the ten bands. Never re-sent; a failure shows the curve read.
+fn set_eq(service: &Service, curve: &write::EqCurve) -> Value {
+    let _one = READING.lock().unwrap_or_else(|e| e.into_inner());
+    tracing::info!("QCY write: equalizer -> [{}] (one command, confirmed by a read-back)", write::eq_text(curve));
+    let dir = service.config_dir();
+    let outcome = host_for_read(service).and_then(|h| link_at(&h, dir, |l| write::run_eq(l, curve, WRITE_TIMEOUT)));
+    let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let w = match outcome {
+        Ok((o, classic)) => {
+            for s in &o.steps {
+                tracing::info!("QCY write step: {} {}", s.what, s.detail);
+            }
+            if let Some((preset, prev)) = o.previous {
+                let saved = json!({ "preset": preset, "gains": db(&prev) });
+                crate::qcy_cache::save_previous(dir, &classic, Setting::Equalizer.key(), saved);
+                keep_original(dir, &classic, preset, &prev);
+            }
+            if let Some(r) = c.last.as_mut() {
+                // The screen shows what the earbuds hold: the read-back when
+                // it parses, else the curve read before the write
+                let now = o.read_back.as_deref().and_then(write::eq_read).or(o.previous);
+                if let Some((preset, gains)) = now {
+                    set_gains(&mut r.state, preset, &gains);
+                    r.at_ms = now_ms();
+                }
+            }
+            c.link = None;
+            LastWrite {
+                setting: Setting::Equalizer.key(),
+                toggle: false,
+                value: 0,
+                previous: None,
+                max: None,
+                sent: o.sent.as_deref().map(packet::to_hex),
+                read_back: o.read_back.as_deref().map(packet::to_hex),
+                failure: o.failure.map(write::Failure::code),
+                steps: o.steps.iter().map(|s| (s.what.to_string(), s.detail.clone())).collect(),
+                at_ms: now_ms(),
+                eq: Some(EqWrite { curve: o.curve, previous: o.previous }),
+            }
+        }
+        Err(why) => {
+            tracing::warn!("QCY write: no link ({}), nothing sent", why.reason());
+            LastWrite {
+                setting: Setting::Equalizer.key(),
+                toggle: false,
+                value: 0,
+                previous: None,
+                max: None,
+                sent: None,
+                read_back: None,
+                failure: Some(why.reason()),
+                steps: vec![("no_link".into(), why.reason().into())],
+                at_ms: now_ms(),
+                eq: Some(EqWrite { curve: *curve, previous: None }),
+            }
+        }
+    };
+    match w.failure {
+        None => tracing::info!("QCY write: equalizer confirmed by the earbuds"),
+        Some(f) => tracing::warn!(
+            "QCY write: equalizer NOT confirmed ({f}); the screen shows the curve read, nothing is re-sent"
+        ),
+    }
+    c.write = Some(w);
+    view_all(c.last.as_ref(), c.link, c.write.as_ref())
+}
+
+/// The first ten gains of a state become `gains` (the slots after the tenth
+/// stay as read)
+fn set_gains(s: &mut QcyState, preset: u8, gains: &write::EqCurve) {
+    s.equalizer_preset = Some(preset);
+    if s.equalizer_gains.len() < 10 {
+        s.equalizer_gains = vec![0.0; 10];
+    }
+    for (slot, g) in s.equalizer_gains.iter_mut().zip(db(gains)) {
+        *slot = g;
+    }
+}
+
+/// Keeps the curve read before the first equalizer write, once
+fn keep_original(dir: &Path, classic: &str, preset: u8, curve: &write::EqCurve) {
+    let mut o = EQ_ORIGINAL.lock().unwrap_or_else(|e| e.into_inner());
+    if o.is_some() {
+        return;
+    }
+    let orig = EqOriginal { preset, curve: *curve, saved_at: now_ms() };
+    crate::qcy_cache::save_previous(dir, classic, EQ_ORIGINAL_KEY, orig.to_json());
+    tracing::info!("QCY: original equalizer kept (preset {preset} [{}])", write::eq_text(curve));
+    *o = Some(orig);
 }
 
 /// The BTstack link as the write flow's transport: frames to 1001,
@@ -346,6 +511,20 @@ impl write::Transport for GattLink<'_> {
 /// Connects straight to where the last read found the earbuds (no scan:
 /// a write needs a read first), runs the write flow, disconnects
 fn write_at(host: &BtHost, dir: &Path, setting: Setting, value: u8) -> Result<write::Outcome, Unavailable> {
+    let (o, classic) = link_at(host, dir, |l| write::run(l, setting, value, WRITE_TIMEOUT))?;
+    for s in &o.steps {
+        tracing::info!("QCY write step: {} {}", s.what, s.detail);
+    }
+    if let Some(p) = o.previous {
+        let saved = if setting.is_toggle() { json!(p == 0x01) } else { json!(p) };
+        crate::qcy_cache::save_previous(dir, &classic, setting.key(), saved);
+    }
+    Ok(o)
+}
+
+/// Connects straight to the known earbuds, runs `f` on the command link,
+/// disconnects; returns its result and their classic address
+fn link_at<R>(host: &BtHost, dir: &Path, f: impl FnOnce(&mut GattLink) -> R) -> Result<(R, String), Unavailable> {
     load_known(dir);
     let Some(k) = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         // Never scan for a write: "Atualizar" finds them first
@@ -358,27 +537,18 @@ fn write_at(host: &BtHost, dir: &Path, setting: Setting, value: u8) -> Result<wr
             Unavailable::Timeout
         })?;
     let services = host.le_gatt_services(id);
-    let r = write_on(host, id, &services, setting, value);
+    let r = write_on(host, id, &services, f);
     host.le_disconnect(id);
     tracing::info!("QCY write: link up {} ms in total", started.elapsed().as_millis());
-    let o = r?;
-    for s in &o.steps {
-        tracing::info!("QCY write step: {} {}", s.what, s.detail);
-    }
-    if let Some(p) = o.previous {
-        let saved = if setting.is_toggle() { json!(p == 0x01) } else { json!(p) };
-        crate::qcy_cache::save_previous(dir, &k.address, setting.key(), saved);
-    }
-    Ok(o)
+    Ok((r?, k.address))
 }
 
-fn write_on(
+fn write_on<R>(
     host: &BtHost,
     id: bt_host::LeDeviceId,
     services: &[GattService],
-    setting: Setting,
-    value: u8,
-) -> Result<write::Outcome, Unavailable> {
+    f: impl FnOnce(&mut GattLink) -> R,
+) -> Result<R, Unavailable> {
     let command = find_char(services, uuids::MAIN_SERVICE, uuids::COMMAND).ok_or(Unavailable::GattFailed)?;
     let notification = find_char(services, uuids::MAIN_SERVICE, uuids::NOTIFICATION).ok_or(Unavailable::GattFailed)?;
     // Only A001 / 1001, never the OTA services
@@ -386,7 +556,7 @@ fn write_on(
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     host.le_gatt_subscribe(id, notification, tx, GATT_TIMEOUT).map_err(|_| Unavailable::GattFailed)?;
     let mut link = GattLink { host, id, command, rx };
-    Ok(write::run(&mut link, setting, value, WRITE_TIMEOUT))
+    Ok(f(&mut link))
 }
 
 /// The stack to read with, never restarting one that streams
@@ -418,6 +588,10 @@ fn load_known(dir: &Path) {
         && let Some((classic, addr, services, e)) = crate::qcy_cache::latest(&file)
     {
         tracing::info!("QCY: {} from {} (LE {}, {} services)", classic, crate::qcy_cache::FILE, addr, services.len());
+        if let Some(o) = e.previous.get(EQ_ORIGINAL_KEY).and_then(EqOriginal::from_json) {
+            let mut slot = EQ_ORIGINAL.lock().unwrap_or_else(|e| e.into_inner());
+            slot.get_or_insert(o);
+        }
         *known = Some(Known { addr, name: e.name.clone(), address: classic, services });
     }
 }
@@ -643,6 +817,10 @@ fn write_view(w: &LastWrite) -> Value {
         "read_back": w.read_back,
         "steps": w.steps.iter().map(|(what, detail)| json!({ "what": what, "detail": detail })).collect::<Vec<_>>(),
         "at_ms": w.at_ms,
+        // Phase F4: the curve asked for and the one read before (dB)
+        "gains": w.eq.as_ref().map_or(Value::Null, |e| json!(db(&e.curve))),
+        "previous_gains": w.eq.as_ref().and_then(|e| e.previous).map_or(Value::Null, |(_, c)| json!(db(&c))),
+        "previous_preset_index": w.eq.as_ref().and_then(|e| e.previous).map_or(Value::Null, |(p, _)| json!(p)),
     })
 }
 
@@ -650,7 +828,7 @@ fn write_view(w: &LastWrite) -> Value {
 /// only the `writable` settings can change (game mode, sleep mode, wind
 /// reduction, noise control, wear detection); `verified` lists those
 /// confirmed on the N70 (all five: Gabriel, 2026-10-31); any other writable
-/// one would show "Em teste"
+/// one would show "Em teste" (the equalizer, phase F4)
 pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option<&LastWrite>) -> Value {
     let link = match (link, last) {
         (Some(why), _) => json!({ "state": "unavailable", "reason": why.reason() }),
@@ -687,7 +865,11 @@ pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option
             m.insert(gesture.into(), json!(action));
         }
     }
-    let gains: Vec<f64> = if s.equalizer_gains.len() == 10 { s.equalizer_gains.clone() } else { vec![0.0; 10] };
+    // The first ten slots (the N70 answers 20); unknown: zeros, eq_known false
+    let eq_known = s.equalizer_gains.len() >= 10;
+    let gains: Vec<f64> = if eq_known { s.equalizer_gains[..10].to_vec() } else { vec![0.0; 10] };
+    let original =
+        EQ_ORIGINAL.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(Value::Null, EqOriginal::to_json);
     let wear = s.wearing_detection.map(|w| w.enabled).or(s.wear_detection_enabled);
     // The 0x2C bytes as read (state, music action, ANC action, tone): the
     // screen shows them; a write copies them from a fresh read, not these
@@ -704,7 +886,7 @@ pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option
         "read_only": false,
         "writable": Setting::ALL.iter().filter(|s| write::ALLOWED.contains(&s.opcode())).map(|s| s.key()).collect::<Vec<_>>(),
         "verified": ["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"],
-        "experimental": [],
+        "experimental": ["equalizer"],
         "write": write.map_or(Value::Null, write_view),
         "device_name": last.map_or("", |r| r.name.as_str()),
         "address": last.map_or("", |r| r.address.as_str()),
@@ -728,6 +910,8 @@ pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option
         "auto_off": match s.auto_power_off_minutes { None | Some(0xFFFF) => Value::Null, Some(m) => json!(m) },
         "eq": { "preset": "custom", "gains": gains, "master_gain": 0 },
         "eq_preset_index": s.equalizer_preset,
+        "eq_known": eq_known,
+        "eq_original": original,
         "gestures": { "left": left, "right": right },
         "supported_gestures": [],
         "reapply_on_connect": false,
@@ -760,7 +944,7 @@ mod tests {
         assert_eq!(v["read_only"], false);
         assert_eq!(
             v["writable"],
-            json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"])
+            json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection", "equalizer"])
         );
         assert_eq!(
             v["verified"],
@@ -897,7 +1081,7 @@ mod tests {
             Some((Setting::WearDetection, 0x02))
         );
         let v = view_all(Some(&reading()), None, None);
-        assert_eq!(v["experimental"], json!([]));
+        assert_eq!(v["experimental"], json!(["equalizer"]));
         assert!(v["verified"].as_array().unwrap().contains(&json!("wear_detection")));
         assert_eq!(v["reapply_on_connect"], false);
     }
@@ -935,6 +1119,7 @@ mod tests {
             failure: None,
             steps: vec![],
             at_ms: 7,
+            eq: None,
         };
         let v = view_all(Some(&reading()), None, Some(&w));
         assert_eq!(v["write"]["value"], 6);
@@ -950,7 +1135,7 @@ mod tests {
         let v = view_all(Some(&reading()), None, None);
         assert_eq!(
             v["writable"],
-            json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"])
+            json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection", "equalizer"])
         );
         assert_eq!(
             v["verified"],
@@ -971,6 +1156,7 @@ mod tests {
             failure: None,
             steps: vec![],
             at_ms: 7,
+            eq: None,
         };
         let v = view_all(Some(&reading()), None, Some(&w));
         assert_eq!(v["write"]["value"], 12);
@@ -993,6 +1179,7 @@ mod tests {
             failure: None,
             steps: vec![("sent".into(), "FF03090101".into())],
             at_ms: 7,
+            eq: None,
         };
         let v = view_all(Some(&r), None, Some(&w));
         assert_eq!(v["write"]["status"], "confirmed");
@@ -1011,5 +1198,93 @@ mod tests {
             assert_eq!(f[2], 0xFE, "0x{op:02X}");
             assert!(!(0x01..=0x03).contains(&f[2]));
         }
+    }
+
+    // ---- Phase F4: equalizer ----
+
+    #[test]
+    fn only_a_ten_band_curve_in_range_passes() {
+        let rock = json!([4, 3, 1.5, -0.5, -1.5, -1, 1, 2.5, 3.5, 3.5]);
+        assert_eq!(
+            allowed_eq(&json!({ "kind": "equalizer", "gains": rock })),
+            Some([400, 300, 150, -50, -150, -100, 100, 250, 350, 350])
+        );
+        assert!(allowed_eq(&json!({ "kind": "equalizer", "gains": [8, -8, 0, 0, 0, 0, 0, 0, 0, 0] })).is_some());
+        for c in [
+            json!({ "kind": "equalizer", "gains": [8.5, 0, 0, 0, 0, 0, 0, 0, 0, 0] }),
+            json!({ "kind": "equalizer", "gains": [0, 0, 0, 0, 0, 0, 0, 0, 0, -9] }),
+            json!({ "kind": "equalizer", "gains": [0.001, 0, 0, 0, 0, 0, 0, 0, 0, 0] }),
+            json!({ "kind": "equalizer", "gains": [0, 0, 0, 0, 0, 0, 0, 0, 0] }),
+            json!({ "kind": "equalizer", "gains": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }),
+            json!({ "kind": "equalizer", "gains": ["1", 0, 0, 0, 0, 0, 0, 0, 0, 0] }),
+            json!({ "kind": "equalizer", "gains": [null, 0, 0, 0, 0, 0, 0, 0, 0, 0] }),
+            json!({ "kind": "equalizer", "gains": rock, "preset": 1 }),
+            json!({ "kind": "equalizer", "gains": rock, "master_gain": 0 }),
+            json!({ "kind": "equalizer" }),
+            json!({ "kind": "eq", "gains": rock }),
+            json!({ "kind": "eq", "eq": { "preset": "rock", "gains": rock, "master_gain": 0 } }),
+        ] {
+            assert_eq!(allowed_eq(&c), None, "{c}");
+            // Never as a one-byte setting either
+            assert_eq!(allowed_change(&c), None, "{c}");
+        }
+        assert_eq!(allowed_change(&json!({ "kind": "equalizer", "value": 1 })), None);
+    }
+
+    #[test]
+    fn the_eq_view_uses_the_first_ten_slots() {
+        let mut r = reading();
+        assert_eq!(view_all(Some(&r), None, None)["eq_known"], false);
+        // The N70 answers 20 slots
+        let mut p = vec![1u8, 0, 0];
+        for i in 0..20u16 {
+            let f = commands::EQUALIZER_FREQUENCIES.get(usize::from(i)).copied().unwrap_or(16000);
+            p.extend(f.to_le_bytes());
+            p.extend((if i < 10 { 50 * i16::try_from(i).unwrap() } else { -700 }).to_le_bytes());
+            p.extend([100, 0, 0]);
+        }
+        r.state.apply(&Command { opcode: commands::opcode::EQUALIZER, parameters: p });
+        let v = view_all(Some(&r), None, None);
+        assert_eq!(v["eq_known"], true);
+        assert_eq!(v["eq"]["gains"], json!([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5]));
+        assert_eq!(v["eq_preset_index"], 1);
+        assert!(v["writable"].as_array().unwrap().contains(&json!("equalizer")));
+        assert!(!v["verified"].as_array().unwrap().contains(&json!("equalizer")));
+        assert_eq!(v["reapply_on_connect"], false);
+        // set_gains keeps slots 11..20 as read
+        set_gains(&mut r.state, 8, &[100; 10]);
+        assert_eq!(r.state.equalizer_gains.len(), 20);
+        assert_eq!(r.state.equalizer_gains[..10], [1.0; 10]);
+        assert_eq!(r.state.equalizer_gains[10], -7.0);
+        assert_eq!(r.state.equalizer_preset, Some(8));
+    }
+
+    #[test]
+    fn an_eq_write_shows_both_curves() {
+        let w = LastWrite {
+            setting: "equalizer",
+            toggle: false,
+            value: 0,
+            previous: None,
+            max: None,
+            sent: Some("FF4B2249".into()),
+            read_back: None,
+            failure: Some("timeout"),
+            steps: vec![],
+            at_ms: 9,
+            eq: Some(EqWrite { curve: [250, 0, 0, 0, 0, 0, 0, 0, 0, -50], previous: Some((1, [0; 10])) }),
+        };
+        let v = view_all(Some(&reading()), None, Some(&w));
+        assert_eq!(v["write"]["setting"], "equalizer");
+        assert_eq!(v["write"]["status"], "failed");
+        assert_eq!(v["write"]["gains"], json!([2.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.5]));
+        assert_eq!(v["write"]["previous_gains"], json!(vec![0.0; 10]));
+        assert_eq!(v["write"]["previous_preset_index"], 1);
+        let o = EqOriginal { preset: 1, curve: [0, 0, 0, 0, 0, 0, 0, 0, 0, 25], saved_at: 5 };
+        assert_eq!(EqOriginal::from_json(&o.to_json()), Some(o));
+        assert_eq!(
+            EqOriginal::from_json(&json!({ "preset": 1, "gains": [9, 0, 0, 0, 0, 0, 0, 0, 0, 0], "saved_at": 5 })),
+            None
+        );
     }
 }

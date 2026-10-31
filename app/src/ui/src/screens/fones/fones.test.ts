@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { parseRoute, routeHash } from "../../app/context";
 import { MockQcy } from "../../ipc/qcyMock";
-import { EQ_BANDS_HZ, NOISE_CODES, noiseCode } from "../../ipc/qcy";
+import { EQ_BANDS_HZ, eqFrameHex, eqWritable, NOISE_CODES, noiseCode } from "../../ipc/qcy";
 import { EQ_PRESETS, matchPreset } from "../../lib/eqPresets";
-import { wearBytes, canRefresh, curvePath, F2_SETTINGS, needsNoiseWarning, noiseChange, noiseText, promptMax, settingName, valueText, windAllowed, writeChange, writeStepLines } from "./Fones";
+import { curveText, wearBytes, canRefresh, curvePath, F2_SETTINGS, needsNoiseWarning, noiseChange, noiseText, promptMax, settingName, valueText, windAllowed, writeChange, writeStepLines } from "./Fones";
 import { ft } from "./strings";
 import { setLanguage } from "../../i18n";
 import { F2_OPCODES, sampleQcyState } from "../../ipc/qcyMock";
@@ -15,11 +15,11 @@ describe("fones", () => {
     expect(routeHash({ name: "fones", arg: "settings" })).toBe("#/fones/settings");
   });
 
-  it("has ten bands per preset and -3 dB on the bass boost", () => {
+  it("has ten bands per preset, all at master gain 0 (phase 4 writes 0)", () => {
     for (const p of EQ_PRESETS) expect(p.gains).toHaveLength(EQ_BANDS_HZ.length);
-    expect(EQ_PRESETS.find((p) => p.id === "bass")!.master_gain).toBe(-3);
-    expect(matchPreset([6, 5.5, 4, 2, 0.5, 0, 0, 0, 0, 0], -3)).toBe("bass");
-    expect(matchPreset([6, 5.5, 4, 2, 0.5, 0, 0, 0, 0, 0], 0)).toBe("custom");
+    for (const p of EQ_PRESETS) expect(p.master_gain).toBe(0);
+    expect(matchPreset([6, 5.5, 4, 2, 0.5, 0, 0, 0, 0, 0], 0)).toBe("bass");
+    expect(matchPreset([6, 5.5, 4, 2, 0.5, 0, 0, 0, 0, 0], -3)).toBe("custom");
     expect(curvePath([0, 0])).toBe("M0.0 9.0 L56.0 9.0");
   });
 
@@ -53,8 +53,8 @@ import { placeholderQcyState } from "../../ipc/qcy";
 describe("placeholder (real build, no qcy_* commands)", () => {
   it("phase 2: reads, one command, read-back; the rest is refused", async () => {
     const q = new MockQcy({ speed: 0, gameOnly: true });
-    expect((await q.state()).writable).toEqual(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"]);
-    expect((await q.state()).experimental).toEqual([]);
+    expect((await q.state()).writable).toEqual(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection", "equalizer"]);
+    expect((await q.state()).experimental).toEqual(["equalizer"]);
     expect((await q.state()).verified).toEqual(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"]);
     const on = await q.set({ kind: "game_mode", enabled: true });
     expect(on.game_mode).toBe(true);
@@ -74,6 +74,8 @@ describe("placeholder (real build, no qcy_* commands)", () => {
     ] as const) {
       await expect(q.set(c)).rejects.toMatchObject({ code: "qcy.read_only" });
     }
+    // the full mock's "eq" change is not the phase-4 write
+    await expect(q.set({ kind: "eq", eq: { preset: "rock", gains: [4, 3, 1.5, -0.5, -1.5, -1, 1, 2.5, 3.5, 3.5], master_gain: 0 } })).rejects.toMatchObject({ code: "qcy.read_only" });
   });
 
   it("game mode timeout: the switch keeps the value read, nothing re-sent", async () => {
@@ -108,7 +110,7 @@ describe("Atualizar", () => {
 
 describe("phase 2 (sleep, wind; prompt volume read-only)", () => {
   it("allowlist is exactly 0x09, 0x10, 0x2A (+ 0x17 since phase 3)", () => {
-    expect(F2_OPCODES).toEqual({ game_mode: 0x09, sleep_mode: 0x10, wind_reduction: 0x2a, noise_control: 0x17, wear_detection: 0x2c });
+    expect(F2_OPCODES).toEqual({ game_mode: 0x09, sleep_mode: 0x10, wind_reduction: 0x2a, noise_control: 0x17, wear_detection: 0x2c, equalizer: 0x22 });
     expect(F2_SETTINGS).toEqual(["game_mode", "sleep_mode", "wind_reduction"]);
     for (const op of Object.values(F2_OPCODES)) expect([0x01, 0x02, 0x03]).not.toContain(op);
   });
@@ -293,5 +295,93 @@ describe("phase 3b (wear detection 0x2C, Verificado)", () => {
     await q.state();
     expect(q.calls).toHaveLength(0);
     expect((await q.state()).write).toBeNull();
+  });
+});
+
+describe("phase 4 (equalizer 0x22, Em teste)", () => {
+  const SPATIAL = [...EQ_PRESETS.find((p) => p.id === "spatial")!.gains];
+
+  it("builds OpenQCY's frame: FF 4B 22 49, preset 8, master 0, 10 × {freq, gain, Q 1.00, type 0}", () => {
+    const flat = eqFrameHex(Array(10).fill(0));
+    expect(flat.length / 2).toBe(77);
+    expect(flat.startsWith("FF4B2249080000")).toBe(true);
+    expect(flat.slice(14, 28)).toBe("1F000000640000"); // 31 Hz, 0, Q 0x0064, type 0
+    expect(flat.slice(-14)).toBe("803E0000640000"); // 16 kHz
+    const f = eqFrameHex([1, -1.5, 8, -8, 0, 0, 0, 0, 0, 0.25]);
+    expect(f.slice(14, 28)).toBe("1F006400640000"); // +1.00 dB = 100
+    expect(f.slice(28, 42)).toBe("3E006AFF640000"); // -1.50 dB = -150
+    expect(f.slice(42, 56)).toBe("7D002003640000"); // +8 = 800
+    expect(f.slice(56, 70)).toBe("FA00E0FC640000"); // -8 = -800
+    expect(f.slice(-14)).toBe("803E1900640000"); // +0.25 = 25
+  });
+
+  it("refuses out-of-range curves (no clamping) and sends nothing", async () => {
+    for (const g of [Array(9).fill(0), Array(11).fill(0), [8.5, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, -12], [0.001, 0, 0, 0, 0, 0, 0, 0, 0, 0], [NaN, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
+      expect(eqWritable(g)).toBe(false);
+    expect(eqWritable([8, -8, 0.5, 0.25, 0, 0, 0, 0, 0, 0])).toBe(true);
+    const q = new MockQcy({ speed: 0, gameOnly: true });
+    await expect(q.set({ kind: "equalizer", gains: [9, 0, 0, 0, 0, 0, 0, 0, 0, 0] })).rejects.toMatchObject({ code: "qcy.read_only" });
+    expect((await q.state()).write).toBeNull();
+    expect((await q.state()).eq_original).toBeNull();
+  });
+
+  it("confirmed: curve read and kept first, ONE frame, 10/10 read back, Desfazer", async () => {
+    await setLanguage("pt-BR");
+    const q = new MockQcy({ speed: 0, gameOnly: true });
+    const s0 = await q.state();
+    expect(s0.eq_known).toBe(true);
+    expect(s0.write).toBeNull();
+    const s = await q.set({ kind: "equalizer", gains: SPATIAL });
+    expect(q.calls).toHaveLength(1);
+    expect(s.eq.gains).toEqual(SPATIAL);
+    expect(s.write).toMatchObject({ setting: "equalizer", status: "confirmed", failure: null, sent: eqFrameHex(SPATIAL), gains: SPATIAL, previous_gains: Array(10).fill(0), previous_preset_index: 1 });
+    expect(s.write!.steps.map((x) => x.what)).toEqual(["read_previous", "sent", "read_back"]);
+    expect(s.eq_original).toMatchObject({ preset: 1, gains: Array(10).fill(0) });
+    expect(writeStepLines(s.write!)).toEqual([
+      "Curva anterior lida e salva: preset 1, plana",
+      "Enviado: Áudio espacial (1 comando, 10 bandas)",
+      "Confirmado pelo fone: 10/10 bandas iguais ✓",
+    ]);
+    expect(settingName("equalizer")).toBe("Equalizador");
+    expect(ft("write.ok_eq")).toBe("Equalizador aplicado — confirmado pelo fone");
+    expect(ft("write.fail_title_eq")).toBe("O fone não confirmou o equalizador");
+    expect(curveText(Array(10).fill(0), 1)).toBe("preset 1, plana");
+    // Desfazer: the same flow back to the curve read; the original is kept once
+    const undo = writeChange(s.write!, "undo");
+    expect(undo).toEqual({ kind: "equalizer", gains: Array(10).fill(0) });
+    expect(writeChange(s.write!, "retry")).toEqual({ kind: "equalizer", gains: SPATIAL });
+    const back = await q.set(undo!);
+    expect(back.eq.gains).toEqual(Array(10).fill(0));
+    expect(back.write).toMatchObject({ status: "confirmed", previous_gains: SPATIAL });
+    expect(back.eq_original!.gains).toEqual(Array(10).fill(0));
+    expect(q.calls).toHaveLength(2);
+    await setLanguage("en");
+  });
+
+  it("timeout: the curve read stays, nothing re-sent, Tentar de novo resends the same curve", async () => {
+    const q = new MockQcy({ speed: 0, gameOnly: "fail" });
+    const s = await q.set({ kind: "equalizer", gains: SPATIAL });
+    expect(q.calls).toHaveLength(1);
+    expect(s.eq.gains).toEqual(Array(10).fill(0));
+    expect(s.write).toMatchObject({ status: "failed", failure: "timeout", read_back: null });
+    expect(s.write!.steps.map((x) => x.what)).toEqual(["read_previous", "sent", "no_read_back"]);
+    expect(writeChange(s.write!, "retry")).toEqual({ kind: "equalizer", gains: SPATIAL });
+  });
+
+  it("an unreadable curve: nothing is written", async () => {
+    const q = new MockQcy({ speed: 0, gameOnly: true });
+    (q as unknown as { s: { eq_known: boolean } }).s.eq_known = false;
+    const s = await q.set({ kind: "equalizer", gains: SPATIAL });
+    expect(s.write).toMatchObject({ status: "failed", failure: "no_previous", sent: null });
+    expect(s.eq_original).toBeNull();
+    expect(writeStepLines(s.write!)).toHaveLength(1);
+  });
+
+  it("never writes on open, and Reaplicar ao reconectar stays out of the writable list", async () => {
+    const q = new MockQcy({ speed: 0, gameOnly: true });
+    const s = await q.state();
+    expect(q.calls).toHaveLength(0);
+    expect(s.writable).not.toContain("reapply_on_connect");
+    await expect(q.set({ kind: "reapply_on_connect", enabled: true })).rejects.toMatchObject({ code: "qcy.read_only" });
   });
 });

@@ -1,11 +1,11 @@
 //! Changing a setting of the earbuds: the ONLY place that frames a write.
 //!
-//! Phases F2–F3b (plano_escrita_qcy.md): five settings may change. Everything
+//! Phases F2–F4 (plano_escrita_qcy.md): six settings may change. Everything
 //! else is refused here, whatever the caller asks:
 //!
 //! - [`ALLOWED`]: exactly 0x09 game mode, 0x10 sleep mode and 0x2A wind
 //!   reduction (on/off: one parameter byte, `01` on or `02` off), plus
-//!   0x17 noise control and 0x2C wear detection as below. Any other
+//!   0x17 noise control, 0x2C wear detection and 0x22 equalizer as below. Any other
 //!   opcode, length or value: [`Refused`].
 //! - 0x1D prompt volume is NOT written (fase 2b): on the N70 every
 //!   `FF 03 1D 01 <v>` read back the old level (04/0F, 2026-10-31), so it
@@ -22,6 +22,20 @@
 //!   `FF 06 2C 04 <01|02> <music> <anc> <tone>`. Confirmed when the
 //!   read-back's state is the one written (off reads back as `00`) and the
 //!   other bytes did not change. Verified on the N70 (Gabriel, 2026-10-31).
+//! - Phase F4: 0x22 ten-band equalizer ("Em teste"). Exactly the frame
+//!   OpenQCY-Desktop's `QcyCommands.BuildCustomEqualizer` makes: 73
+//!   parameter bytes = preset `08` (custom), master gain `00 00`, then 10 ×
+//!   [freq u16 LE, gain i16 LE in 1/100 dB, Q u16 LE = 100, type `00`] at
+//!   the fixed frequencies 31 Hz … 16 kHz, each gain within ±800 (±8 dB):
+//!   `FF 4B 22 49 08 00 00 1F 00 gg gg 64 00 00 3E 00 … 80 3E gg gg 64 00 00`
+//!   (77 bytes on the wire). See [`eq_frame`] / [`run_eq`]: the current curve
+//!   is read (`FE 22`) and kept first; nothing is written when it cannot be
+//!   parsed; the read-back must hold the same 10 bands (7 bytes each, the
+//!   preset byte and the master gain are not compared). Sources:
+//!   OpenQCY-Desktop `Protocol/QcyCommands.cs` (commit ee7e849, 2026-09-05)
+//!   and hui1601/Quicky `docs/protocol.md` ("Parametric EQ Write (v2, cmd
+//!   0x22)": `[0x22, paramLen, eqIndex, masterGain, {freq, gain, q,
+//!   bandType} x N]`, `paramLen = N x 7 + 3`).
 //! - [`BLOCKED`]: opcodes that are never written, even if a later phase
 //!   widens [`ALLOWED`] by mistake (restore defaults, clear pairings,
 //!   factory reset, test modes, standby, rename, fit/EQ tests).
@@ -37,6 +51,7 @@
 //! FF 03 1D 01 vv        prompt volume vv         read FE 1D -> 1D 02 <vv> <max>
 //! FF 05 17 03 m s v     noise control (F3)       read FE 17 -> 17 03 <m> <s> <v>
 //! FF 05 2C 03 e m a     wear detection (F3b)     read FE 2C -> 2C 03 <01|00> <m> <a> [t]
+//! FF 4B 22 49 08 0000 {10 × 7 bytes}  EQ (F4)    read FE 22 -> 22 <3+7n> <preset> <master> {n × 7}
 //! ```
 //!
 //! Sources (confidence in plano_escrita_qcy.md):
@@ -69,9 +84,110 @@ use std::time::{Duration, Instant};
 use crate::commands::{self, opcode};
 use crate::packet;
 
-/// The opcodes this build may write (exactly these five)
-pub const ALLOWED: [u8; 5] =
-    [opcode::GAME_MODE, opcode::SLEEP_MODE, opcode::WIND_DETECTION, opcode::NOISE_CONTROL, opcode::WEARING_DETECTION];
+/// The opcodes this build may write (exactly these six)
+pub const ALLOWED: [u8; 6] = [
+    opcode::GAME_MODE,
+    opcode::SLEEP_MODE,
+    opcode::WIND_DETECTION,
+    opcode::NOISE_CONTROL,
+    opcode::WEARING_DETECTION,
+    opcode::EQUALIZER,
+];
+
+/// Phase F4: the parameter bytes of a 0x22 write (preset, master gain, 10
+/// bands of 7 bytes)
+pub const EQ_PARAMS_LEN: usize = 3 + 10 * 7;
+/// A band's gain limit, 1/100 dB (±8 dB)
+pub const EQ_GAIN_LIMIT: i16 = 800;
+/// The Q written with every band (1.00)
+pub const EQ_Q: u16 = 100;
+/// The band type written (0, as OpenQCY)
+pub const EQ_TYPE: u8 = 0;
+/// The preset byte of a custom curve (OpenQCY: 8)
+pub const EQ_PRESET_CUSTOM: u8 = commands::CUSTOM_EQUALIZER_PRESET;
+
+/// Ten gains in 1/100 dB, in [`commands::EQUALIZER_FREQUENCIES`] order
+pub type EqCurve = [i16; 10];
+
+/// Whether `p` are exactly the parameters of an acceptable 0x22 write
+fn eq_parameters_ok(p: &[u8]) -> bool {
+    if p.len() != EQ_PARAMS_LEN || p[0] != EQ_PRESET_CUSTOM || p[1..3] != [0, 0] {
+        return false;
+    }
+    p[3..].as_chunks::<7>().0.iter().zip(commands::EQUALIZER_FREQUENCIES).all(|(b, f)| {
+        let gain = i16::from_le_bytes([b[2], b[3]]);
+        u16::from_le_bytes([b[0], b[1]]) == f
+            && (-EQ_GAIN_LIMIT..=EQ_GAIN_LIMIT).contains(&gain)
+            && u16::from_le_bytes([b[4], b[5]]) == EQ_Q
+            && b[6] == EQ_TYPE
+    })
+}
+
+/// The 0x22 write of a curve (gains in 1/100 dB). Any gain outside ±800 is
+/// refused, not clamped.
+pub fn eq_frame(curve: &EqCurve) -> Result<Vec<u8>, Refused> {
+    let mut p = Vec::with_capacity(EQ_PARAMS_LEN);
+    p.push(EQ_PRESET_CUSTOM);
+    p.extend([0, 0]);
+    for (f, g) in commands::EQUALIZER_FREQUENCIES.iter().zip(curve) {
+        p.extend(f.to_le_bytes());
+        p.extend(g.to_le_bytes());
+        p.extend(EQ_Q.to_le_bytes());
+        p.push(EQ_TYPE);
+    }
+    build(opcode::EQUALIZER, &p)
+}
+
+/// A 0x22 read: the preset byte and the first ten bands' gains, only when
+/// the answer is well formed (3 + 7n bytes, n ≥ 10) and its first ten
+/// bands sit at the fixed frequencies. None: not a known curve (then
+/// nothing is written).
+pub fn eq_read(got: &[u8]) -> Option<(u8, EqCurve)> {
+    if got.len() < EQ_PARAMS_LEN || !(got.len() - 3).is_multiple_of(7) {
+        return None;
+    }
+    let mut curve = [0i16; 10];
+    for (i, (b, f)) in got[3..].as_chunks::<7>().0.iter().zip(commands::EQUALIZER_FREQUENCIES).enumerate() {
+        if u16::from_le_bytes([b[0], b[1]]) != f {
+            return None;
+        }
+        curve[i] = i16::from_le_bytes([b[2], b[3]]);
+    }
+    Some((got[0], curve))
+}
+
+/// A 0x22 read-back confirms a write when its first ten bands are byte for
+/// byte the ten written (frequency, gain, Q, type). The preset byte (8 or 1)
+/// and the master gain are not compared; the slots after the tenth (the
+/// N70 answers 20) are ignored. Anything not comparable: not confirmed.
+pub fn eq_confirms(sent: &[u8], got: &[u8]) -> bool {
+    if sent.len() != EQ_PARAMS_LEN || got.len() < EQ_PARAMS_LEN || !(got.len() - 3).is_multiple_of(7) {
+        return false;
+    }
+    sent[3..EQ_PARAMS_LEN] == got[3..EQ_PARAMS_LEN]
+}
+
+/// dB (the UI's numbers) -> 1/100 dB; None when not a whole number of
+/// hundredths or outside ±8 dB (refused, never clamped)
+pub fn eq_curve_from_db(gains: &[f64]) -> Option<EqCurve> {
+    if gains.len() != 10 {
+        return None;
+    }
+    let mut c = [0i16; 10];
+    for (i, g) in gains.iter().enumerate() {
+        let h = g * 100.0;
+        if !h.is_finite() || (h - h.round()).abs() > 1e-6 || h.round().abs() > f64::from(EQ_GAIN_LIMIT) {
+            return None;
+        }
+        c[i] = h.round() as i16;
+    }
+    Some(c)
+}
+
+/// The text of a curve for the log ("+0.00 … +2.50 dB")
+pub fn eq_text(c: &EqCurve) -> String {
+    c.iter().map(|g| format!("{:+.2}", f64::from(*g) / 100.0)).collect::<Vec<_>>().join(" ")
+}
 
 /// The highest music / ANC action byte copied into a 0x2C write (the N70
 /// reports `01`; anything above is not a known action and is never
@@ -186,12 +302,21 @@ pub enum Setting {
     NoiseControl,
     /// 0x2C (phase F3b): on/off; the other bytes come from the read
     WearDetection,
+    /// 0x22 (phase F4): a ten-band curve; written only by [`run_eq`] ([`run`]
+    /// refuses it before any traffic)
+    Equalizer,
 }
 
 impl Setting {
     /// The writable settings (prompt volume is read-only)
-    pub const ALL: [Setting; 5] =
-        [Setting::GameMode, Setting::SleepMode, Setting::WindReduction, Setting::NoiseControl, Setting::WearDetection];
+    pub const ALL: [Setting; 6] = [
+        Setting::GameMode,
+        Setting::SleepMode,
+        Setting::WindReduction,
+        Setting::NoiseControl,
+        Setting::WearDetection,
+        Setting::Equalizer,
+    ];
 
     pub fn opcode(self) -> u8 {
         match self {
@@ -201,6 +326,7 @@ impl Setting {
             Setting::PromptVolume => opcode::PROMPT_VOLUME,
             Setting::NoiseControl => opcode::NOISE_CONTROL,
             Setting::WearDetection => opcode::WEARING_DETECTION,
+            Setting::Equalizer => opcode::EQUALIZER,
         }
     }
     pub fn key(self) -> &'static str {
@@ -211,11 +337,12 @@ impl Setting {
             Setting::PromptVolume => "prompt_volume",
             Setting::NoiseControl => "noise_control",
             Setting::WearDetection => "wear_detection",
+            Setting::Equalizer => "equalizer",
         }
     }
     /// On/off (01/02) rather than a level
     pub fn is_toggle(self) -> bool {
-        !matches!(self, Setting::PromptVolume | Setting::NoiseControl)
+        !matches!(self, Setting::PromptVolume | Setting::NoiseControl | Setting::Equalizer)
     }
     /// The UI's change kind -> the setting; None for everything not allowed
     pub fn from_kind(kind: &str) -> Option<Setting> {
@@ -261,6 +388,7 @@ pub fn build(op: u8, parameters: &[u8]) -> Result<Vec<u8>, Refused> {
         }
         (opcode::NOISE_CONTROL, p) if NOISE_PRESETS.iter().any(|n| n.2 == p) => Ok(packet::frame(op, p)),
         (opcode::WEARING_DETECTION, p) if wear_parameters_ok(p) => Ok(packet::frame(op, p)),
+        (opcode::EQUALIZER, p) if eq_parameters_ok(p) => Ok(packet::frame(op, p)),
         _ => Err(Refused::BadParameters(op, parameters.to_vec())),
     }
 }
@@ -276,6 +404,10 @@ pub fn toggle_frame(setting: Setting, enabled: bool) -> Result<Vec<u8>, Refused>
 /// Whether `value` may be asked for `setting` (the check before any
 /// traffic; for wear detection, `01` or `02` with 0x2C allowed)
 pub fn check_value(setting: Setting, value: u8) -> Result<(), Refused> {
+    if setting == Setting::Equalizer {
+        // A curve, not a byte: only [`run_eq`] writes it
+        return Err(Refused::BadParameters(opcode::EQUALIZER, vec![value]));
+    }
     if setting == Setting::WearDetection {
         let op = opcode::WEARING_DETECTION;
         if BLOCKED.contains(&op) {
@@ -297,6 +429,9 @@ pub fn check_value(setting: Setting, value: u8) -> Result<(), Refused> {
 pub fn frame_for(setting: Setting, value: u8) -> Result<Vec<u8>, Refused> {
     if setting == Setting::WearDetection {
         return Err(Refused::BadParameters(opcode::WEARING_DETECTION, vec![value]));
+    }
+    if setting == Setting::Equalizer {
+        return Err(Refused::BadParameters(opcode::EQUALIZER, vec![value]));
     }
     if setting == Setting::NoiseControl {
         let bytes = noise_bytes(value).ok_or_else(|| Refused::BadParameters(opcode::NOISE_CONTROL, vec![value]))?;
@@ -623,6 +758,128 @@ pub fn run<T: Transport>(t: &mut T, setting: Setting, value: u8, timeout: Durati
     out
 }
 
+/// The result of [`run_eq`]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EqOutcome {
+    /// The curve asked for
+    pub curve: EqCurve,
+    /// The preset byte and curve read before the write (None: not read or
+    /// not parsable, nothing written)
+    pub previous: Option<(u8, EqCurve)>,
+    pub sent: Option<Vec<u8>>,
+    /// The read-back's parameters (None: no answer)
+    pub read_back: Option<Vec<u8>>,
+    pub failure: Option<Failure>,
+    pub steps: Vec<Step>,
+}
+
+impl EqOutcome {
+    pub fn confirmed(&self) -> bool {
+        self.failure.is_none()
+    }
+}
+
+/// Phase F4: the whole equalizer write, as [`run`]: read the current curve
+/// (`FE 22`) and keep it (nothing is written when it cannot be parsed),
+/// send exactly ONE 0x22 frame, read back and compare the ten bands. No
+/// answer within `timeout` is a failure; nothing is ever re-sent.
+pub fn run_eq<T: Transport>(t: &mut T, curve: &EqCurve, timeout: Duration) -> EqOutcome {
+    let op = opcode::EQUALIZER;
+    let mut out =
+        EqOutcome { curve: *curve, previous: None, sent: None, read_back: None, failure: None, steps: Vec::new() };
+    // Validate before any traffic
+    let frame = match eq_frame(curve) {
+        Ok(f) => f,
+        Err(e) => {
+            out.steps.push(Step { what: "refused", detail: e.to_string() });
+            out.failure = Some(Failure::OutOfRange);
+            return out;
+        }
+    };
+
+    // 1. Read the current curve and keep it
+    drain(t);
+    let request = commands::request(op);
+    let read = t.send(&request).ok().and_then(|()| wait_for(t, op, Instant::now() + timeout));
+    match read.as_deref().and_then(|p| eq_read(p).map(|c| (c, p))) {
+        Some((c, raw)) => {
+            out.previous = Some(c);
+            out.steps.push(Step {
+                what: "read_previous",
+                detail: format!(
+                    "{} -> preset {} [{}] ({} bytes: {})",
+                    packet::to_hex(&request),
+                    c.0,
+                    eq_text(&c.1),
+                    raw.len(),
+                    packet::to_hex(raw)
+                ),
+            });
+        }
+        None => {
+            out.steps.push(Step {
+                what: "read_previous_failed",
+                detail: match read.as_deref() {
+                    Some(raw) => format!("{} -> {} (not a known curve)", packet::to_hex(&request), packet::to_hex(raw)),
+                    None => packet::to_hex(&request),
+                },
+            });
+            out.failure = Some(Failure::NoPrevious);
+            return out;
+        }
+    }
+
+    // 2. Exactly one write
+    if let Err(e) = t.send(&frame) {
+        out.steps.push(Step { what: "send_failed", detail: format!("{}: {e}", packet::to_hex(&frame)) });
+        out.failure = Some(Failure::SendFailed);
+        return out;
+    }
+    let written = Instant::now();
+    out.sent = Some(frame.clone());
+    out.steps.push(Step { what: "sent", detail: packet::to_hex(&frame) });
+
+    // 3. Notifications right after the write: logged, never a confirmation
+    let listen_until = written + NOTIFY_WINDOW.min(timeout / 2);
+    while let Some(left) = listen_until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
+        if let Some(v) = t.recv(left) {
+            out.steps.push(Step { what: "notify", detail: packet::to_hex(&v) });
+        }
+    }
+    while let Some(v) = t.recv(Duration::ZERO) {
+        out.steps.push(Step { what: "notify", detail: packet::to_hex(&v) });
+    }
+
+    // 4. Read back and compare the ten bands
+    let got = t.send(&request).ok().and_then(|()| wait_for(t, op, written + timeout));
+    match got {
+        None => {
+            out.steps.push(Step { what: "no_read_back", detail: format!("{} ms", timeout.as_millis()) });
+            out.failure = Some(Failure::Timeout);
+        }
+        Some(p) => {
+            let same = commands::EQUALIZER_FREQUENCIES.len();
+            let matching = if p.len() >= EQ_PARAMS_LEN {
+                p[3..EQ_PARAMS_LEN]
+                    .as_chunks::<7>()
+                    .0
+                    .iter()
+                    .zip(frame[7..].as_chunks::<7>().0)
+                    .filter(|(a, b)| a == b)
+                    .count()
+            } else {
+                0
+            };
+            out.steps.push(Step { what: "read_back", detail: format!("{matching}/{same} {}", packet::to_hex(&p)) });
+            if !eq_confirms(&frame[4..], &p) {
+                out.failure = Some(Failure::Mismatch);
+            }
+            out.read_back = Some(p);
+        }
+    }
+    out
+}
+
 fn value_text(setting: Setting, v: u8, max: Option<u8>) -> String {
     if setting == Setting::NoiseControl {
         noise_name(v).to_string()
@@ -668,14 +925,14 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_five_settings_are_allowed() {
-        assert_eq!(ALLOWED, [0x09, 0x10, 0x2A, 0x17, 0x2C]);
+    fn exactly_the_six_settings_are_allowed() {
+        assert_eq!(ALLOWED, [0x09, 0x10, 0x2A, 0x17, 0x2C, 0x22]);
         for op in 0..=u8::MAX {
             for p in [&[0x01u8][..], &[0x02], &[0x00], &[0x0F], &[0x64], &[0x65], &[0xFF], &[0x01, 0x02], &[]] {
                 let r = build(op, p);
                 let ok = match op {
                     0x09 | 0x10 | 0x2A => p == [0x01] || p == [0x02],
-                    // 0x17 and 0x2C take three or four bytes: none of these
+                    // 0x17 and 0x2C take three or four bytes, 0x22 73: none of these
                     _ => false,
                 };
                 assert_eq!(r.is_ok(), ok, "0x{op:02X} {p:?}");
@@ -1319,5 +1576,260 @@ mod tests {
         let o = run(&mut m, Setting::WearDetection, 0x00, T);
         assert_eq!(o.failure, Some(Failure::OutOfRange));
         assert!(m.sent.is_empty(), "a bad value sends nothing, not even a read");
+    }
+
+    // ---- Phase F4: equalizer (0x22) ----
+
+    /// The N70's answer to FE 22: preset, master gain, `slots` bands
+    #[allow(clippy::needless_range_loop)]
+    fn eq_answer(preset: u8, curve: &EqCurve, slots: usize) -> Vec<u8> {
+        let mut p = vec![preset, 0, 0];
+        for i in 0..slots {
+            let (f, g) = if i < 10 { (commands::EQUALIZER_FREQUENCIES[i], curve[i]) } else { (16000, 0) };
+            p.extend(f.to_le_bytes());
+            p.extend(g.to_le_bytes());
+            p.extend(EQ_Q.to_le_bytes());
+            p.push(0);
+        }
+        p
+    }
+
+    const ROCK: EqCurve = [400, 300, 150, -50, -150, -100, 100, 250, 350, 350];
+
+    #[test]
+    fn eq_frame_is_openqcys() {
+        let f = eq_frame(&ROCK).unwrap();
+        assert_eq!(f.len(), 77);
+        assert_eq!(&f[..7], &hex("FF4B2249080000"));
+        // 31 Hz +4.00 dB, Q 100, type 0
+        assert_eq!(&f[7..14], &hex("1F00900164 0000".replace(' ', "").as_str()));
+        // 250 Hz -0.50 dB
+        assert_eq!(&f[28..35], &hex("FA00CEFF640000"));
+        // 16 kHz +3.50 dB
+        assert_eq!(&f[70..77], &hex("803E5E01640000"));
+        // The same bytes as the crate's own builder (OpenQCY's port)
+        let db: Vec<f64> = ROCK.iter().map(|g| f64::from(*g) / 100.0).collect();
+        assert_eq!(f[..], commands::build_custom_equalizer(&db, EQ_PRESET_CUSTOM).unwrap()[..]);
+        assert_eq!(
+            eq_frame(&[0; 10]).unwrap()[..14],
+            hex("FF4B22490800001F0000006400 00".replace(' ', "").as_str())[..]
+        );
+        assert_eq!(eq_frame(&[800, -800, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap()[9..11], [0x20, 0x03]);
+    }
+
+    #[test]
+    fn eq_out_of_range_is_refused() {
+        assert!(eq_frame(&[801, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
+        assert!(eq_frame(&[0, 0, 0, 0, 0, 0, 0, 0, 0, -801]).is_err());
+        let good = eq_frame(&ROCK).unwrap()[4..].to_vec();
+        assert!(build(0x22, &good).is_ok());
+        let bad = |i: usize, v: u8| {
+            let mut p = good.clone();
+            p[i] = v;
+            build(0x22, &p)
+        };
+        // preset not 8, master gain not 0, a moved frequency, Q, type
+        for (i, v) in [(0, 1), (0, 0), (1, 1), (2, 0xFF), (3, 0x20), (8, 0x20), (8, 0x65), (9, 1), (73 - 1, 2)] {
+            assert_eq!(
+                bad(i, v),
+                Err(Refused::BadParameters(0x22, {
+                    let mut p = good.clone();
+                    p[i] = v;
+                    p
+                })),
+                "{i}={v}"
+            );
+        }
+        // gain +8.01 dB written raw
+        let mut p = good.clone();
+        p[5..7].copy_from_slice(&801i16.to_le_bytes());
+        assert!(build(0x22, &p).is_err());
+        // wrong lengths: 20 bands, 9 bands, one byte short or long
+        assert!(build(0x22, &eq_answer(8, &ROCK, 20)).is_err());
+        assert!(build(0x22, &good[..66]).is_err());
+        assert!(build(0x22, &good[..72]).is_err());
+        let mut long = good.clone();
+        long.push(0);
+        assert!(build(0x22, &long).is_err());
+        assert!(build(0x22, &[]).is_err());
+        assert!(run(&mut Mock::new(0), Setting::Equalizer, 1, T).failure.is_some());
+        assert!(check_value(Setting::Equalizer, 1).is_err());
+        // The UI's dB: hundredths, ±8, never clamped
+        assert_eq!(eq_curve_from_db(&[4.0, 3.0, 1.5, -0.5, -1.5, -1.0, 1.0, 2.5, 3.5, 3.5]), Some(ROCK));
+        assert_eq!(
+            eq_curve_from_db(&[8.0, -8.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).unwrap()[..3],
+            [800, -800, 1]
+        );
+        assert!(eq_curve_from_db(&[8.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).is_none());
+        assert!(eq_curve_from_db(&[0.001, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).is_none());
+        assert!(eq_curve_from_db(&[f64::NAN, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).is_none());
+        assert!(eq_curve_from_db(&[0.0; 9]).is_none());
+        assert!(eq_curve_from_db(&[0.0; 11]).is_none());
+        // The blocklist still wins
+        for op in [0x01, 0x02, 0x03, 0x0D, 0x11, 0x18, 0x1F, 0x45, 0xFE] {
+            assert_eq!(build(op, &good), Err(Refused::Blocked(op)));
+        }
+    }
+
+    #[test]
+    fn eq_read_back_compares_the_ten_bands() {
+        let sent = eq_frame(&ROCK).unwrap()[4..].to_vec();
+        // The N70 answers 20 slots and preset 1 or 8: the same ten bands confirm
+        assert!(eq_confirms(&sent, &eq_answer(8, &ROCK, 20)));
+        assert!(eq_confirms(&sent, &eq_answer(1, &ROCK, 20)));
+        assert!(eq_confirms(&sent, &eq_answer(1, &ROCK, 10)));
+        // One gain, Q or type different: not confirmed
+        let mut other = ROCK;
+        other[9] = 300;
+        assert!(!eq_confirms(&sent, &eq_answer(8, &other, 20)));
+        let mut q = eq_answer(8, &ROCK, 20);
+        q[3 + 7 * 4 + 4] = 0x65;
+        assert!(!eq_confirms(&sent, &q));
+        let mut ty = eq_answer(8, &ROCK, 20);
+        ty[3 + 6] = 1;
+        assert!(!eq_confirms(&sent, &ty));
+        // Not comparable: not confirmed
+        assert!(!eq_confirms(&sent, &[]));
+        assert!(!eq_confirms(&sent, &eq_answer(8, &ROCK, 9)));
+        assert!(!eq_confirms(&sent, &eq_answer(8, &ROCK, 20)[..100]));
+        assert!(!eq_confirms(&sent[..72], &eq_answer(8, &ROCK, 20)));
+        // The read: preset + first ten gains, only at the fixed frequencies
+        assert_eq!(eq_read(&eq_answer(1, &[0; 10], 20)), Some((1, [0; 10])));
+        assert_eq!(eq_read(&eq_answer(8, &ROCK, 10)), Some((8, ROCK)));
+        assert_eq!(eq_read(&eq_answer(1, &ROCK, 9)), None);
+        let mut moved = eq_answer(1, &ROCK, 20);
+        moved[3] = 0x20;
+        assert_eq!(eq_read(&moved), None);
+        assert_eq!(eq_read(&[]), None);
+    }
+
+    /// The earbuds' EQ: answers FE 22 with `slots` slots; a 0x22 write sets
+    /// the ten bands (preset byte from `preset_after`)
+    struct EqMock {
+        curve: EqCurve,
+        preset: u8,
+        preset_after: u8,
+        slots: usize,
+        applies: bool,
+        /// Answers left (None: all)
+        answers: Option<usize>,
+        garbled: bool,
+        sent: Vec<Vec<u8>>,
+        inbox: VecDeque<Vec<u8>>,
+    }
+
+    impl EqMock {
+        fn new() -> EqMock {
+            EqMock {
+                curve: [0; 10],
+                preset: 1,
+                preset_after: 1,
+                slots: 20,
+                applies: true,
+                answers: None,
+                garbled: false,
+                sent: Vec::new(),
+                inbox: VecDeque::new(),
+            }
+        }
+        fn writes(&self) -> Vec<&Vec<u8>> {
+            self.sent.iter().filter(|f| f[2] != 0xFE).collect()
+        }
+    }
+
+    impl Transport for EqMock {
+        fn send(&mut self, frame: &[u8]) -> Result<(), String> {
+            self.sent.push(frame.to_vec());
+            if frame[2] == 0xFE {
+                if self.answers.is_some_and(|n| n == 0) {
+                    return Ok(());
+                }
+                self.answers = self.answers.map(|n| n - 1);
+                let a =
+                    if self.garbled { vec![1, 0, 0, 0x1F] } else { eq_answer(self.preset, &self.curve, self.slots) };
+                self.inbox.push_back(packet::frame(0x22, &a));
+            } else if self.applies {
+                self.curve = eq_read(&frame[4..]).unwrap().1;
+                self.preset = self.preset_after;
+            }
+            Ok(())
+        }
+        fn recv(&mut self, wait: Duration) -> Option<Vec<u8>> {
+            let v = self.inbox.pop_front();
+            if v.is_none() && !wait.is_zero() {
+                std::thread::sleep(wait.min(Duration::from_millis(5)));
+            }
+            v
+        }
+    }
+
+    #[test]
+    fn eq_write_reads_first_sends_once_and_confirms() {
+        let mut m = EqMock::new();
+        let o = run_eq(&mut m, &ROCK, T);
+        assert!(o.confirmed(), "{o:?}");
+        assert_eq!(o.previous, Some((1, [0; 10])));
+        assert_eq!(m.sent.len(), 3);
+        assert_eq!(m.sent[0], hex("FF03FE0122"));
+        assert_eq!(m.writes(), [&eq_frame(&ROCK).unwrap()]);
+        assert_eq!(m.sent[2], hex("FF03FE0122"));
+        assert_eq!(o.steps.iter().map(|s| s.what).collect::<Vec<_>>(), ["read_previous", "sent", "read_back"]);
+        assert!(o.steps[2].detail.starts_with("10/10 "));
+        // Desfazer: the curve read before, the same way
+        let undo = run_eq(&mut m, &o.previous.unwrap().1, T);
+        assert!(undo.confirmed());
+        assert_eq!(undo.previous, Some((1, ROCK)));
+        assert_eq!(m.curve, [0; 10]);
+        assert_eq!(m.writes().len(), 2);
+    }
+
+    #[test]
+    fn eq_preset_byte_8_back_still_confirms() {
+        let mut m = EqMock::new();
+        m.preset_after = 8;
+        assert!(run_eq(&mut m, &ROCK, T).confirmed());
+    }
+
+    #[test]
+    fn eq_not_applied_is_a_mismatch_and_not_resent() {
+        let mut m = EqMock::new();
+        m.applies = false;
+        let o = run_eq(&mut m, &ROCK, T);
+        assert_eq!(o.failure, Some(Failure::Mismatch));
+        assert_eq!(m.writes().len(), 1);
+        assert!(o.steps.last().unwrap().detail.starts_with("0/10 "), "{:?}", o.steps);
+    }
+
+    #[test]
+    fn eq_timeout_is_never_resent() {
+        let mut m = EqMock::new();
+        m.answers = Some(1);
+        let o = run_eq(&mut m, &ROCK, T);
+        assert_eq!(o.failure, Some(Failure::Timeout));
+        assert_eq!(o.previous, Some((1, [0; 10])));
+        assert_eq!(m.writes().len(), 1);
+        assert_eq!(o.steps.last().unwrap().what, "no_read_back");
+    }
+
+    #[test]
+    fn eq_unreadable_curve_writes_nothing() {
+        for (garbled, answers, slots) in [(true, None, 20), (false, Some(0), 20), (false, None, 9)] {
+            let mut m = EqMock::new();
+            m.garbled = garbled;
+            m.answers = answers;
+            m.slots = slots;
+            let o = run_eq(&mut m, &ROCK, T);
+            assert_eq!(o.failure, Some(Failure::NoPrevious));
+            assert!(m.writes().is_empty());
+            assert_eq!(o.sent, None);
+        }
+    }
+
+    #[test]
+    fn eq_out_of_range_sends_nothing_at_all() {
+        let mut m = EqMock::new();
+        let o = run_eq(&mut m, &[900, 0, 0, 0, 0, 0, 0, 0, 0, 0], T);
+        assert_eq!(o.failure, Some(Failure::OutOfRange));
+        assert!(m.sent.is_empty());
     }
 }
