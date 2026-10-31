@@ -684,7 +684,7 @@ pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option
         "link": link,
         "read_only": false,
         "writable": Setting::ALL.iter().filter(|s| write::ALLOWED.contains(&s.opcode())).map(|s| s.key()).collect::<Vec<_>>(),
-        "verified": ["game_mode", "sleep_mode", "wind_reduction"],
+        "verified": ["game_mode", "sleep_mode", "wind_reduction", "noise_control"],
         "write": write.map_or(Value::Null, write_view),
         "device_name": last.map_or("", |r| r.name.as_str()),
         "address": last.map_or("", |r| r.address.as_str()),
@@ -738,7 +738,7 @@ mod tests {
         assert_eq!(v["link"]["state"], "none");
         assert_eq!(v["read_only"], false);
         assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
-        assert_eq!(v["verified"], json!(["game_mode", "sleep_mode", "wind_reduction"]));
+        assert_eq!(v["verified"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
         assert_eq!(v["write"], Value::Null);
         assert_eq!(v["synced_at"], Value::Null);
         assert_eq!(v["battery"]["left"]["level"], Value::Null);
@@ -892,7 +892,7 @@ mod tests {
     fn writable_and_verified() {
         let v = view_all(Some(&reading()), None, None);
         assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
-        assert_eq!(v["verified"], json!(["game_mode", "sleep_mode", "wind_reduction"]));
+        assert_eq!(v["verified"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
     }
 
     #[test]

@@ -52,7 +52,7 @@ describe("placeholder (real build, no qcy_* commands)", () => {
   it("phase 2: reads, one command, read-back; the rest is refused", async () => {
     const q = new MockQcy({ speed: 0, gameOnly: true });
     expect((await q.state()).writable).toEqual(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]);
-    expect((await q.state()).verified).toEqual(["game_mode", "sleep_mode", "wind_reduction"]);
+    expect((await q.state()).verified).toEqual(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]);
     const on = await q.set({ kind: "game_mode", enabled: true });
     expect(on.game_mode).toBe(true);
     expect(on.write).toMatchObject({ status: "confirmed", previous: false, sent: "FF03090101", failure: null });
