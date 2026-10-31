@@ -405,12 +405,15 @@ export function valueText(w: QcyWrite, v: boolean | number | null | undefined): 
   if (v === null || v === undefined) return "?";
   if (isNoise(w) && typeof v === "number") return noiseText(v);
   if (typeof v === "number") return w.max ? `${v}/${w.max}` : String(v);
+  // "Detecção de uso" is feminine in pt-BR: ligada/desligada
+  if (w.setting === "wear_detection") return ft(v ? "write.on_f" : "write.off_f");
   return ft(v ? "write.on" : "write.off");
 }
 
 function writeTitle(w: QcyWrite): string {
   if (isNoise(w)) return ft("write.ok_noise", valueText(w, w.value));
   if (isLevel(w)) return ft("write.ok_level", settingName(w.setting), valueText(w, w.value));
+  if (w.setting === "wear_detection") return ft(w.enabled ? "write.ok_on_f" : "write.ok_off_f", settingName(w.setting));
   return ft(w.enabled ? "write.ok_on" : "write.ok_off", settingName(w.setting));
 }
 
@@ -808,7 +811,7 @@ function SettingsTab(props: {
    *  (the prompt volume is shown, read-only) */
   const locked = (k: string) => props.partial === true && !can(k);
   const lockAll = () => props.partial === true;
-  /** Phase F3b: wear detection is writable (tag Em teste until verified) */
+  /** Phase F3b: wear detection is writable (verified on the N70, 2026-10-31) */
   const wearWritable = () => props.partial === true && can("wear_detection");
   const wearOk = () => props.verified?.includes("wear_detection") === true;
   // The switch stays on until the dialog's answer: the click flipped the

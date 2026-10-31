@@ -1,10 +1,11 @@
 //! Changing a setting of the earbuds: the ONLY place that frames a write.
 //!
-//! Phase F2 (plano_escrita_qcy.md): three settings may change. Everything
+//! Phases F2–F3b (plano_escrita_qcy.md): five settings may change. Everything
 //! else is refused here, whatever the caller asks:
 //!
 //! - [`ALLOWED`]: exactly 0x09 game mode, 0x10 sleep mode and 0x2A wind
-//!   reduction (on/off: one parameter byte, `01` on or `02` off). Any other
+//!   reduction (on/off: one parameter byte, `01` on or `02` off), plus
+//!   0x17 noise control and 0x2C wear detection as below. Any other
 //!   opcode, length or value: [`Refused`].
 //! - 0x1D prompt volume is NOT written (fase 2b): on the N70 every
 //!   `FF 03 1D 01 <v>` read back the old level (04/0F, 2026-10-31), so it
@@ -20,7 +21,7 @@
 //!   right before it: `FF 05 2C 03 <01|02> <music> <anc>` or
 //!   `FF 06 2C 04 <01|02> <music> <anc> <tone>`. Confirmed when the
 //!   read-back's state is the one written (off reads back as `00`) and the
-//!   other bytes did not change. Experimental (not yet verified on the N70).
+//!   other bytes did not change. Verified on the N70 (Gabriel, 2026-10-31).
 //! - [`BLOCKED`]: opcodes that are never written, even if a later phase
 //!   widens [`ALLOWED`] by mistake (restore defaults, clear pairings,
 //!   factory reset, test modes, standby, rename, fit/EQ tests).

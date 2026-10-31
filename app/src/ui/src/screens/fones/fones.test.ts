@@ -3,7 +3,9 @@ import { parseRoute, routeHash } from "../../app/context";
 import { MockQcy } from "../../ipc/qcyMock";
 import { EQ_BANDS_HZ, NOISE_CODES, noiseCode } from "../../ipc/qcy";
 import { EQ_PRESETS, matchPreset } from "../../lib/eqPresets";
-import { wearBytes, canRefresh, curvePath, F2_SETTINGS, needsNoiseWarning, noiseChange, noiseText, promptMax, settingName, windAllowed, writeChange, writeStepLines } from "./Fones";
+import { wearBytes, canRefresh, curvePath, F2_SETTINGS, needsNoiseWarning, noiseChange, noiseText, promptMax, settingName, valueText, windAllowed, writeChange, writeStepLines } from "./Fones";
+import { ft } from "./strings";
+import { setLanguage } from "../../i18n";
 import { F2_OPCODES, sampleQcyState } from "../../ipc/qcyMock";
 
 describe("fones", () => {
@@ -52,8 +54,8 @@ describe("placeholder (real build, no qcy_* commands)", () => {
   it("phase 2: reads, one command, read-back; the rest is refused", async () => {
     const q = new MockQcy({ speed: 0, gameOnly: true });
     expect((await q.state()).writable).toEqual(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"]);
-    expect((await q.state()).experimental).toEqual(["wear_detection"]);
-    expect((await q.state()).verified).toEqual(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]);
+    expect((await q.state()).experimental).toEqual([]);
+    expect((await q.state()).verified).toEqual(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"]);
     const on = await q.set({ kind: "game_mode", enabled: true });
     expect(on.game_mode).toBe(true);
     expect(on.write).toMatchObject({ status: "confirmed", previous: false, sent: "FF03090101", failure: null });
@@ -238,7 +240,7 @@ describe("phase 3 (noise control 0x17)", () => {
   });
 });
 
-describe("phase 3b (wear detection 0x2C, Em teste)", () => {
+describe("phase 3b (wear detection 0x2C, Verificado)", () => {
   it("off: one frame copying music/ANC, 00 read back counts as off, Desfazer", async () => {
     const q = new MockQcy({ speed: 0, gameOnly: true });
     const off = await q.set({ kind: "wear_detection", enabled: false });
@@ -253,6 +255,25 @@ describe("phase 3b (wear detection 0x2C, Em teste)", () => {
     expect(writeChange(off.write!, "undo")).toEqual({ kind: "wear_detection", enabled: true });
     const on = await q.set(writeChange(off.write!, "undo")!);
     expect(on.write).toMatchObject({ status: "confirmed", sent: "FF052C03010101", read_back: "010101" });
+  });
+
+  it("pt-BR texts are feminine (a Detecção de uso)", async () => {
+    await setLanguage("pt-BR");
+    const q = new MockQcy({ speed: 0, gameOnly: true });
+    const off = await q.set({ kind: "wear_detection", enabled: false });
+    expect(valueText(off.write!, true)).toBe("ligada");
+    expect(valueText(off.write!, false)).toBe("desligada");
+    expect(writeStepLines(off.write!)[0]).toBe("Valor anterior lido e salvo: ligada");
+    expect(ft("write.undo", valueText(off.write!, off.write!.previous))).toBe("↶ Desfazer (voltar para ligada)");
+    const on = await q.set(writeChange(off.write!, "undo")!);
+    expect(writeStepLines(on.write!)[0]).toBe("Valor anterior lido e salvo: desligada");
+    expect(writeStepLines(on.write!)[2]).toBe("Confirmado pelo fone: ligada ✓");
+    expect(ft("write.ok_on_f", ft("wear"))).toBe("Detecção de uso ligada — confirmada pelo fone");
+    expect(ft("write.ok_off_f", ft("wear"))).toBe("Detecção de uso desligada — confirmada pelo fone");
+    // the other settings keep the masculine forms
+    const g = await q.set({ kind: "game_mode", enabled: true });
+    expect(valueText(g.write!, false)).toBe("desligado");
+    await setLanguage("en");
   });
 
   it("keeps a tone byte and times out once without re-sending", async () => {

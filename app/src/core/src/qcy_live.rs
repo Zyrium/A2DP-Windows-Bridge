@@ -648,8 +648,9 @@ fn write_view(w: &LastWrite) -> Value {
 
 /// The QcyState of qcy.ts (app/src/ui/src/ipc/qcy.ts): read_only false,
 /// only the `writable` settings can change (game mode, sleep mode, wind
-/// reduction, prompt volume); `verified` lists those confirmed on the N70
-/// (game mode: Gabriel, 2026-10-31); the others show "Em teste"
+/// reduction, noise control, wear detection); `verified` lists those
+/// confirmed on the N70 (all five: Gabriel, 2026-10-31); any other writable
+/// one would show "Em teste"
 pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option<&LastWrite>) -> Value {
     let link = match (link, last) {
         (Some(why), _) => json!({ "state": "unavailable", "reason": why.reason() }),
@@ -702,8 +703,8 @@ pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option
         "link": link,
         "read_only": false,
         "writable": Setting::ALL.iter().filter(|s| write::ALLOWED.contains(&s.opcode())).map(|s| s.key()).collect::<Vec<_>>(),
-        "verified": ["game_mode", "sleep_mode", "wind_reduction", "noise_control"],
-        "experimental": ["wear_detection"],
+        "verified": ["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"],
+        "experimental": [],
         "write": write.map_or(Value::Null, write_view),
         "device_name": last.map_or("", |r| r.name.as_str()),
         "address": last.map_or("", |r| r.address.as_str()),
@@ -761,7 +762,10 @@ mod tests {
             v["writable"],
             json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"])
         );
-        assert_eq!(v["verified"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
+        assert_eq!(
+            v["verified"],
+            json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"])
+        );
         assert_eq!(v["write"], Value::Null);
         assert_eq!(v["synced_at"], Value::Null);
         assert_eq!(v["battery"]["left"]["level"], Value::Null);
@@ -893,8 +897,8 @@ mod tests {
             Some((Setting::WearDetection, 0x02))
         );
         let v = view_all(Some(&reading()), None, None);
-        assert_eq!(v["experimental"], json!(["wear_detection"]));
-        assert!(!v["verified"].as_array().unwrap().contains(&json!("wear_detection")));
+        assert_eq!(v["experimental"], json!([]));
+        assert!(v["verified"].as_array().unwrap().contains(&json!("wear_detection")));
         assert_eq!(v["reapply_on_connect"], false);
     }
 
@@ -948,7 +952,10 @@ mod tests {
             v["writable"],
             json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"])
         );
-        assert_eq!(v["verified"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
+        assert_eq!(
+            v["verified"],
+            json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"])
+        );
     }
 
     #[test]
