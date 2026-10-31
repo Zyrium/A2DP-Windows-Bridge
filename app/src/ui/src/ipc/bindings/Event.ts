@@ -9,8 +9,9 @@ import type { ReceiverState } from "./ReceiverState";
 import type { Settings } from "./Settings";
 import type { StreamStatus } from "./StreamStatus";
 import type { UpdateState } from "./UpdateState";
+import type { JsonValue } from "./serde_json/JsonValue";
 
 /**
  * One part of the state changed, or a subscribed stream produced data
  */
-export type Event = { "kind": "adapter", "value": AdapterState } | { "kind": "devices", "value": Array<Device> } | { "kind": "scanning", "value": boolean } | { "kind": "le_scanning", "value": boolean } | { "kind": "stream", "value": StreamStatus } | { "kind": "profiles", "value": { profiles: Array<Profile>, active_profile: string | null, } } | { "kind": "settings", "value": Settings } | { "kind": "update", "value": UpdateState } | { "kind": "link", "value": LinkSample } | { "kind": "log", "value": LogLine } | { "kind": "capture", "value": CaptureState | null } | { "kind": "v1_running", "value": boolean } | { "kind": "receiver", "value": ReceiverState } | { "kind": "bye" };
+export type Event = { "kind": "adapter", "value": AdapterState } | { "kind": "devices", "value": Array<Device> } | { "kind": "scanning", "value": boolean } | { "kind": "le_scanning", "value": boolean } | { "kind": "stream", "value": StreamStatus } | { "kind": "profiles", "value": { profiles: Array<Profile>, active_profile: string | null, } } | { "kind": "settings", "value": Settings } | { "kind": "update", "value": UpdateState } | { "kind": "link", "value": LinkSample } | { "kind": "log", "value": LogLine } | { "kind": "capture", "value": CaptureState | null } | { "kind": "v1_running", "value": boolean } | { "kind": "receiver", "value": ReceiverState } | { "kind": "qcy", "value": JsonValue } | { "kind": "bye" };

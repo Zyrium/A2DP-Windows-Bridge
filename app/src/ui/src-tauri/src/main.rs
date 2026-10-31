@@ -39,6 +39,11 @@ fn main() {
             commands::reveal_path,
             commands::update_status,
             commands::update_install,
+            commands::qcy_state,
+            commands::qcy_refresh,
+            commands::qcy_reconnect,
+            commands::qcy_set,
+            commands::qcy_save_profile,
         ])
         .on_window_event(windows::on_window_event)
         .setup(move |app| {

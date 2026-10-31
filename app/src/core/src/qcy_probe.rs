@@ -52,6 +52,8 @@ pub fn run(host: &BtHost, seconds: u32, address: Option<[u8; 6]>) -> i32 {
     }
     for f in &found {
         println!("{}", describe(f));
+        println!("    adv {}", to_hex(&f.result.adv));
+        println!("    scan response {}", to_hex(&f.result.scan_rsp));
     }
 
     let Some(target) = choose(&found, address) else {
@@ -146,11 +148,14 @@ fn probe(host: &BtHost, id: bt_host::LeDeviceId) -> i32 {
         let frame = commands::request(op);
         while responses.try_recv().is_ok() {}
         println!("  query 0x{op:02X}  tx {}", to_hex(&frame));
-        if let Err(e) = host.le_gatt_write(id, command.value_handle, frame, GATT_TIMEOUT) {
-            println!("    write failed: {e}");
-            if command.properties & 0x08 == 0 {
-                println!("    (1001 does not list Write with response; properties 0x{:02X})", command.properties);
-            }
+        // 1001 lists only Write Without Response (properties 0x04)
+        let written = if command.properties & 0x04 != 0 {
+            host.le_gatt_write_without_response(id, command.value_handle, frame, GATT_TIMEOUT)
+        } else {
+            host.le_gatt_write(id, command.value_handle, frame, GATT_TIMEOUT)
+        };
+        if let Err(e) = written {
+            println!("    write failed: {e} (properties 0x{:02X})", command.properties);
             continue;
         }
         if wait_for(&responses, op, &mut state) {

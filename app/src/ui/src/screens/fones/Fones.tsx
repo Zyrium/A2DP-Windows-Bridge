@@ -45,6 +45,10 @@ export function Fones(props: { tab?: string }) {
 
   const tab = (): FonesTab => (props.tab === "eq" || props.tab === "settings" ? props.tab : "main");
   const live = () => state()?.link.state === "connected";
+  const readOnly = () => state()?.read_only === true;
+  /** Controls usable: connected and not a read-only build */
+  const editable = () => live() && !readOnly();
+  const reason = () => (state()?.link as { reason?: string } | undefined)?.reason;
 
   const act = async (f: (q: QcyProvider) => Promise<QcyState>) => {
     const q = qcy();
@@ -77,9 +81,10 @@ export function Fones(props: { tab?: string }) {
         <span class="muted sync">
           <Icon name="arrow_sync" /> {syncText()}
         </span>
-        <Button icon="arrow_sync" disabled={!live() || busy()} onClick={() => void act((q) => q.refresh())}>
+        <Button icon="arrow_sync" disabled={busy() || (!live() && !readOnly())} onClick={() => void act((q) => q.refresh())}>
           {ft("refresh")}
         </Button>
+        <span class="muted refresh-hint">{ft("refresh_hint")}</span>
       </header>
 
       <Segmented<FonesTab>
@@ -111,10 +116,21 @@ export function Fones(props: { tab?: string }) {
                   </Show>
                 }
               >
-                {(s().link as { reason?: string }).reason === "not_implemented" ? ft("unavailable.not_implemented") : ft("unavailable.text")}
+                {reason() === "not_implemented"
+                  ? ft("unavailable.not_implemented")
+                  : reason() === "le_off"
+                    ? ft("unavailable.le_off")
+                    : reason() === "not_found"
+                      ? ft("unavailable.not_found")
+                      : ft("unavailable.text")}
               </Banner>
             </Show>
-            <div class="fones-body" classList={{ stale: !live() }} aria-disabled={!live()} inert={!live() ? true : undefined}>
+            <Show when={s().read_only}>
+              <Banner kind="info" title={ft("read_only.title")}>
+                {s().link.state === "none" ? `${ft("read_only.text")} ${ft("read_only.first")}` : ft("read_only.text")}
+              </Banner>
+            </Show>
+            <div class="fones-body" classList={{ stale: !live(), readonly: live() && readOnly() }} aria-disabled={!editable()} inert={!editable() ? true : undefined}>
               <Show when={tab() === "main"}>
                 <MainTab s={s()} send={send} />
               </Show>

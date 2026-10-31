@@ -46,3 +46,4 @@
 .fones .lastval { font-size: 11px; color: var(--text-3); }
 .fones-body { display: flex; flex-direction: column; gap: var(--s4); }
 .fones-body.stale { opacity: 0.5; filter: grayscale(1); pointer-events: none; user-select: none; }
+.fones-body.readonly { opacity: 0.7; filter: grayscale(0.6); pointer-events: none; user-select: none; }

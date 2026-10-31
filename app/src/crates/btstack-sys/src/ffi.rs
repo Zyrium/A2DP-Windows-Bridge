@@ -215,6 +215,16 @@ unsafe extern "C" {
     // ---- BTstack: GAP (LE) ----
     pub fn gap_set_scan_params(scan_type: u8, scan_interval: u16, scan_window: u16, filter_policy: u8) -> u8;
     pub fn gap_start_scan();
+    pub fn gap_set_connection_parameters(
+        conn_scan_interval: u16,
+        conn_scan_window: u16,
+        conn_interval_min: u16,
+        conn_interval_max: u16,
+        conn_latency: u16,
+        supervision_timeout: u16,
+        min_ce_length: u16,
+        max_ce_length: u16,
+    );
     pub fn gap_stop_scan();
     pub fn gap_connect_cancel() -> u8;
     pub fn gap_cig_remove(cig_id: u8) -> u8;

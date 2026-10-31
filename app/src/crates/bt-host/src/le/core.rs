@@ -82,6 +82,9 @@ pub struct LeDevice {
     /// pairing, no modules, no PACS / ASCS; the GATT cache is all that is
     /// read. For peripherals with their own control channel (QCY earbuds).
     pub plain: bool,
+    /// A plain link's GATT cache from an earlier link (same device, same
+    /// firmware): used instead of a full discovery when not empty
+    pub cached_services: Vec<GattService>,
     /// Why it went down / failed (HCI / ATT / SM)
     pub last_error: u8,
 
@@ -119,6 +122,7 @@ impl LeDevice {
             gatt_ready: false,
             ready: false,
             plain: false,
+            cached_services: Vec::new(),
             last_error: 0,
             services: Vec::new(),
             sink_pacs: Vec::new(),
@@ -509,7 +513,7 @@ impl<'a> LeCtx<'a> {
 
     /// The device of an address (an RPA SM resolved stands for its
     /// identity), created if asked
-    fn device_for_addr(&mut self, addr: LeAddr, create: bool) -> Option<LeDeviceId> {
+    pub(crate) fn device_for_addr(&mut self, addr: LeAddr, create: bool) -> Option<LeDeviceId> {
         let resolved = self.resolved_identity(&addr.addr);
         let key = resolved.unwrap_or(addr);
         if let Some(d) = self.core.devices.iter_mut().find(|d| d.addr.addr == key.addr || d.peer_addr.addr == addr.addr)
@@ -666,10 +670,21 @@ impl<'a> LeCtx<'a> {
     // ======================================================================
 
     pub(crate) fn start_scan(&mut self) {
+        self.start_scan_with(0x0030, 0x0030);
+    }
+
+    /// Active scan with this interval / window (0.625 ms units): a window
+    /// shorter than the interval leaves the radio to a BR/EDR stream
+    pub(crate) fn start_scan_with(&mut self, interval: u16, window: u16) {
         self.core.scan_results.clear();
         self.core.scanning = true;
-        self.stack.le_set_scan_params(true, 0x0030, 0x0030, 0);
+        self.stack.le_set_scan_params(true, interval, window, 0);
         self.stack.le_start_scan();
+    }
+
+    /// The advertisers seen so far by the running scan
+    pub(crate) fn scan_results(&self) -> Vec<LeScanResult> {
+        self.core.scan_results.clone()
     }
 
     pub(crate) fn stop_scan(&mut self) -> Vec<LeScanResult> {
@@ -838,7 +853,27 @@ impl<'a> LeCtx<'a> {
             // Set up in progress: wait for it
             return;
         }
+        if plain {
+            // A plain GATT link next to an A2DP stream: a short initiator
+            // window, a long connection interval and short connection
+            // events, so the LE link takes as little airtime as possible
+            let p = PLAIN_LINK_PARAMS;
+            self.stack.le_set_connection_params(
+                p.scan_interval,
+                p.scan_window,
+                p.interval_min,
+                p.interval_max,
+                p.latency,
+                p.supervision_timeout,
+                p.min_ce,
+                p.max_ce,
+            );
+        }
         let status = self.stack.le_connect(&target.addr, target.addr_type);
+        if plain {
+            // gap_connect copied them; LE Audio links keep the defaults
+            restore_default_connection_params(self.stack);
+        }
         if status != ERROR_CODE_SUCCESS
             && let Some(c) = self.core.connect.take()
         {
@@ -934,6 +969,14 @@ impl<'a> LeCtx<'a> {
         // maybe_secured must not start a profile set-up if the peer encrypts
         d.secured = true;
         let con = d.acl;
+        if !d.cached_services.is_empty() {
+            d.services = d.cached_services.clone();
+            d.gatt_ready = true;
+            d.ready = true;
+            tracing::info!("LE: {}: GATT handles from the cache, no discovery", d.addr);
+            self.finish_connect(id, true);
+            return;
+        }
         self.core.gatt.discover_all(
             con,
             Box::new(move |ctx, status, services| {
@@ -1132,6 +1175,19 @@ impl<'a> LeCtx<'a> {
         }
         let Some(id) = self.device_by_handle(handle).map(|d| d.id) else { return };
         let addr = self.device(id).map(|d| d.addr).unwrap_or_default();
+        // A plain GATT link (le_connect_plain) never pairs or bonds: a
+        // pairing request from the peer is declined, every other SM event is
+        // ignored, and nothing below (confirm, retry) runs for it
+        if self.device(id).is_some_and(|d| d.plain) {
+            match plain_link_sm_action(ty) {
+                PlainSm::Decline => {
+                    tracing::warn!("LE: {addr}: peer asked to pair on a plain link, declined");
+                    self.stack.sm_bonding_decline(handle);
+                }
+                PlainSm::Ignore => tracing::info!("LE: {addr}: SM event 0x{ty:02x} on a plain link, ignored"),
+            }
+            return;
+        }
         match ty {
             SM_EVENT_JUST_WORKS_REQUEST => {
                 tracing::info!("LE Audio: {addr}: pairing (Just Works)");
@@ -1876,5 +1932,124 @@ mod tests {
         assert!(LeAddr { addr: [0x5A, 1, 2, 3, 4, 5], addr_type: LeAddr::RANDOM }.is_rpa());
         assert!(!LeAddr { addr: [0xDA, 1, 2, 3, 4, 5], addr_type: LeAddr::RANDOM }.is_rpa());
         assert!(!LeAddr { addr: [0x5A, 1, 2, 3, 4, 5], addr_type: LeAddr::PUBLIC }.is_rpa());
+    }
+}
+
+/// LE connection parameters (BTstack units, see
+/// `Stack::le_set_connection_params`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnParams {
+    pub scan_interval: u16,
+    pub scan_window: u16,
+    pub interval_min: u16,
+    pub interval_max: u16,
+    pub latency: u16,
+    pub supervision_timeout: u16,
+    pub min_ce: u16,
+    pub max_ce: u16,
+}
+
+/// BTstack's defaults (hci.c): what LE Audio links use
+pub(crate) const DEFAULT_CONNECTION_PARAMS: ConnParams = ConnParams {
+    scan_interval: 0x0060,
+    scan_window: 0x0030,
+    interval_min: 0x0008,
+    interval_max: 0x0018,
+    latency: 4,
+    supervision_timeout: 0x0048,
+    min_ce: 0,
+    max_ce: 0,
+};
+
+/// Plain GATT links (QCY reads) while A2DP may stream: initiator window
+/// 15 ms of every 60 ms (25 % instead of 50 %), interval 45-60 ms instead
+/// of 10-30 ms, no latency (the central talks only when it has to anyway),
+/// 1 s supervision, connection events of at most 2.5 ms
+pub(crate) const PLAIN_LINK_PARAMS: ConnParams = ConnParams {
+    scan_interval: 0x0060,
+    scan_window: 0x0018,
+    interval_min: 0x0024,
+    interval_max: 0x0030,
+    latency: 0,
+    supervision_timeout: 0x0064,
+    min_ce: 0,
+    max_ce: 0x0004,
+};
+
+fn restore_default_connection_params(stack: &Stack) {
+    let p = DEFAULT_CONNECTION_PARAMS;
+    stack.le_set_connection_params(
+        p.scan_interval,
+        p.scan_window,
+        p.interval_min,
+        p.interval_max,
+        p.latency,
+        p.supervision_timeout,
+        p.min_ce,
+        p.max_ce,
+    );
+}
+
+#[cfg(test)]
+mod plain_link_params_tests {
+    use super::*;
+
+    #[test]
+    fn plain_links_are_gentler_than_the_defaults_and_valid() {
+        let (p, d) = (PLAIN_LINK_PARAMS, DEFAULT_CONNECTION_PARAMS);
+        assert!(p.scan_window < d.scan_window && p.scan_window <= p.scan_interval);
+        assert!(p.interval_min > d.interval_max && p.interval_min <= p.interval_max);
+        // Core spec ranges: interval 7.5 ms..4 s, timeout 100 ms..32 s
+        assert!((0x0006..=0x0C80).contains(&p.interval_max));
+        assert!((0x000A..=0x0C80).contains(&p.supervision_timeout));
+        // timeout (10 ms) > (1 + latency) * interval_max (1.25 ms) * 2
+        let timeout_ms = u32::from(p.supervision_timeout) * 10;
+        let needed_ms = (1 + u32::from(p.latency)) * u32::from(p.interval_max) * 125 * 2 / 100;
+        assert!(timeout_ms > needed_ms, "{timeout_ms} <= {needed_ms}");
+    }
+}
+
+/// What a plain GATT link does with a Security Manager event
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlainSm {
+    /// The peer asks to pair: refuse
+    Decline,
+    /// Anything else: no answer, no retry
+    Ignore,
+}
+
+/// The no-pairing guard of plain links: every pairing request is declined,
+/// nothing is ever confirmed
+pub(crate) fn plain_link_sm_action(ty: u8) -> PlainSm {
+    match ty {
+        SM_EVENT_JUST_WORKS_REQUEST
+        | SM_EVENT_NUMERIC_COMPARISON_REQUEST
+        | SM_EVENT_PASSKEY_INPUT_NUMBER
+        | SM_EVENT_PASSKEY_DISPLAY_NUMBER => PlainSm::Decline,
+        _ => PlainSm::Ignore,
+    }
+}
+
+#[cfg(test)]
+mod plain_link_guard_tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_link_declines_every_pairing_request() {
+        for ty in [
+            SM_EVENT_JUST_WORKS_REQUEST,
+            SM_EVENT_NUMERIC_COMPARISON_REQUEST,
+            SM_EVENT_PASSKEY_INPUT_NUMBER,
+            SM_EVENT_PASSKEY_DISPLAY_NUMBER,
+        ] {
+            assert_eq!(plain_link_sm_action(ty), PlainSm::Decline, "0x{ty:02x}");
+        }
+    }
+
+    #[test]
+    fn a_plain_link_ignores_the_other_sm_events() {
+        for ty in [SM_EVENT_PAIRING_STARTED, SM_EVENT_PAIRING_COMPLETE] {
+            assert_eq!(plain_link_sm_action(ty), PlainSm::Ignore, "0x{ty:02x}");
+        }
     }
 }

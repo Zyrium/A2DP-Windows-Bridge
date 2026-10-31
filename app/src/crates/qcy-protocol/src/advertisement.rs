@@ -146,6 +146,23 @@ mod tests {
         d
     }
 
+    /// Raw advertising data of a MeloBuds N70 (2026-10-30). The advertising
+    /// packet and the scan response carry separate battery snapshots (98 / 98
+    /// vs 96 / 97 here); the scan response matched characteristic 0008.
+    #[test]
+    fn parses_a_captured_n70_scan_response() {
+        let hex = |s: &str| {
+            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect::<Vec<u8>>()
+        };
+        let rsp = find_in_ad(&hex("1BFF1C525D459D516A606139CB150833C496820C116733C496A61B11")).unwrap();
+        assert_eq!(rsp.vendor_id, 23877);
+        assert_eq!((rsp.left_battery, rsp.right_battery, rsp.case_battery), (96, 97, 57));
+        assert_eq!(rsp.control_address.map(format_address).as_deref(), Some("C4:33:96:11:0C:82"));
+        assert_eq!(rsp.other_address.map(format_address).as_deref(), Some("C4:33:96:11:1B:A6"));
+        let adv = find_in_ad(&hex("1BFF1C525D4594416E626239CB150833C496820C116733C496A61B11")).unwrap();
+        assert_eq!((adv.left_battery, adv.right_battery, adv.case_battery), (98, 98, 57));
+    }
+
     #[test]
     fn parses_identity_and_battery() {
         let a = Advertisement::parse(&sample()).unwrap();

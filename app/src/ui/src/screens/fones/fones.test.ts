@@ -33,6 +33,19 @@ describe("fones", () => {
   });
 });
 
+describe("read only (this version)", () => {
+  it("shows the values and refuses every change", async () => {
+    const q = new MockQcy({ speed: 0, readOnly: true });
+    const s = await q.state();
+    expect(s.read_only).toBe(true);
+    expect(s.link.state).toBe("connected");
+    await expect(q.set({ kind: "ldac", enabled: false })).rejects.toMatchObject({ code: "qcy.read_only" });
+    expect((await q.state()).ldac).toBe(true);
+    const le = new MockQcy({ speed: 0, readOnly: true, reason: "le_off" });
+    expect((await le.state()).link).toEqual({ state: "unavailable", reason: "le_off" });
+  });
+});
+
 import { placeholderQcyState } from "../../ipc/qcy";
 describe("placeholder (real build, no qcy_* commands)", () => {
   it("shows no headset data and the not_implemented reason", () => {

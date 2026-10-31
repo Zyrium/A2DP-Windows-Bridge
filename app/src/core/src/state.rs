@@ -614,7 +614,7 @@ impl CoreState {
                 Event::Capture(c) => s.capture = c.clone(),
                 Event::V1Running(b) => s.v1_running = *b,
                 // Not state: no revision
-                Event::Link(_) | Event::Log(_) | Event::Receiver(_) | Event::Bye => {
+                Event::Link(_) | Event::Log(_) | Event::Receiver(_) | Event::Qcy(_) | Event::Bye => {
                     let _ = self.events.send((g.0, Arc::new(event)));
                     return;
                 }
@@ -1353,6 +1353,15 @@ impl CoreState {
                 Ok(Value::Null)
             }
             Method::ReceiverStatus => Ok(json(&self.receiver_state())),
+            Method::QcyState => Ok(crate::qcy_live::current()),
+            Method::QcyRefresh | Method::QcyReconnect => {
+                blocking(Box::new(move |me| {
+                    let v = crate::qcy_live::refresh(&me.service);
+                    me.publish(Event::Qcy(v.clone()));
+                    Ok(v)
+                }))
+                .await
+            }
             Method::AppCheckUpdate => blocking(Box::new(|me| me.check_update().map(|u| json(&u)))).await,
             Method::AppHiddenToTray => {
                 self.hidden_to_tray();

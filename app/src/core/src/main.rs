@@ -10,6 +10,8 @@
 mod cli;
 mod driver;
 mod logging;
+mod qcy_cache;
+mod qcy_live;
 mod qcy_probe;
 mod quit;
 mod resident;

@@ -1,7 +1,8 @@
 // The contract between the "Fones" screen and the QCY headset control
-// (BLE/GATT, crates/qcy-protocol). The Rust side (src-tauri, a future
-// `qcy` module) is not written yet: this file is the interface it has to
-// implement. In a plain browser, or with ?qcy=mock, the mock provider of
+// (BLE/GATT, crates/qcy-protocol). The Rust side: src-tauri/commands.rs
+// (qcy_*) and the core's qcy.* requests (core/src/qcy_live.rs). This
+// version is READ ONLY: qcy_set and qcy_save_profile reject with
+// qcy.read_only, and the state carries read_only: true. In a plain browser, or with ?qcy=mock, the mock provider of
 // qcyMock.ts stands in for it.
 //
 // Tauri commands (invoke):
@@ -23,7 +24,7 @@ export type QcyLink =
   /** No QCY headset in the active profile */
   | { state: "none" };
 
-export type QcyUnavailableReason = "not_found" | "gatt_failed" | "timeout" | "adapter_busy" | "not_implemented" | "other";
+export type QcyUnavailableReason = "not_found" | "gatt_failed" | "timeout" | "adapter_busy" | "not_implemented" | "le_off" | "other";
 
 export type NoiseMode = "off" | "anc" | "transparency";
 export type NoiseScene = "adaptive" | "indoor" | "commuting" | "noisy" | "anti_wind";
@@ -76,6 +77,11 @@ export type AutoOff = null | 5 | 15 | 30 | 60;
 
 export interface QcyState {
   link: QcyLink;
+  /** The values are read from the headset but cannot be changed (this
+   *  version): the controls stay greyed, "Atualizar" reads again */
+  read_only?: boolean;
+  /** The headset's own equalizer preset number, when it reported one */
+  eq_preset_index?: number | null;
   device_name: string;
   address: string;
   firmware: string | null;
@@ -194,7 +200,10 @@ export async function createQcy(insideTauri: boolean): Promise<QcyProvider> {
   }
   if (flag || !insideTauri || import.meta.env.VITE_QCY_MOCK === "1") {
     const { MockQcy } = await import("./qcyMock");
-    return new MockQcy({ unavailable: flag === "unavailable" });
+    // ?qcy=readonly, readonly-le_off, readonly-not_found: like this version
+    const ro = flag?.startsWith("readonly") === true;
+    const reason = flag?.split("-")[1] as "le_off" | "not_found" | undefined;
+    return new MockQcy({ unavailable: flag === "unavailable", readOnly: ro, reason });
   }
   return createTauriQcy();
 }

@@ -128,3 +128,49 @@ pub fn update_status(updates: State<'_, Arc<Updates>>) -> Phase {
 pub fn update_install(app: AppHandle, manifest_url: String) -> Result<(), String> {
     update::start(&app, manifest_url)
 }
+
+// The Fones screen's QCY earbuds (ipc/qcy.ts), READ ONLY in this version:
+// state, refresh and reconnect go to the core (qcy.*); set and
+// save_profile are refused here, so nothing is ever written to the earbuds.
+
+fn qcy_read_only() -> ErrorInfo {
+    ErrorInfo { code: "qcy.read_only".into(), message: ipc::Msg::new("fones.error.read_only") }
+}
+
+#[tauri::command]
+pub async fn qcy_state(window: WebviewWindow, ipc: State<'_, Arc<Ipc>>) -> Result<Value, ErrorInfo> {
+    ipc.request(window.label(), "qcy.state", None).await
+}
+
+#[tauri::command]
+pub async fn qcy_refresh(window: WebviewWindow, ipc: State<'_, Arc<Ipc>>) -> Result<Value, ErrorInfo> {
+    ipc.request(window.label(), "qcy.refresh", None).await
+}
+
+#[tauri::command]
+pub async fn qcy_reconnect(window: WebviewWindow, ipc: State<'_, Arc<Ipc>>) -> Result<Value, ErrorInfo> {
+    ipc.request(window.label(), "qcy.reconnect", None).await
+}
+
+/// Changing a setting of the earbuds is not available in this version
+#[tauri::command]
+pub fn qcy_set(change: Option<Value>) -> Result<Value, ErrorInfo> {
+    let _ = change;
+    Err(qcy_read_only())
+}
+
+#[tauri::command]
+pub fn qcy_save_profile() -> Result<Value, ErrorInfo> {
+    Err(qcy_read_only())
+}
+
+#[cfg(test)]
+mod qcy_tests {
+    use super::*;
+
+    #[test]
+    fn writes_to_the_earbuds_are_refused() {
+        assert_eq!(qcy_set(Some(serde_json::json!({ "kind": "ldac", "enabled": false }))).unwrap_err().code, "qcy.read_only");
+        assert_eq!(qcy_save_profile().unwrap_err().code, "qcy.read_only");
+    }
+}
