@@ -944,7 +944,7 @@ mod tests {
         assert_eq!(v["read_only"], false);
         assert_eq!(
             v["writable"],
-            json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"])
+            json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection", "equalizer"])
         );
         assert_eq!(
             v["verified"],
@@ -1135,7 +1135,7 @@ mod tests {
         let v = view_all(Some(&reading()), None, None);
         assert_eq!(
             v["writable"],
-            json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"])
+            json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection", "equalizer"])
         );
         assert_eq!(
             v["verified"],
