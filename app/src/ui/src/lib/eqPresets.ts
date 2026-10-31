@@ -1,6 +1,7 @@
-// The EQ presets of the Fones screen (our own curves, see the phase 4
-// notes): ten bands, EQ_BANDS_HZ order, dB. The headset only stores the
-// gains; the preset is the app's name for them.
+// The EQ presets of the Fones screen (our own approximate curves,
+// presets_eq.md): ten bands, EQ_BANDS_HZ order, dB. The headset only stores
+// the gains; the preset is the app's name for them. Phase F4 writes master
+// gain 0 always, so every preset has master_gain 0.
 
 export interface EqPreset {
   id: string;
@@ -14,8 +15,7 @@ export const EQ_PRESETS: EqPreset[] = [
   { id: "spatial", gains: [1, 1, 0, -1, -1.5, 0, 1.5, 2.5, 3, 3], master_gain: 0 },
   { id: "soft_stage", gains: [0, 0.5, 1, 0.5, 0, -0.5, -1, -0.5, 0.5, 1], master_gain: 0 },
   { id: "pop", gains: [-1, 0, 1.5, 2.5, 2, 1, 0, 1, 1.5, 1], master_gain: 0 },
-  // The bass boost reaches +6 dB: -3 dB overall keeps it from clipping
-  { id: "bass", gains: [6, 5.5, 4, 2, 0.5, 0, 0, 0, 0, 0], master_gain: -3 },
+  { id: "bass", gains: [6, 5.5, 4, 2, 0.5, 0, 0, 0, 0, 0], master_gain: 0 },
   { id: "rock", gains: [4, 3, 1.5, -0.5, -1.5, -1, 1, 2.5, 3.5, 3.5], master_gain: 0 },
   { id: "mellow", gains: [1, 1, 0.5, 0, 0, -1, -2, -2.5, -2, -1.5], master_gain: 0 },
   { id: "classical", gains: [2.5, 2, 1, 0, -0.5, -0.5, 0, 1, 2, 2.5], master_gain: 0 },

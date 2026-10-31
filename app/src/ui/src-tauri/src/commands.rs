@@ -157,7 +157,7 @@ pub async fn qcy_reconnect(window: WebviewWindow, ipc: State<'_, Arc<Ipc>>) -> R
     ipc.request(window.label(), "qcy.reconnect", None).await
 }
 
-/// The only changes this version sends to the core (phase F2)
+/// The only changes this version sends to the core (phases F2–F4)
 fn qcy_allowed(change: Option<&Value>) -> Option<Value> {
     let c = change?.as_object()?;
     if c.len() != 2 {
@@ -174,6 +174,25 @@ fn qcy_allowed(change: Option<&Value>) -> Option<Value> {
         "noise_control" => {
             let value = c.get("value")?.as_u64().filter(|v| *v <= 6)?;
             Some(serde_json::json!({ "kind": "noise_control", "value": value }))
+        }
+        // Phase F4 ("Em teste"): ten gains in dB, each a whole number of
+        // hundredths within ±8 dB, refused (never clamped) otherwise. The
+        // core frames 0x22 itself: preset 8, master gain 0, fixed bands,
+        // Q 1.00, type 0; nothing else rides along.
+        "equalizer" => {
+            let gains = c.get("gains")?.as_array()?;
+            if gains.len() != 10 {
+                return None;
+            }
+            let gains: Vec<f64> = gains
+                .iter()
+                .map(|g| {
+                    let h = g.as_f64()? * 100.0;
+                    (h.is_finite() && (h - h.round()).abs() <= 1e-6 && h.round().abs() <= 800.0)
+                        .then(|| h.round() / 100.0)
+                })
+                .collect::<Option<_>>()?;
+            Some(serde_json::json!({ "kind": "equalizer", "gains": gains }))
         }
         _ => None,
     }
@@ -228,6 +247,17 @@ mod qcy_tests {
             json!({ "kind": "noise_control", "enabled": true }),
             json!({ "kind": "noise_control", "value": 6, "raw": "FF0517030301 04" }),
             json!({ "kind": "noise_control" }),
+            json!({ "kind": "equalizer" }),
+            json!({ "kind": "equalizer", "gains": [8.01, 0, 0, 0, 0, 0, 0, 0, 0, 0] }),
+            json!({ "kind": "equalizer", "gains": [0, 0, 0, 0, 0, 0, 0, 0, 0, -12] }),
+            json!({ "kind": "equalizer", "gains": [0.005, 0, 0, 0, 0, 0, 0, 0, 0, 0] }),
+            json!({ "kind": "equalizer", "gains": [0, 0, 0, 0, 0, 0, 0, 0, 0] }),
+            json!({ "kind": "equalizer", "gains": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }),
+            json!({ "kind": "equalizer", "gains": ["1", 0, 0, 0, 0, 0, 0, 0, 0, 0] }),
+            json!({ "kind": "equalizer", "gains": "0000" }),
+            json!({ "kind": "equalizer", "gains": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "preset": 8 }),
+            json!({ "kind": "equalizer", "gains": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "raw": "FF4B2249" }),
+            json!({ "kind": "eq", "eq": { "preset": "rock", "gains": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "master_gain": 0 } }),
         ] {
             assert_eq!(qcy_allowed(Some(&c)), None, "{c}");
         }
@@ -243,6 +273,12 @@ mod qcy_tests {
         ] {
             assert_eq!(qcy_allowed(Some(&c)), Some(c.clone()), "{c}");
         }
+        let rock = json!({ "kind": "equalizer", "gains": [4, 3, 1.5, -0.5, -1.5, -1, 1, 2.5, 3.5, 3.5] });
+        assert_eq!(
+            qcy_allowed(Some(&rock)),
+            Some(json!({ "kind": "equalizer", "gains": [4.0, 3.0, 1.5, -0.5, -1.5, -1.0, 1.0, 2.5, 3.5, 3.5] }))
+        );
+        assert!(qcy_allowed(Some(&json!({ "kind": "equalizer", "gains": [8, -8, 0, 0, 0, 0, 0, 0, 0, 0.25] }))).is_some());
         assert_eq!(qcy_save_profile().unwrap_err().code, "qcy.read_only");
     }
 
