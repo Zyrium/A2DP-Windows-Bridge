@@ -206,7 +206,9 @@ fn keep_known(previous: Option<&Reading>, mut r: Reading) -> Reading {
 /// else. Only `{ "kind": "game_mode" | "sleep_mode" | "wind_reduction",
 /// "enabled": bool }` and, since phase F3, `{ "kind": "noise_control",
 /// "value": 0..=6 }` (a code of `write::NOISE_PRESETS`) pass (the prompt
-/// volume is read-only).
+/// volume is read-only). Since phase F3b, `{ "kind": "wear_detection",
+/// "enabled": bool }` too (the music / ANC bytes are copied from the read
+/// made right before the write, never from the UI).
 pub fn allowed_change(change: &Value) -> Option<(Setting, u8)> {
     let setting = Setting::from_kind(change.get("kind")?.as_str()?)?;
     // Exactly kind + one value: no extra parameters ride along
@@ -219,7 +221,7 @@ pub fn allowed_change(change: &Value) -> Option<(Setting, u8)> {
         _ => return None,
     };
     // The same check the frame builder makes
-    write::frame_for(setting, value).ok()?;
+    write::check_value(setting, value).ok()?;
     Some((setting, value))
 }
 
@@ -254,6 +256,12 @@ pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
                     Setting::NoiseControl => {
                         r.state.noise_control =
                             qcy_protocol::commands::NoiseControlState::parse(p).or(r.state.noise_control);
+                    }
+                    Setting::WearDetection => {
+                        if let Some(w) = qcy_protocol::commands::WearingDetection::parse(p) {
+                            r.state.wearing_detection = Some(w);
+                            r.state.wear_detection_enabled = Some(w.enabled);
+                        }
                     }
                     Setting::PromptVolume => {
                         if let Some(v) = p.first() {
@@ -680,11 +688,22 @@ pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option
     }
     let gains: Vec<f64> = if s.equalizer_gains.len() == 10 { s.equalizer_gains.clone() } else { vec![0.0; 10] };
     let wear = s.wearing_detection.map(|w| w.enabled).or(s.wear_detection_enabled);
+    // The 0x2C bytes as read (state, music action, ANC action, tone): the
+    // screen shows them; a write copies them from a fresh read, not these
+    let wear_read = s.wearing_detection.map_or(Value::Null, |w| {
+        json!({
+            "enabled": w.enabled,
+            "music": w.music_action,
+            "anc": w.anc_action,
+            "tone": w.tone_enabled,
+        })
+    });
     json!({
         "link": link,
         "read_only": false,
         "writable": Setting::ALL.iter().filter(|s| write::ALLOWED.contains(&s.opcode())).map(|s| s.key()).collect::<Vec<_>>(),
         "verified": ["game_mode", "sleep_mode", "wind_reduction", "noise_control"],
+        "experimental": ["wear_detection"],
         "write": write.map_or(Value::Null, write_view),
         "device_name": last.map_or("", |r| r.name.as_str()),
         "address": last.map_or("", |r| r.address.as_str()),
@@ -700,6 +719,7 @@ pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option
         "sleep_mode": s.sleep_mode.unwrap_or(false),
         "wind_reduction": s.wind_detection.unwrap_or(false),
         "wear_detection": wear.unwrap_or(false),
+        "wear_read": wear_read,
         "ldac": s.ldac.unwrap_or(false),
         "multipoint": s.multipoint.unwrap_or(false),
         "prompt_volume": s.prompt_volume.unwrap_or(0),
@@ -737,7 +757,7 @@ mod tests {
         let v = current_of(None, None);
         assert_eq!(v["link"]["state"], "none");
         assert_eq!(v["read_only"], false);
-        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
+        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"]));
         assert_eq!(v["verified"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
         assert_eq!(v["write"], Value::Null);
         assert_eq!(v["synced_at"], Value::Null);
@@ -799,7 +819,11 @@ mod tests {
         for c in [
             json!({ "kind": "ldac", "enabled": false }),
             json!({ "kind": "multipoint", "enabled": true }),
-            json!({ "kind": "wear_detection", "enabled": true }),
+            json!({ "kind": "wear_detection", "enabled": 1 }),
+            json!({ "kind": "wear_detection", "value": 1 }),
+            json!({ "kind": "wear_detection" }),
+            json!({ "kind": "wear_detection", "enabled": true, "music": 1 }),
+            json!({ "kind": "wear_detection", "enabled": true, "bytes": [1, 1, 1] }),
             json!({ "kind": "reapply_on_connect", "enabled": true }),
             json!({ "kind": "noise", "mode": "anc" }),
             json!({ "kind": "noise_control", "value": 7 }),
@@ -856,6 +880,32 @@ mod tests {
     }
 
     #[test]
+    fn wear_detection_passes_as_a_toggle_only() {
+        assert_eq!(
+            allowed_change(&json!({ "kind": "wear_detection", "enabled": true })),
+            Some((Setting::WearDetection, 0x01))
+        );
+        assert_eq!(
+            allowed_change(&json!({ "kind": "wear_detection", "enabled": false })),
+            Some((Setting::WearDetection, 0x02))
+        );
+        let v = view_all(Some(&reading()), None, None);
+        assert_eq!(v["experimental"], json!(["wear_detection"]));
+        assert!(!v["verified"].as_array().unwrap().contains(&json!("wear_detection")));
+        assert_eq!(v["reapply_on_connect"], false);
+    }
+
+    #[test]
+    fn the_wear_bytes_are_shown_as_read() {
+        let mut r = reading();
+        assert_eq!(view_all(Some(&r), None, None)["wear_read"], Value::Null);
+        r.state.apply(&Command { opcode: commands::opcode::WEARING_DETECTION, parameters: vec![0x00, 0x01, 0x01] });
+        let v = view_all(Some(&r), None, None);
+        assert_eq!(v["wear_detection"], false);
+        assert_eq!(v["wear_read"], json!({ "enabled": false, "music": 1, "anc": 1, "tone": null }));
+    }
+
+    #[test]
     fn the_seven_noise_codes_pass() {
         for code in 0..=6u8 {
             assert_eq!(
@@ -891,7 +941,7 @@ mod tests {
     #[test]
     fn writable_and_verified() {
         let v = view_all(Some(&reading()), None, None);
-        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
+        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control", "wear_detection"]));
         assert_eq!(v["verified"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
     }
 

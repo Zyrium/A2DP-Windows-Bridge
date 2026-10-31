@@ -132,7 +132,8 @@ pub fn update_install(app: AppHandle, manifest_url: String) -> Result<(), String
 // The Fones screen's QCY earbuds (ipc/qcy.ts): state, refresh and reconnect
 // go to the core (qcy.*). qcy_set forwards ONLY { kind: "game_mode" |
 // "sleep_mode" | "wind_reduction", enabled: bool } and (phase F3)
-// { kind: "noise_control", value: 0..=6 } (the core and the
+// { kind: "noise_control", value: 0..=6 } and (phase F3b)
+// { kind: "wear_detection", enabled: bool } (the core and the
 // protocol crate check again); every other change (the prompt volume too:
 // read-only since fase 2b) and save_profile are refused here, before the
 // core.
@@ -163,7 +164,9 @@ fn qcy_allowed(change: Option<&Value>) -> Option<Value> {
         return None;
     }
     match c.get("kind")?.as_str()? {
-        kind @ ("game_mode" | "sleep_mode" | "wind_reduction") => {
+        // Phase F3b: wear_detection (0x2C) as on/off only; the core copies the
+        // music / ANC bytes from a fresh read
+        kind @ ("game_mode" | "sleep_mode" | "wind_reduction" | "wear_detection") => {
             let enabled = c.get("enabled")?.as_bool()?;
             Some(serde_json::json!({ "kind": kind, "enabled": enabled }))
         }
@@ -205,7 +208,10 @@ mod qcy_tests {
             json!({ "kind": "game_mode" }),
             json!({ "kind": "game_mode", "enabled": "yes" }),
             json!({ "kind": "game_mode", "enabled": true, "raw": "FF03030101" }),
-            json!({ "kind": "wear_detection", "enabled": true }),
+            json!({ "kind": "wear_detection", "enabled": 1 }),
+            json!({ "kind": "wear_detection" }),
+            json!({ "kind": "wear_detection", "enabled": true, "music": 2 }),
+            json!({ "kind": "wear_detection", "enabled": true, "raw": "FF052C03010101" }),
             json!({ "kind": "reapply_on_connect", "enabled": true }),
             json!({ "kind": "sleep_mode", "value": 1 }),
             json!({ "kind": "prompt_volume", "enabled": true }),
@@ -232,6 +238,8 @@ mod qcy_tests {
             json!({ "kind": "wind_reduction", "enabled": true }),
             json!({ "kind": "noise_control", "value": 0 }),
             json!({ "kind": "noise_control", "value": 6 }),
+            json!({ "kind": "wear_detection", "enabled": true }),
+            json!({ "kind": "wear_detection", "enabled": false }),
         ] {
             assert_eq!(qcy_allowed(Some(&c)), Some(c.clone()), "{c}");
         }

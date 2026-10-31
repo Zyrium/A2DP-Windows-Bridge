@@ -40,6 +40,7 @@ export function sampleQcyState(): QcyState {
     sleep_mode: false,
     wind_reduction: true,
     wear_detection: true,
+    wear_read: { enabled: true, music: 1, anc: 1, tone: null },
     ldac: true,
     multipoint: false,
     prompt_volume: 9,
@@ -59,7 +60,7 @@ export function sampleQcyState(): QcyState {
 
 /** The phase-2 allowlist, as in qcy_protocol::write::ALLOWED (the prompt
  *  volume 0x1D is read-only since fase 2b) */
-export const F2_OPCODES = { game_mode: 0x09, sleep_mode: 0x10, wind_reduction: 0x2a, noise_control: 0x17 } as const;
+export const F2_OPCODES = { game_mode: 0x09, sleep_mode: 0x10, wind_reduction: 0x2a, noise_control: 0x17, wear_detection: 0x2c } as const;
 type F2Kind = keyof typeof F2_OPCODES;
 export const F2_WRITABLE = Object.keys(F2_OPCODES) as F2Kind[];
 
@@ -83,6 +84,7 @@ export class MockQcy implements QcyProvider {
       this.s.read_only = false;
       this.s.writable = [...F2_WRITABLE];
       this.s.verified = ["game_mode", "sleep_mode", "wind_reduction", "noise_control"];
+      this.s.experimental = ["wear_detection"];
       this.s.write = null;
     }
     if (o.unavailable || o.reason) {
@@ -160,6 +162,7 @@ export class MockQcy implements QcyProvider {
     const hex = (n: number) => n.toString(16).toUpperCase().padStart(2, "0");
     const at_ms = Date.now();
     if (c.kind === "noise_control") return this.setNoise(c.value);
+    if (c.kind === "wear_detection") return this.setWear(c.enabled);
     if (!("enabled" in c)) throw { code: "qcy.read_only", msg: { key: "fones.error.read_only", args: [] } };
     const kind = c.kind as "game_mode" | "sleep_mode" | "wind_reduction";
     const previous = this.s[kind];
@@ -209,6 +212,36 @@ export class MockQcy implements QcyProvider {
       steps.push({ what: "read_wind", detail: `2A01${this.s.wind_reduction ? "01" : "00"}` });
       this.s.synced_at = Date.now();
       this.s.write = { ...base, status: "confirmed", failure: null, read_back: want.bytes };
+    }
+    return this.push();
+  }
+
+  /** Phase F3b: 0x2C; the frame copies the music / ANC (/ tone) bytes just
+   *  read; off reads back as 00. A timeout is never re-sent. */
+  private async setWear(enabled: boolean) {
+    const hex = (n: number) => n.toString(16).toUpperCase().padStart(2, "0");
+    const at_ms = Date.now();
+    const r = this.s.wear_read ?? { enabled: this.s.wear_detection, music: 1, anc: 1, tone: null };
+    const previous = r.enabled;
+    const tail = `${hex(r.music)}${hex(r.anc)}${r.tone === null ? "" : r.tone ? "01" : "02"}`;
+    const readHex = (on: boolean) => `${on ? "01" : "00"}${tail}`;
+    const len = r.tone === null ? 3 : 4;
+    const sent = `FF${hex(len + 2)}2C${hex(len)}${enabled ? "01" : "02"}${tail}`;
+    const steps = [
+      { what: "read_previous", detail: `FF03FE012C -> ${previous ? "on" : "off"} (${readHex(previous)})` },
+      { what: "sent", detail: sent },
+    ];
+    await this.wait(this.gameOnly === "fail" ? 3000 : 400);
+    const base = { setting: "wear_detection", enabled, previous, sent, steps, at_ms };
+    if (this.gameOnly === "fail") {
+      steps.push({ what: "no_read_back", detail: "3000 ms" });
+      this.s.write = { ...base, status: "failed", failure: "timeout", read_back: null };
+    } else {
+      steps.push({ what: "read_back", detail: readHex(enabled) });
+      this.s.wear_detection = enabled;
+      this.s.wear_read = { ...r, enabled };
+      this.s.synced_at = Date.now();
+      this.s.write = { ...base, status: "confirmed", failure: null, read_back: readHex(enabled) };
     }
     return this.push();
   }

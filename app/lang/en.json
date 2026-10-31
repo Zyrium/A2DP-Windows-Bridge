@@ -679,7 +679,7 @@
   "fones.tag.verified": "Verified",
   "fones.tag.unverified": "Not verified yet",
   "fones.write_test.title": "Write test",
-  "fones.write_test.text": "This version can change Game mode, Sleep mode, Wind reduction and Noise control (noise cancelling, scenes and transparency); Prompt volume is shown read-only. Each tap reads the current value, sends 1 command and checks it with the earbuds. Everything else stays read-only.",
+  "fones.write_test.text": "This version can change Game mode, Sleep mode, Wind reduction, Noise control (noise cancelling, scenes and transparency) and, experimentally, Wear detection; Prompt volume is shown read-only. Each tap reads the current value, sends 1 command and checks it with the earbuds. Everything else stays read-only.",
   "fones.write.sending": "Sending… (reading the current value, 1 command, checking)",
   "fones.write.ok_on": "%s on — confirmed by the earbuds",
   "fones.write.ok_off": "%s off — confirmed by the earbuds",
@@ -719,5 +719,14 @@
   "fones.write.step.sent_noise": "Sent: %s (1 command)",
   "fones.write.step.read_wind": "Wind reduction read again: %s",
   "fones.write.step.read_wind_failed": "Wind reduction: no answer when read again",
-  "fones.prompt_volume.readonly": "The earbuds don't accept this change from here yet; read only."
+  "fones.prompt_volume.readonly": "The earbuds don't accept this change from here yet; read only.",
+  "fones.wear.hint_write": "Pause when an earbud comes out: pauses the music when an earbud leaves your ear.",
+  "fones.wear.unread": "The earbuds did not answer the wear detection read; tap Refresh before changing it.",
+  "fones.wear.read": "Read from the earbuds",
+  "fones.wear.on": "On",
+  "fones.wear.off": "Off",
+  "fones.wear.music": "Music action",
+  "fones.wear.anc": "ANC action",
+  "fones.wear.kept": "kept as it is",
+  "fones.write.step.read_back_wear_off": "Confirmed by the earbuds: off ✓ (read %s — the earbuds report 00 for off)"
 }

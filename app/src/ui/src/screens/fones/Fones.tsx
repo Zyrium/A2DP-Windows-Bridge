@@ -363,6 +363,15 @@ export function noiseText(code: number): string {
   return ft(n.mode === "off" ? "noise.off" : "noise.transparency");
 }
 
+const hex2 = (n: number) => n.toString(16).toUpperCase().padStart(2, "0");
+
+/** The 0x2C bytes as read ("00 01 01"; off reads as 00) */
+export function wearBytes(r: NonNullable<QcyState["wear_read"]>): string {
+  const b = [r.enabled ? 1 : 0, r.music, r.anc];
+  if (r.tone !== null) b.push(r.tone ? 1 : 2);
+  return b.map(hex2).join(" ");
+}
+
 /** The writable settings of this version (phase F2) */
 export const F2_SETTINGS = ["game_mode", "sleep_mode", "wind_reduction"] as const;
 
@@ -379,6 +388,8 @@ export function settingName(k: string): string {
       return ft("prompt_volume");
     case "noise_control":
       return ft("noise.title");
+    case "wear_detection":
+      return ft("wear");
     default:
       return k;
   }
@@ -412,7 +423,8 @@ export function writeChange(w: QcyWrite, which: "retry" | "undo"): QcyChange | n
   if (isLevel(w)) return typeof v === "number" ? { kind: "prompt_volume", value: v } : null;
   if (isNoise(w)) return typeof v === "number" && NOISE_CODES.some((n) => n.code === v) ? { kind: "noise_control", value: v } : null;
   if (typeof v !== "boolean") return null;
-  if (w.setting === "game_mode" || w.setting === "sleep_mode" || w.setting === "wind_reduction") return { kind: w.setting, enabled: v };
+  if (w.setting === "game_mode" || w.setting === "sleep_mode" || w.setting === "wind_reduction" || w.setting === "wear_detection")
+    return { kind: w.setting, enabled: v };
   return null;
 }
 
@@ -456,6 +468,8 @@ export function writeStepLines(w: QcyWrite): string[] {
       case "send_failed":
         return ft("write.step.send_failed");
       case "read_back":
+        if (w.status === "confirmed" && w.setting === "wear_detection" && w.enabled === false && st.detail.startsWith("00"))
+          return ft("write.step.read_back_wear_off", st.detail);
         return w.status === "confirmed" ? ft("write.step.read_back", valueText(w, target(w))) : ft("write.step.read_back_bad", st.detail);
       case "no_read_back":
         return ft("write.step.no_read_back");
@@ -794,6 +808,9 @@ function SettingsTab(props: {
    *  (the prompt volume is shown, read-only) */
   const locked = (k: string) => props.partial === true && !can(k);
   const lockAll = () => props.partial === true;
+  /** Phase F3b: wear detection is writable (tag Em teste until verified) */
+  const wearWritable = () => props.partial === true && can("wear_detection");
+  const wearOk = () => props.verified?.includes("wear_detection") === true;
   // The switch stays on until the dialog's answer: the click flipped the
   // native checkbox, so it is put back (off -> on makes Solid set it again)
   const [ldacUi, setLdacUi] = createSignal(true);
@@ -804,8 +821,48 @@ function SettingsTab(props: {
   return (
     <>
       <Section title={ft("use.title")} actions={<LastValue s={s()} />}>
+        <Show
+          when={wearWritable()}
+          fallback={
+            <div class="fones-lock" classList={{ locked: lockAll() }} inert={lockAll() ? true : undefined}>
+              <Toggle label={ft("wear")} hint={ft("wear.hint")} checked={s().wear_detection} onChange={(enabled) => void props.send({ kind: "wear_detection", enabled })} />
+            </div>
+          }
+        >
+          {/* Phase F3b: 0x2C, one command per click, confirmed by a read-back */}
+          <Toggle
+            label={ft("wear")}
+            badge={
+              <span class="codec-badge fones-tag" classList={{ "tag-verified": wearOk(), "tag-testing": !wearOk() }}>
+                {ft(wearOk() ? "tag.verified" : "tag.testing")}
+              </span>
+            }
+            hint={props.busy ? ft("write.sending") : ft("wear.hint_write")}
+            checked={s().wear_detection}
+            disabled={props.busy === true || !s().wear_read}
+            onChange={(enabled) => void props.send({ kind: "wear_detection", enabled })}
+          />
+          <Show when={s().wear_read} fallback={<p class="hint">{ft("wear.unread")}</p>}>
+            {(r) => (
+              <dl class="wear-read hint">
+                <dt>{ft("wear.read")}</dt>
+                <dd>
+                  <b>{ft(r().enabled ? "wear.on" : "wear.off")}</b> <code>({wearBytes(r())})</code>
+                </dd>
+                <dt>{ft("wear.music")}</dt>
+                <dd>
+                  <b>{hex2(r().music)}</b> · {ft("wear.kept")}
+                </dd>
+                <dt>{ft("wear.anc")}</dt>
+                <dd>
+                  <b>{hex2(r().anc)}</b> · {ft("wear.kept")}
+                </dd>
+              </dl>
+            )}
+          </Show>
+          <Show when={s().write?.setting === "wear_detection" ? s().write : null}>{(w) => <WriteSteps w={w()} />}</Show>
+        </Show>
         <div class="fones-lock" classList={{ locked: lockAll() }} inert={lockAll() ? true : undefined}>
-        <Toggle label={ft("wear")} hint={ft("wear.hint")} checked={s().wear_detection} onChange={(enabled) => void props.send({ kind: "wear_detection", enabled })} />
         <Toggle
           label={ft("ldac")}
           badge={<span class="tag warn">{ft("ldac.tag")}</span>}

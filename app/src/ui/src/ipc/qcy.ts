@@ -89,6 +89,8 @@ export interface QcyState {
   /** Writable settings already checked on real earbuds (game_mode; the
    *  others carry the "Em teste" tag) */
   verified?: string[];
+  /** Writable but experimental (tag "Em teste"): phase F3b wear detection */
+  experimental?: string[];
   /** The last write, null before the first */
   write?: QcyWrite | null;
   /** The headset's own equalizer preset number, when it reported one */
@@ -104,6 +106,9 @@ export interface QcyState {
   sleep_mode: boolean;
   wind_reduction: boolean;
   wear_detection: boolean;
+  /** Phase F3b: the 0x2C bytes as last read (state, music action, ANC
+   *  action, optional tone); null when 0x2C was not answered */
+  wear_read?: { enabled: boolean; music: number; anc: number; tone: boolean | null } | null;
   ldac: boolean;
   multipoint: boolean;
   prompt_volume: number;
