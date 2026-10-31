@@ -1,8 +1,11 @@
-//! The Fones screen's QCY reads (MeloBuds N70), READ ONLY: `qcy.state`,
-//! `qcy.refresh`, `qcy.reconnect` and the `qcy` event. Nothing here changes
-//! a setting of the earbuds: the only frames written to 1001 are the
-//! `FF 03 FE <op>` state requests of [`commands::STATE_QUERIES`] (opcode
-//! 0xFE), and `le_connect_plain` never pairs.
+//! The Fones screen's QCY reads (MeloBuds N70): `qcy.state`, `qcy.refresh`,
+//! `qcy.reconnect` and the `qcy` event, plus ONE write: `qcy.set` for game
+//! mode (phase F1). The reads only send the `FF 03 FE <op>` state requests
+//! of [`commands::STATE_QUERIES`] (opcode 0xFE). The write goes through
+//! [`qcy_protocol::write`] (allowlist: opcode 0x09 with 01/02 only; every
+//! other change is refused before any Bluetooth traffic) and only on an
+//! explicit qcy.set: never when the app opens or the link comes up.
+//! `le_connect_plain` never pairs.
 //!
 //! Audio: the reads use the resident core's own BTstack (the one that
 //! streams A2DP), so no second process takes the adapter and the stack is
@@ -35,6 +38,7 @@ use qcy_protocol::commands::{self, NoiseMode, NoiseScene};
 use qcy_protocol::packet;
 use qcy_protocol::state::QcyState;
 use qcy_protocol::uuids::{self, uuid16_matches};
+use qcy_protocol::write::{self, Setting};
 use serde_json::{Value, json};
 
 /// Longest scan (it stops as soon as the earbuds are seen)
@@ -50,6 +54,8 @@ const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const GATT_TIMEOUT: Duration = Duration::from_secs(5);
 /// After the last query is sent: how long the answers may take in total
 const ANSWERS_TIMEOUT: Duration = Duration::from_millis(1500);
+/// A write: the first read, then write -> read-back, each at most this
+const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Touch actions in the protocol's order (qcy.ts TOUCH_ACTIONS)
 const TOUCH_ACTIONS: [&str; 9] = [
@@ -118,13 +124,28 @@ struct Known {
     services: Vec<GattService>,
 }
 
+/// The last write (the banner of the Fones screen)
+#[derive(Debug, Clone)]
+pub struct LastWrite {
+    pub setting: &'static str,
+    pub enabled: bool,
+    pub previous: Option<bool>,
+    pub sent: Option<String>,
+    pub read_back: Option<String>,
+    /// None: confirmed by the read-back
+    pub failure: Option<&'static str>,
+    pub steps: Vec<(String, String)>,
+    pub at_ms: u64,
+}
+
 #[derive(Default)]
 struct Cache {
     last: Option<Reading>,
     link: Option<Unavailable>,
+    write: Option<LastWrite>,
 }
 
-static CACHE: Mutex<Cache> = Mutex::new(Cache { last: None, link: None });
+static CACHE: Mutex<Cache> = Mutex::new(Cache { last: None, link: None, write: None });
 static KNOWN: Mutex<Option<Known>> = Mutex::new(None);
 /// qcy-cache.json was read into KNOWN (once per process)
 static LOADED: AtomicBool = AtomicBool::new(false);
@@ -134,7 +155,7 @@ static READING: Mutex<()> = Mutex::new(());
 /// The last known state (no Bluetooth traffic)
 pub fn current() -> Value {
     let c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    view(c.last.as_ref(), c.link)
+    view_all(c.last.as_ref(), c.link, c.write.as_ref())
 }
 
 /// Reads the earbuds now (blocking: run off the async runtime)
@@ -153,7 +174,149 @@ pub fn refresh(service: &Service) -> Value {
             c.link = Some(why);
         }
     }
-    view(c.last.as_ref(), c.link)
+    view_all(c.last.as_ref(), c.link, c.write.as_ref())
+}
+
+/// A change the UI asked for (`qcy.set`) that this version refuses: only
+/// `{ "kind": "game_mode", "enabled": bool }` passes. Nothing is sent.
+pub fn allowed_change(change: &Value) -> Option<(Setting, bool)> {
+    let setting = Setting::from_kind(change.get("kind")?.as_str()?)?;
+    let enabled = change.get("enabled")?.as_bool()?;
+    // Exactly kind + enabled: no extra parameters ride along
+    if change.as_object()?.len() != 2 {
+        return None;
+    }
+    Some((setting, enabled))
+}
+
+/// Changes one allowed setting (blocking: run off the async runtime). Err
+/// only when the change is refused (nothing sent); a write that is not
+/// confirmed is Ok with `write.status = "failed"` in the state.
+pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
+    let Some((setting, enabled)) = allowed_change(change) else {
+        tracing::warn!("QCY write: refused (not allowed in this version): {change}");
+        return Err(());
+    };
+    let _one = READING.lock().unwrap_or_else(|e| e.into_inner());
+    tracing::info!(
+        "QCY write: {} -> {} (one command, confirmed by a read-back)",
+        setting.key(),
+        if enabled { "on" } else { "off" }
+    );
+    let outcome = host_for_read(service).and_then(|h| write_at(&h, service.config_dir(), setting, enabled));
+    let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let w = match outcome {
+        Ok(o) => {
+            if let (Some(r), Some(on)) = (c.last.as_mut(), o.read_back.as_deref().and_then(write::read_on)) {
+                match setting {
+                    Setting::GameMode => r.state.game_mode = Some(on),
+                }
+                r.at_ms = now_ms();
+            }
+            c.link = None;
+            last_write(&o)
+        }
+        Err(why) => {
+            tracing::warn!("QCY write: no link ({}), nothing sent", why.reason());
+            LastWrite {
+                setting: setting.key(),
+                enabled,
+                previous: None,
+                sent: None,
+                read_back: None,
+                failure: Some(why.reason()),
+                steps: vec![("no_link".into(), why.reason().into())],
+                at_ms: now_ms(),
+            }
+        }
+    };
+    match w.failure {
+        None => tracing::info!("QCY write: confirmed by the earbuds ({})", w.read_back.as_deref().unwrap_or("")),
+        Some(f) => tracing::warn!("QCY write: NOT confirmed ({f}); the switch goes back, nothing is re-sent"),
+    }
+    c.write = Some(w);
+    Ok(view_all(c.last.as_ref(), c.link, c.write.as_ref()))
+}
+
+fn last_write(o: &write::Outcome) -> LastWrite {
+    LastWrite {
+        setting: o.setting.key(),
+        enabled: o.enabled,
+        previous: o.previous,
+        sent: o.sent.as_deref().map(packet::to_hex),
+        read_back: o.read_back.as_deref().map(packet::to_hex),
+        failure: o.failure.map(write::Failure::code),
+        steps: o.steps.iter().map(|s| (s.what.to_string(), s.detail.clone())).collect(),
+        at_ms: now_ms(),
+    }
+}
+
+/// The BTstack link as the write flow's transport: frames to 1001,
+/// notifications of 1002
+struct GattLink<'a> {
+    host: &'a BtHost,
+    id: bt_host::LeDeviceId,
+    command: GattChar,
+    rx: mpsc::Receiver<Vec<u8>>,
+}
+
+impl write::Transport for GattLink<'_> {
+    fn send(&mut self, frame: &[u8]) -> Result<(), String> {
+        let f = frame.to_vec();
+        if self.command.properties & 0x04 != 0 {
+            self.host.le_gatt_write_without_response(self.id, self.command.value_handle, f, GATT_TIMEOUT)
+        } else {
+            self.host.le_gatt_write(self.id, self.command.value_handle, f, GATT_TIMEOUT)
+        }
+    }
+    fn recv(&mut self, wait: Duration) -> Option<Vec<u8>> {
+        if wait.is_zero() { self.rx.try_recv().ok() } else { self.rx.recv_timeout(wait).ok() }
+    }
+}
+
+/// Connects straight to where the last read found the earbuds (no scan:
+/// a write needs a read first), runs the write flow, disconnects
+fn write_at(host: &BtHost, dir: &Path, setting: Setting, enabled: bool) -> Result<write::Outcome, Unavailable> {
+    load_known(dir);
+    let Some(k) = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+        // Never scan for a write: "Atualizar" finds them first
+        return Err(Unavailable::NotFound);
+    };
+    let started = Instant::now();
+    let id =
+        host.le_connect_plain_cached(k.addr, &k.name, DIRECT_CONNECT_TIMEOUT, k.services.clone()).map_err(|e| {
+            tracing::warn!("QCY write: connection failed: {e}");
+            Unavailable::Timeout
+        })?;
+    let services = host.le_gatt_services(id);
+    let r = write_on(host, id, &services, setting, enabled);
+    host.le_disconnect(id);
+    tracing::info!("QCY write: link up {} ms in total", started.elapsed().as_millis());
+    let o = r?;
+    for s in &o.steps {
+        tracing::info!("QCY write step: {} {}", s.what, s.detail);
+    }
+    if let Some(p) = o.previous {
+        crate::qcy_cache::save_previous(dir, &k.address, setting.key(), p);
+    }
+    Ok(o)
+}
+
+fn write_on(
+    host: &BtHost,
+    id: bt_host::LeDeviceId,
+    services: &[GattService],
+    setting: Setting,
+    enabled: bool,
+) -> Result<write::Outcome, Unavailable> {
+    let command = find_char(services, uuids::MAIN_SERVICE, uuids::COMMAND).ok_or(Unavailable::GattFailed)?;
+    let notification = find_char(services, uuids::MAIN_SERVICE, uuids::NOTIFICATION).ok_or(Unavailable::GattFailed)?;
+    // Only A001 / 1001, never the OTA services
+    write::check_target(uuids::MAIN_SERVICE, uuids::COMMAND).map_err(|_| Unavailable::Other)?;
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    host.le_gatt_subscribe(id, notification, tx, GATT_TIMEOUT).map_err(|_| Unavailable::GattFailed)?;
+    let mut link = GattLink { host, id, command, rx };
+    Ok(write::run(&mut link, setting, enabled, WRITE_TIMEOUT))
 }
 
 /// The stack to read with, never restarting one that streams
@@ -372,8 +535,29 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0))
 }
 
-/// The QcyState of qcy.ts (app/src/ui/src/ipc/qcy.ts), read_only: true
+/// [`view_all`] without a write
 pub fn view(last: Option<&Reading>, link: Option<Unavailable>) -> Value {
+    view_all(last, link, None)
+}
+
+fn write_view(w: &LastWrite) -> Value {
+    json!({
+        "setting": w.setting,
+        "enabled": w.enabled,
+        "previous": w.previous,
+        "status": if w.failure.is_none() { "confirmed" } else { "failed" },
+        "failure": w.failure,
+        "sent": w.sent,
+        "read_back": w.read_back,
+        "steps": w.steps.iter().map(|(what, detail)| json!({ "what": what, "detail": detail })).collect::<Vec<_>>(),
+        "at_ms": w.at_ms,
+    })
+}
+
+/// The QcyState of qcy.ts (app/src/ui/src/ipc/qcy.ts): read_only false,
+/// only the `writable` settings can change (game mode), still "testing"
+/// (not verified on the N70) in this version
+pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option<&LastWrite>) -> Value {
     let link = match (link, last) {
         (Some(why), _) => json!({ "state": "unavailable", "reason": why.reason() }),
         (None, Some(_)) => json!({ "state": "connected" }),
@@ -411,7 +595,10 @@ pub fn view(last: Option<&Reading>, link: Option<Unavailable>) -> Value {
     let wear = s.wearing_detection.map(|w| w.enabled).or(s.wear_detection_enabled);
     json!({
         "link": link,
-        "read_only": true,
+        "read_only": false,
+        "writable": write::ALLOWED.iter().filter(|o| **o == commands::opcode::GAME_MODE).map(|_| "game_mode").collect::<Vec<_>>(),
+        "verified": Vec::<&str>::new(),
+        "write": write.map_or(Value::Null, write_view),
         "device_name": last.map_or("", |r| r.name.as_str()),
         "address": last.map_or("", |r| r.address.as_str()),
         "firmware": s.firmware_version,
@@ -462,7 +649,10 @@ mod tests {
     fn nothing_read_yet_is_no_headset() {
         let v = current_of(None, None);
         assert_eq!(v["link"]["state"], "none");
-        assert_eq!(v["read_only"], true);
+        assert_eq!(v["read_only"], false);
+        assert_eq!(v["writable"], json!(["game_mode"]));
+        assert_eq!(v["verified"], json!([]));
+        assert_eq!(v["write"], Value::Null);
         assert_eq!(v["synced_at"], Value::Null);
         assert_eq!(v["battery"]["left"]["level"], Value::Null);
     }
@@ -507,6 +697,48 @@ mod tests {
         drop(tx);
         // A closed channel ends the wait too
         assert_eq!(collect(&rx, &mut state, &mut pending, Duration::from_secs(5)), 0);
+    }
+
+    #[test]
+    fn only_game_mode_changes_pass() {
+        assert_eq!(allowed_change(&json!({ "kind": "game_mode", "enabled": true })), Some((Setting::GameMode, true)));
+        assert_eq!(allowed_change(&json!({ "kind": "game_mode", "enabled": false })), Some((Setting::GameMode, false)));
+        for c in [
+            json!({ "kind": "ldac", "enabled": false }),
+            json!({ "kind": "multipoint", "enabled": true }),
+            json!({ "kind": "sleep_mode", "enabled": true }),
+            json!({ "kind": "noise", "mode": "anc" }),
+            json!({ "kind": "auto_off", "minutes": 5 }),
+            json!({ "kind": "game_mode" }),
+            json!({ "kind": "game_mode", "enabled": 1 }),
+            json!({ "kind": "game_mode", "enabled": true, "opcode": 3 }),
+            json!(null),
+        ] {
+            assert_eq!(allowed_change(&c), None, "{c}");
+        }
+    }
+
+    #[test]
+    fn a_write_shows_in_the_state() {
+        let r = reading();
+        let w = LastWrite {
+            setting: "game_mode",
+            enabled: true,
+            previous: Some(false),
+            sent: Some("FF03090101".into()),
+            read_back: Some("0100".into()),
+            failure: None,
+            steps: vec![("sent".into(), "FF03090101".into())],
+            at_ms: 7,
+        };
+        let v = view_all(Some(&r), None, Some(&w));
+        assert_eq!(v["write"]["status"], "confirmed");
+        assert_eq!(v["write"]["previous"], false);
+        assert_eq!(v["write"]["sent"], "FF03090101");
+        let failed = LastWrite { failure: Some("timeout"), read_back: None, ..w };
+        let v = view_all(Some(&r), None, Some(&failed));
+        assert_eq!(v["write"]["status"], "failed");
+        assert_eq!(v["write"]["failure"], "timeout");
     }
 
     #[test]

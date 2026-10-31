@@ -1,8 +1,9 @@
 // The contract between the "Fones" screen and the QCY headset control
 // (BLE/GATT, crates/qcy-protocol). The Rust side: src-tauri/commands.rs
 // (qcy_*) and the core's qcy.* requests (core/src/qcy_live.rs). This
-// version is READ ONLY: qcy_set and qcy_save_profile reject with
-// qcy.read_only, and the state carries read_only: true. In a plain browser, or with ?qcy=mock, the mock provider of
+// version reads everything and changes ONE setting: game mode (`writable`,
+// still "testing"). Any other qcy_set and qcy_save_profile reject with
+// qcy.read_only. In a plain browser, or with ?qcy=mock, the mock provider of
 // qcyMock.ts stands in for it.
 //
 // Tauri commands (invoke):
@@ -80,6 +81,14 @@ export interface QcyState {
   /** The values are read from the headset but cannot be changed (this
    *  version): the controls stay greyed, "Atualizar" reads again */
   read_only?: boolean;
+  /** The only settings that can change (this version: ["game_mode"]);
+   *  absent: every control works (the mock's full mode) */
+  writable?: string[];
+  /** Writable settings already checked on real earbuds (none yet: the
+   *  others carry the "Em teste" tag) */
+  verified?: string[];
+  /** The last write, null before the first */
+  write?: QcyWrite | null;
   /** The headset's own equalizer preset number, when it reported one */
   eq_preset_index?: number | null;
   device_name: string;
@@ -106,6 +115,28 @@ export interface QcyState {
   profile_saved_at: number | null;
   /** Unix ms of the last read from the headset, null before the first */
   synced_at: number | null;
+}
+
+/** One step of a write, as the core logged it */
+export interface QcyWriteStep {
+  what: "read_previous" | "read_previous_failed" | "sent" | "send_failed" | "read_back" | "no_read_back" | "refused" | "no_link" | string;
+  detail: string;
+}
+
+/** A write: read the old value, send one command, read it back. Never
+ *  re-sent: "failed" leaves the switch at the value read. */
+export interface QcyWrite {
+  setting: string;
+  enabled: boolean;
+  /** The value read before the write (what "Desfazer" goes back to) */
+  previous: boolean | null;
+  status: "confirmed" | "failed";
+  failure: "no_previous" | "send_failed" | "timeout" | "mismatch" | QcyUnavailableReason | null;
+  /** Hex of the frame sent (e.g. FF03090101), null when nothing was sent */
+  sent: string | null;
+  read_back: string | null;
+  steps: QcyWriteStep[];
+  at_ms: number;
 }
 
 /** One change. The values stay as they are until the headset confirms. */
@@ -203,7 +234,9 @@ export async function createQcy(insideTauri: boolean): Promise<QcyProvider> {
     // ?qcy=readonly, readonly-le_off, readonly-not_found: like this version
     const ro = flag?.startsWith("readonly") === true;
     const reason = flag?.split("-")[1] as "le_off" | "not_found" | undefined;
-    return new MockQcy({ unavailable: flag === "unavailable", readOnly: ro, reason });
+    // ?qcy=game (game mode writes confirm) or ?qcy=game-fail (3 s timeout)
+    const gameOnly = flag === "game" ? true : flag === "game-fail" ? "fail" : false;
+    return new MockQcy({ unavailable: flag === "unavailable", readOnly: ro, reason: gameOnly ? undefined : reason, gameOnly });
   }
   return createTauriQcy();
 }

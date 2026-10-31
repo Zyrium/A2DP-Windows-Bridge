@@ -47,3 +47,27 @@
 .fones-body { display: flex; flex-direction: column; gap: var(--s4); }
 .fones-body.stale { opacity: 0.5; filter: grayscale(1); pointer-events: none; user-select: none; }
 .fones-body.readonly { opacity: 0.7; filter: grayscale(0.6); pointer-events: none; user-select: none; }
+
+/* Write test (phase F1): only game mode changes, the rest is greyed */
+.fones .fones-lock.locked {
+  opacity: 0.5;
+  pointer-events: none;
+  user-select: none;
+}
+.fones .fones-tag {
+  margin-left: 8px;
+  font-size: 11px;
+}
+.fones .fones-tag.tag-testing {
+  color: var(--warn-fg, #9a6700);
+  border-color: currentColor;
+}
+.fones .write-steps {
+  margin: 4px 0 8px 0;
+  padding: 8px 12px 8px 32px;
+  border-radius: 6px;
+  background: var(--subtle-bg, rgba(127, 127, 127, 0.08));
+}
+.fones .write-steps li {
+  margin: 2px 0;
+}

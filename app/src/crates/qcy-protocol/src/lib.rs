@@ -16,6 +16,8 @@
 //! - [`commands`]: typed commands and the values they carry (ANC scenes,
 //!   wearing detection, the ten-band equalizer, key functions)
 //! - [`state`]: the device state, updated from responses and notifications
+//! - [`write`]: the allowlist / blocklist and the confirmed write flow (only
+//!   game mode in this version)
 //!
 //! Safety rule, as in OpenQCY: no command is guessed. A command is only built
 //! here when a captured transcript or public interoperability evidence backs
@@ -28,6 +30,7 @@ pub mod commands;
 pub mod packet;
 pub mod state;
 pub mod uuids;
+pub mod write;
 
 #[cfg(test)]
 pub(crate) mod test_util {
