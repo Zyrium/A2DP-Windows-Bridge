@@ -73,6 +73,18 @@ export function V1Running() {
   );
 }
 
+/** The card title: the profile's device name, else the name of the paired
+  device with that address, else the address */
+export function deviceTitle(
+  p: { device_name: string; device_address: string },
+  devices: readonly { address: string; name: string }[] | undefined,
+): string {
+  if (p.device_name.trim()) return p.device_name;
+  const addr = p.device_address.toUpperCase();
+  const known = devices?.find((d) => d.address.toUpperCase() === addr && d.name.trim());
+  return known?.name ?? p.device_address;
+}
+
 export function Home() {
   const { core, navigate } = useApp();
   const snap = () => core.state.snap!;
@@ -123,7 +135,7 @@ export function Home() {
                 <Icon name="headphones" />
               </Ring>
               <div class="device-info">
-                <div class="device-name">{p().device_name || p().device_address}</div>
+                <div class="device-name">{deviceTitle(p(), snap().devices)}</div>
                 <div class="muted device-sub">
                   <span>{p().name}</span>
                   <span class="mono">{p().device_address}</span>

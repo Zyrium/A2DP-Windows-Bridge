@@ -35,13 +35,13 @@ impl fmt::Display for Msg {
     }
 }
 
-/// Text of `key` in `lang` (en, ja, de, fr, es, ko, zh-CN, zh-TW), English
+/// Text of `key` in `lang` (en, ja, de, fr, es, ko, zh-CN, zh-TW, pt-BR), English
 /// when it has no translation, `default` when not even English has it. For
 /// the few texts the core shows itself (tray menu, notifications).
 pub fn translate(lang: &str, key: &str, default: &str) -> String {
     static LANGS: OnceLock<HashMap<&'static str, HashMap<String, String>>> = OnceLock::new();
     let langs = LANGS.get_or_init(|| {
-        let files: [(&str, &str); 7] = [
+        let files: [(&str, &str); 8] = [
             ("ja", include_str!("../../../../../app/lang/ja.json")),
             ("de", include_str!("../../../../../app/lang/de.json")),
             ("fr", include_str!("../../../../../app/lang/fr.json")),
@@ -49,6 +49,7 @@ pub fn translate(lang: &str, key: &str, default: &str) -> String {
             ("ko", include_str!("../../../../../app/lang/ko.json")),
             ("zh-CN", include_str!("../../../../../app/lang/zh-CN.json")),
             ("zh-TW", include_str!("../../../../../app/lang/zh-TW.json")),
+            ("pt-BR", include_str!("../../../../../app/lang/pt-BR.json")),
         ];
         files.iter().map(|(l, text)| (*l, serde_json::from_str(text).unwrap_or_default())).collect()
     });
@@ -106,6 +107,13 @@ mod tests {
             &["2".into(), "3".into(), "4".into(), "48.0".into()],
         );
         assert_eq!(s, "try 2/3, 4 found, 48.0 kHz, 100%");
+    }
+
+    #[test]
+    fn portuguese_core_texts() {
+        assert_eq!(translate("pt-BR", "tray.exit", "Exit"), "Sair");
+        assert_eq!(translate("pt-BR", "tray.open", "Open A2DPWB"), "Abrir o A2DPWB");
+        assert_eq!(translate("pt-BR", "no.such.key", "fallback"), "fallback");
     }
 
     #[test]

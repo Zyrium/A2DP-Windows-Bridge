@@ -7,7 +7,7 @@ import type { Core } from "../ipc/store";
 import { IpcError } from "../ipc/types";
 import { t, tm } from "../i18n";
 
-export type RouteName = "home" | "profiles" | "diagnostics" | "adapter" | "settings" | "setup";
+export type RouteName = "home" | "profiles" | "fones" | "diagnostics" | "adapter" | "settings" | "setup";
 
 export interface Route {
   name: RouteName;
@@ -18,13 +18,14 @@ export interface Route {
 
 export function parseRoute(hash: string): Route {
   const parts = hash.replace(/^#\/?/, "").split("/");
-  const names: RouteName[] = ["home", "profiles", "diagnostics", "adapter", "settings", "setup"];
+  const names: RouteName[] = ["home", "profiles", "fones", "diagnostics", "adapter", "settings", "setup"];
   const name = names.find((n) => n === parts[0]) ?? "home";
   if (name === "profiles" && parts[1] === "new") return { name, arg: "new" };
   if (name === "profiles" && parts[1] === "edit" && parts[2] !== undefined) {
     return { name, arg: decodeURIComponent(parts.slice(2).join("/")) };
   }
   if (name === "adapter" && parts[1] === "afh") return { name, arg: "afh" };
+  if (name === "fones" && (parts[1] === "eq" || parts[1] === "settings")) return { name, arg: parts[1] };
   return { name };
 }
 
@@ -32,6 +33,7 @@ export function routeHash(r: Route): string {
   if (r.name === "profiles" && r.arg === "new") return "#/profiles/new";
   if (r.name === "profiles" && r.arg) return `#/profiles/edit/${encodeURIComponent(r.arg)}`;
   if (r.name === "adapter" && r.arg === "afh") return "#/adapter/afh";
+  if (r.name === "fones" && r.arg) return `#/fones/${r.arg}`;
   return `#/${r.name}`;
 }
 

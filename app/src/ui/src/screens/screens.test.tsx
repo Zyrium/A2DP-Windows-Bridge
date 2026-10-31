@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { App } from "../app/App";
 import { setLanguage } from "../i18n";
 import { MockCore, type MockOptions } from "../ipc/mock";
+import { deviceTitle } from "./Home";
 import { createCore } from "../ipc/store";
 
 let mock: MockCore | null = null;
@@ -166,5 +167,19 @@ describe("update", () => {
     await screen.findByText(/It is installed when streaming stops/);
     await mock!.call("stream.stop");
     await screen.findByText(/Installing version 2\.0\.0-beta\.1/, {}, { timeout: 3000 });
+  });
+});
+
+describe("deviceTitle", () => {
+  const devices = [{ address: "C4:33:96:11:0C:82", name: "Melon Buds N70" }];
+  it("prefers the profile's device name", () => {
+    expect(deviceTitle({ device_name: "Meus fones", device_address: "C4:33:96:11:0C:82" }, devices)).toBe("Meus fones");
+  });
+  it("falls back to the paired device's name, ignoring address case", () => {
+    expect(deviceTitle({ device_name: "", device_address: "c4:33:96:11:0c:82" }, devices)).toBe("Melon Buds N70");
+  });
+  it("falls back to the address when no name is known", () => {
+    expect(deviceTitle({ device_name: "", device_address: "AA:BB:CC:DD:EE:FF" }, devices)).toBe("AA:BB:CC:DD:EE:FF");
+    expect(deviceTitle({ device_name: "", device_address: "AA:BB:CC:DD:EE:FF" }, undefined)).toBe("AA:BB:CC:DD:EE:FF");
   });
 });

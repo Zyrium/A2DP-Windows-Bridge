@@ -36,6 +36,7 @@ dependencies = [
  "embed-resource",
  "hci-transport",
  "ipc",
+ "qcy-protocol",
  "serde",
  "serde_json",
  "tao",
@@ -3204,6 +3205,10 @@ dependencies = [
  "tempfile",
  "unarray",
 ]
+
+[[package]]
+name = "qcy-protocol"
+version = "2.0.1"
 
 [[package]]
 name = "quick-error"

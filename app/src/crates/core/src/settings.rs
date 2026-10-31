@@ -18,7 +18,7 @@ fn v1_schema() -> u32 {
     1
 }
 /// The languages of app/lang
-pub const LANGUAGES: [&str; 8] = ["en", "ja", "de", "fr", "es", "ko", "zh-CN", "zh-TW"];
+pub const LANGUAGES: [&str; 9] = ["en", "ja", "de", "fr", "es", "ko", "zh-CN", "zh-TW", "pt-BR"];
 
 /// One of LANGUAGES for a BCP 47 name ("ja-JP", "zh-Hant-HK", "pt-BR"):
 /// None when the app has no strings for it
@@ -38,6 +38,11 @@ pub fn app_language_for(tag: &str) -> Option<&'static str> {
             rest.iter().any(|r| matches!(*r, "tw" | "hk" | "mo"))
         };
         return Some(if traditional { "zh-TW" } else { "zh-CN" });
+    }
+    if primary == "pt" {
+        // Brazilian Portuguese for every Portuguese (pt-PT, pt-AO, ...):
+        // closer than English
+        return Some("pt-BR");
     }
     LANGUAGES.iter().copied().find(|l| *l == primary)
 }
@@ -226,11 +231,16 @@ mod tests {
         assert_eq!(app_language_for("zh-TW"), Some("zh-TW"));
         assert_eq!(app_language_for("zh-HK"), Some("zh-TW"));
         assert_eq!(app_language_for("zh-Hant-TW"), Some("zh-TW"));
-        assert_eq!(app_language_for("pt-BR"), None);
+        assert_eq!(app_language_for("pt-BR"), Some("pt-BR"));
+        assert_eq!(app_language_for("pt_br"), Some("pt-BR"));
+        assert_eq!(app_language_for("pt-PT"), Some("pt-BR"));
+        assert_eq!(app_language_for("pt"), Some("pt-BR"));
+        assert_eq!(app_language_for("it-IT"), None);
         assert_eq!(app_language_for(""), None);
         let tags = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(pick_language(&tags(&["pt-BR", "fr-FR", "en-US"])), "fr");
-        assert_eq!(pick_language(&tags(&["pt-BR"])), "en");
+        assert_eq!(pick_language(&tags(&["pt-BR", "fr-FR", "en-US"])), "pt-BR");
+        assert_eq!(pick_language(&tags(&["it-IT", "fr-FR", "en-US"])), "fr");
+        assert_eq!(pick_language(&tags(&["it-IT"])), "en");
         assert_eq!(pick_language(&[]), "en");
         // A file without the key gets one of them
         let s: Settings = serde_json::from_str("{}").unwrap();

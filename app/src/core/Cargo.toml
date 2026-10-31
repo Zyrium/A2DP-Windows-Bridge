@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 a2dpwb-core.workspace = true
 bt-host.workspace = true
+# qcy_probe.rs: the QCY earbud protocol
+qcy-protocol.workspace = true
 # cli.rs: -u (UsbSelector)
 hci-transport.workspace = true
 codec = { workspace = true, features = ["default"] }

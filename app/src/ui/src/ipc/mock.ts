@@ -47,6 +47,8 @@ export interface MockOptions {
   speed?: number;
   /** Reports method calls (tests) */
   onCall?: (method: string, params: unknown) => void;
+  /** settings.language (?lang= in the URL), as the core picks it on a new install */
+  language?: string;
 }
 
 const RTL: AdapterInfo = {
@@ -396,6 +398,7 @@ export class MockCore implements Transport {
   constructor(opts: MockOptions = {}) {
     this.scenario = opts.scenario ?? "normal";
     this.snap = sampleSnapshot(opts.scenario);
+    if (opts.language) this.snap.settings.language = opts.language;
     // As the core: its local time of day when its clock (time_ms) started
     const t0 = new Date(this.startedAt);
     this.snap.clock_ms = ((t0.getHours() * 60 + t0.getMinutes()) * 60 + t0.getSeconds()) * 1000 + t0.getMilliseconds();
@@ -1260,5 +1263,5 @@ export function mockFromUrl(): MockCore {
   const q = new URLSearchParams(location.search);
   const scenario = (q.get("mock") as MockScenario | null) ?? "normal";
   const win = q.get("window") === "flyout" ? "flyout" : "main";
-  return new MockCore({ scenario, window: win });
+  return new MockCore({ scenario, window: win, language: q.get("lang") ?? undefined });
 }
