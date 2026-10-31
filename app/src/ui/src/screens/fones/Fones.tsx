@@ -7,7 +7,7 @@ import { useApp, errorText } from "../../app/context";
 import { Banner, Button, Dialog, Section, Segmented, Select, Toggle, type Option } from "../../components/controls";
 import { Icon } from "../../components/Icon";
 import { CodecBadge } from "../../components/stream";
-import { createQcy, EQ_BANDS_HZ, EQ_GAIN_MAX, EQ_GAIN_MIN, TOUCH_ACTIONS, type AutoOff, type Battery, type GestureKind, type NoiseMode, type NoiseScene, type QcyChange, type QcyProvider, type QcyState, type QcyWrite, type Side } from "../../ipc/qcy";
+import { createQcy, EQ_BANDS_HZ, EQ_GAIN_MAX, EQ_GAIN_MIN, TOUCH_ACTIONS, type AutoOff, type Battery, type GestureKind, NOISE_CODES, noiseCode, type NoiseMode, type NoiseScene, type QcyChange, type QcyProvider, type QcyState, type QcyWrite, type Side } from "../../ipc/qcy";
 import { insideTauri } from "../../ipc/tauri";
 import { EQ_PRESETS, matchPreset } from "../../lib/eqPresets";
 import { lang } from "../../i18n";
@@ -32,6 +32,8 @@ export function Fones(props: { tab?: string }) {
   const [state, setState] = createSignal<QcyState | null>(null);
   const [now, setNow] = createSignal(Date.now());
   const [askLdac, setAskLdac] = createSignal(false);
+  /** A noise change waiting for "Transparência desliga a Redução de vento. Continuar?" */
+  const [askNoise, setAskNoise] = createSignal<QcyChange | null>(null);
   const [busy, setBusy] = createSignal(false);
   const tick = setInterval(() => setNow(Date.now()), 1000);
   onCleanup(() => clearInterval(tick));
@@ -149,7 +151,19 @@ export function Fones(props: { tab?: string }) {
               inert={!editable() && !(tab() !== "eq" && partial()) ? true : undefined}
             >
               <Show when={tab() === "main"}>
-                <MainTab s={s()} send={send} can={can} partial={partial()} busy={busy()} verified={s().verified ?? []} />
+                <MainTab
+                  s={s()}
+                  send={send}
+                  can={can}
+                  partial={partial()}
+                  busy={busy()}
+                  verified={s().verified ?? []}
+                  onNoise={(mode, scene) => {
+                    const c = noiseChange(s(), mode, scene);
+                    if (needsNoiseWarning(s(), mode)) setAskNoise(c);
+                    else void send(c);
+                  }}
+                />
               </Show>
               <Show when={tab() === "eq"}>
                 <EqTab s={s()} send={send} notify={notify} />
@@ -185,6 +199,22 @@ export function Fones(props: { tab?: string }) {
         }}
       >
         <p>{ft("ldac_off.text")}</p>
+      </Dialog>
+
+      <Dialog
+        open={askNoise() !== null}
+        title={ft("noise.warn.title")}
+        confirm={ft("noise.warn.confirm")}
+        cancel={ft("cancel")}
+        busy={busy()}
+        onCancel={() => setAskNoise(null)}
+        onConfirm={async () => {
+          const c = askNoise();
+          setAskNoise(null);
+          if (c) await send(c);
+        }}
+      >
+        <p>{ft(noiseWarnKey(askNoise()))}</p>
       </Dialog>
     </div>
   );
@@ -308,6 +338,31 @@ function WriteBanner(props: { s: QcyState; busy: boolean; send: (c: QcyChange) =
   );
 }
 
+/** The change for a noise mode (+ ANC scene): the phase-3 code when the
+ *  earbuds accept noise_control writes, else the full mock's change */
+export function noiseChange(s: QcyState, mode: NoiseMode, scene?: NoiseScene): QcyChange {
+  if (s.writable?.includes("noise_control")) return { kind: "noise_control", value: noiseCode(mode, scene ?? s.noise_scene) };
+  return scene ? { kind: "noise", mode, scene } : { kind: "noise", mode };
+}
+
+/** Switching to Desligado or Transparência from another mode asks first:
+ *  the earbuds turn wind reduction off (phase F3, write mode only) */
+export function needsNoiseWarning(s: QcyState, mode: NoiseMode): boolean {
+  return s.writable?.includes("noise_control") === true && (mode === "off" || mode === "transparency") && s.noise_mode !== mode;
+}
+
+function noiseWarnKey(c: QcyChange | null): string {
+  return c?.kind === "noise_control" && c.value === 0 ? "noise.warn.text_off" : "noise.warn.text";
+}
+
+/** A noise_control code on screen ("Cancelamento (ANC) · Antivento") */
+export function noiseText(code: number): string {
+  const n = NOISE_CODES.find((x) => x.code === code);
+  if (!n) return "?";
+  if (n.mode === "anc") return `${ft("noise.anc")} · ${ft(`scene.${n.scene}`)}`;
+  return ft(n.mode === "off" ? "noise.off" : "noise.transparency");
+}
+
 /** The writable settings of this version (phase F2) */
 export const F2_SETTINGS = ["game_mode", "sleep_mode", "wind_reduction"] as const;
 
@@ -322,23 +377,28 @@ export function settingName(k: string): string {
       return ft("wind");
     case "prompt_volume":
       return ft("prompt_volume");
+    case "noise_control":
+      return ft("noise.title");
     default:
       return k;
   }
 }
 
 const isLevel = (w: QcyWrite) => w.setting === "prompt_volume";
-/** What the write asked for: a boolean, or the prompt volume level */
-const target = (w: QcyWrite): boolean | number | null => (isLevel(w) ? (w.value ?? null) : w.enabled);
+const isNoise = (w: QcyWrite) => w.setting === "noise_control";
+/** What the write asked for: a boolean, the prompt volume level or the noise code */
+const target = (w: QcyWrite): boolean | number | null => (isLevel(w) || isNoise(w) ? (w.value ?? null) : w.enabled);
 
 /** A value of this write's setting as text ("ligado", "4/15") */
 export function valueText(w: QcyWrite, v: boolean | number | null | undefined): string {
   if (v === null || v === undefined) return "?";
+  if (isNoise(w) && typeof v === "number") return noiseText(v);
   if (typeof v === "number") return w.max ? `${v}/${w.max}` : String(v);
   return ft(v ? "write.on" : "write.off");
 }
 
 function writeTitle(w: QcyWrite): string {
+  if (isNoise(w)) return ft("write.ok_noise", valueText(w, w.value));
   if (isLevel(w)) return ft("write.ok_level", settingName(w.setting), valueText(w, w.value));
   return ft(w.enabled ? "write.ok_on" : "write.ok_off", settingName(w.setting));
 }
@@ -350,6 +410,7 @@ export function writeChange(w: QcyWrite, which: "retry" | "undo"): QcyChange | n
   if (v === null || v === undefined) return null;
   if (which === "undo" && v === target(w)) return null;
   if (isLevel(w)) return typeof v === "number" ? { kind: "prompt_volume", value: v } : null;
+  if (isNoise(w)) return typeof v === "number" && NOISE_CODES.some((n) => n.code === v) ? { kind: "noise_control", value: v } : null;
   if (typeof v !== "boolean") return null;
   if (w.setting === "game_mode" || w.setting === "sleep_mode" || w.setting === "wind_reduction") return { kind: w.setting, enabled: v };
   return null;
@@ -388,6 +449,7 @@ export function writeStepLines(w: QcyWrite): string[] {
       case "read_previous_failed":
         return ft("write.step.no_previous");
       case "sent":
+        if (isNoise(w)) return ft("write.step.sent_noise", valueText(w, w.value));
         return isLevel(w)
           ? ft("write.step.sent_level", settingName(w.setting), valueText(w, w.value))
           : ft("write.step.sent", ft(w.enabled ? "write.turn_on" : "write.turn_off"), settingName(w.setting));
@@ -399,6 +461,10 @@ export function writeStepLines(w: QcyWrite): string[] {
         return ft("write.step.no_read_back");
       case "refused":
         return ft("write.step.refused");
+      case "read_wind":
+        return ft("write.step.read_wind", ft(st.detail.endsWith("01") ? "write.on" : "write.off"));
+      case "read_wind_failed":
+        return ft("write.step.read_wind_failed");
       default:
         return null;
     }
@@ -422,6 +488,8 @@ function MainTab(props: {
   busy?: boolean;
   /** Writable settings already confirmed on the earbuds (tag Verificado) */
   verified?: string[];
+  /** A noise mode / ANC scene was picked (the screen may ask first) */
+  onNoise?: (mode: NoiseMode, scene?: NoiseScene) => void;
 }) {
   const s = () => props.s;
   const can = (k: string) => props.can?.(k) ?? true;
@@ -439,6 +507,10 @@ function MainTab(props: {
     ) : undefined;
   const writeFor = (k: string) => (props.partial && s().write?.setting === k ? s().write! : null);
   const off = (k: string) => props.partial === true && (props.busy === true || !can(k));
+  const pickNoise = (mode: NoiseMode, scene?: NoiseScene) => {
+    if (props.onNoise) props.onNoise(mode, scene);
+    else void props.send(scene ? { kind: "noise", mode, scene } : { kind: "noise", mode });
+  };
   return (
     <>
       <section class="card dev">
@@ -451,6 +523,7 @@ function MainTab(props: {
             <CodecBadge />
             <Show when={s().firmware}>{(f) => <span class="codec-badge">{ft("firmware", f())}</span>}</Show>
           </div>
+        <Show when={writeFor("noise_control")}>{(w) => <WriteSteps w={w()} />}</Show>
         </div>
         <div class="bats">
           <BatteryRing b={s().battery.left} label={ft("bat.left")} icon={<BudIcon />} />
@@ -463,20 +536,23 @@ function MainTab(props: {
         title={ft("noise.title")}
         actions={
           <span class="hint">
-            {tag("noise")} {live(s()) ? ft("noise.synced") : ft("last_value")}
+            {tag("noise_control")} {live(s()) ? ft("noise.synced") : ft("last_value")}
           </span>
         }
       >
-        <div class="fones-lock" classList={{ locked: locked("noise") }} inert={locked("noise") ? true : undefined}>
+        <div class="fones-lock" classList={{ locked: locked("noise_control") }} inert={locked("noise_control") ? true : undefined}>
+        <Show when={props.partial && can("noise_control")}>
+          <span class="hint">{props.busy ? ft("write.sending") : ft("noise.testing")}</span>
+        </Show>
         <Segmented<NoiseMode>
           label={ft("noise.title")}
           value={s().noise_mode}
           options={[
-            { value: "off", label: ft("noise.off") },
-            { value: "anc", label: ft("noise.anc") },
-            { value: "transparency", label: ft("noise.transparency") },
+            { value: "off", label: ft("noise.off"), disabled: off("noise_control") },
+            { value: "anc", label: ft("noise.anc"), disabled: off("noise_control") },
+            { value: "transparency", label: ft("noise.transparency"), disabled: off("noise_control") },
           ]}
-          onChange={(mode) => void props.send({ kind: "noise", mode })}
+          onChange={(mode) => pickNoise(mode)}
         />
         <span class="hint">{ft("noise.scene_hint")}</span>
         <div class="scenes" role="radiogroup" aria-label={ft("noise.scene_hint")}>
@@ -488,8 +564,8 @@ function MainTab(props: {
                 class="scene"
                 aria-checked={s().noise_scene === sc}
                 classList={{ on: s().noise_scene === sc }}
-                disabled={s().noise_mode !== "anc"}
-                onClick={() => void props.send({ kind: "noise", mode: "anc", scene: sc })}
+                disabled={s().noise_mode !== "anc" || off("noise_control")}
+                onClick={() => pickNoise("anc", sc)}
               >
                 <b>{ft(`scene.${sc}`)}</b>
                 <span class="hint">{ft(`scene.${sc}.hint`)}</span>

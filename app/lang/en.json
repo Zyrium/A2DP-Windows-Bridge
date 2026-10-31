@@ -679,7 +679,7 @@
   "fones.tag.verified": "Verified",
   "fones.tag.unverified": "Not verified yet",
   "fones.write_test.title": "Write test",
-  "fones.write_test.text": "This version can change Game mode, Sleep mode and Wind reduction (Prompt volume is shown read-only). Each tap reads the current value, sends 1 command and checks it with the earbuds. Everything else stays read-only.",
+  "fones.write_test.text": "This version can change Game mode, Sleep mode, Wind reduction and Noise control (noise cancelling, scenes and transparency); Prompt volume is shown read-only. Each tap reads the current value, sends 1 command and checks it with the earbuds. Everything else stays read-only.",
   "fones.write.sending": "Sending… (reading the current value, 1 command, checking)",
   "fones.write.ok_on": "%s on — confirmed by the earbuds",
   "fones.write.ok_off": "%s off — confirmed by the earbuds",
@@ -710,5 +710,14 @@
   "fones.write.step.refused": "Outside the earbuds' range ✕ (nothing sent)",
   "fones.sleep.warn": "Note: with Sleep mode on, the earbuds' touch controls stay locked until you turn it off here.",
   "fones.wind.needs_anc": "Turn on Noise cancelling to use Wind reduction.",
+  "fones.noise.warn.title": "Turn off wind reduction?",
+  "fones.noise.warn.text": "Transparency turns off wind reduction. Continue?",
+  "fones.noise.warn.text_off": "Turning noise cancelling off also turns off wind reduction. Continue?",
+  "fones.noise.warn.confirm": "Continue",
+  "fones.noise.testing": "Each tap reads the current mode, sends 1 command and checks the 3 bytes with the earbuds.",
+  "fones.write.ok_noise": "%s — confirmed by the earbuds",
+  "fones.write.step.sent_noise": "Sent: %s (1 command)",
+  "fones.write.step.read_wind": "Wind reduction read again: %s",
+  "fones.write.step.read_wind_failed": "Wind reduction: no answer when read again",
   "fones.prompt_volume.readonly": "The earbuds don't accept this change from here yet; read only."
 }

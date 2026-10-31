@@ -9,6 +9,11 @@
 //! - 0x1D prompt volume is NOT written (fase 2b): on the N70 every
 //!   `FF 03 1D 01 <v>` read back the old level (04/0F, 2026-10-31), so it
 //!   stays read-only until the earbuds' answer is understood.
+//! - Phase F3: 0x17 noise control, ONLY the seven 3-byte states of
+//!   [`NOISE_PRESETS`] (five ANC scenes, normal `02 00 00`, transparency
+//!   `03 01 04`). The read-back must match the three bytes exactly. After a
+//!   confirmed 0x17 write, 0x2A (wind reduction) is READ again (never
+//!   written) so the screen shows its real state.
 //! - [`BLOCKED`]: opcodes that are never written, even if a later phase
 //!   widens [`ALLOWED`] by mistake (restore defaults, clear pairings,
 //!   factory reset, test modes, standby, rename, fit/EQ tests).
@@ -22,6 +27,7 @@
 //! FF 03 10 01 01 / 02   sleep mode on / off      read FE 10 -> 10 01 <01|00|02>
 //! FF 03 2A 01 01 / 02   wind reduction on / off  read FE 2A -> 2A 01 <01|00|02>
 //! FF 03 1D 01 vv        prompt volume vv         read FE 1D -> 1D 02 <vv> <max>
+//! FF 05 17 03 m s v     noise control (F3)       read FE 17 -> 17 03 <m> <s> <v>
 //! ```
 //!
 //! Sources (confidence in plano_escrita_qcy.md):
@@ -55,7 +61,49 @@ use crate::commands::{self, opcode};
 use crate::packet;
 
 /// The opcodes this build may write (exactly these four)
-pub const ALLOWED: [u8; 3] = [opcode::GAME_MODE, opcode::SLEEP_MODE, opcode::WIND_DETECTION];
+pub const ALLOWED: [u8; 4] = [opcode::GAME_MODE, opcode::SLEEP_MODE, opcode::WIND_DETECTION, opcode::NOISE_CONTROL];
+
+/// The only 0x17 states ever written, by the code the UI sends (`value` of
+/// `{ kind: "noise_control" }`). Sources: OpenQCY-Desktop
+/// `QcyCommands.cs` and the N70 3.0.13 transcript (ANC scenes: high
+/// confidence); normal and transparency: medium (transparency's last two
+/// bytes not confirmed on the N70).
+pub const NOISE_PRESETS: [(u8, &str, [u8; 3]); 7] = [
+    (0, "off", [0x02, 0x00, 0x00]),
+    (1, "anc_adaptive", [0x01, 0x05, 0x00]),
+    (2, "anc_indoor", [0x01, 0x01, 0x02]),
+    (3, "anc_commuting", [0x01, 0x02, 0x02]),
+    (4, "anc_noisy", [0x01, 0x03, 0x02]),
+    (5, "anc_anti_wind", [0x01, 0x04, 0x00]),
+    (6, "transparency", [0x03, 0x01, 0x04]),
+];
+
+/// The three bytes of a noise-control code (None: not one of the seven)
+pub fn noise_bytes(code: u8) -> Option<[u8; 3]> {
+    NOISE_PRESETS.iter().find(|p| p.0 == code).map(|p| p.2)
+}
+
+/// The name of a noise-control code (for the log)
+pub fn noise_name(code: u8) -> &'static str {
+    NOISE_PRESETS.iter().find(|p| p.0 == code).map_or("?", |p| p.1)
+}
+
+/// The code of a 0x17 read: the preset with exactly these three bytes,
+/// else the preset of the same mode and scene (parsed), else None (then
+/// nothing is written: there is no known value to go back to)
+pub fn noise_code(got: &[u8]) -> Option<u8> {
+    let three = got.get(..3)?;
+    if let Some(p) = NOISE_PRESETS.iter().find(|p| p.2 == three) {
+        return Some(p.0);
+    }
+    let parsed = commands::NoiseControlState::parse(three)?;
+    NOISE_PRESETS
+        .iter()
+        .find(|p| {
+            commands::NoiseControlState::parse(&p.2).is_some_and(|q| q.mode == parsed.mode && q.scene == parsed.scene)
+        })
+        .map(|p| p.0)
+}
 
 /// How long the raw notifications of 1002 are kept after a write (logged as
 /// `notify` steps; at most half the timeout)
@@ -91,11 +139,14 @@ pub enum Setting {
     /// Read-only in this build: not in [`Setting::ALL`] nor [`ALLOWED`], so
     /// [`run`] refuses it before any traffic
     PromptVolume,
+    /// 0x17 (phase F3): the value is a code of [`NOISE_PRESETS`]
+    NoiseControl,
 }
 
 impl Setting {
     /// The writable settings (prompt volume is read-only)
-    pub const ALL: [Setting; 3] = [Setting::GameMode, Setting::SleepMode, Setting::WindReduction];
+    pub const ALL: [Setting; 4] =
+        [Setting::GameMode, Setting::SleepMode, Setting::WindReduction, Setting::NoiseControl];
 
     pub fn opcode(self) -> u8 {
         match self {
@@ -103,6 +154,7 @@ impl Setting {
             Setting::SleepMode => opcode::SLEEP_MODE,
             Setting::WindReduction => opcode::WIND_DETECTION,
             Setting::PromptVolume => opcode::PROMPT_VOLUME,
+            Setting::NoiseControl => opcode::NOISE_CONTROL,
         }
     }
     pub fn key(self) -> &'static str {
@@ -111,11 +163,12 @@ impl Setting {
             Setting::SleepMode => "sleep_mode",
             Setting::WindReduction => "wind_reduction",
             Setting::PromptVolume => "prompt_volume",
+            Setting::NoiseControl => "noise_control",
         }
     }
     /// On/off (01/02) rather than a level
     pub fn is_toggle(self) -> bool {
-        !matches!(self, Setting::PromptVolume)
+        !matches!(self, Setting::PromptVolume | Setting::NoiseControl)
     }
     /// The UI's change kind -> the setting; None for everything not allowed
     pub fn from_kind(kind: &str) -> Option<Setting> {
@@ -159,6 +212,7 @@ pub fn build(op: u8, parameters: &[u8]) -> Result<Vec<u8>, Refused> {
         (opcode::GAME_MODE | opcode::SLEEP_MODE | opcode::WIND_DETECTION, [0x01] | [0x02]) => {
             Ok(packet::frame(op, parameters))
         }
+        (opcode::NOISE_CONTROL, p) if NOISE_PRESETS.iter().any(|n| n.2 == p) => Ok(packet::frame(op, p)),
         _ => Err(Refused::BadParameters(op, parameters.to_vec())),
     }
 }
@@ -174,6 +228,10 @@ pub fn toggle_frame(setting: Setting, enabled: bool) -> Result<Vec<u8>, Refused>
 /// The frame of `setting` with its raw parameter byte (01/02 for a
 /// toggle, the level for the prompt volume)
 pub fn frame_for(setting: Setting, value: u8) -> Result<Vec<u8>, Refused> {
+    if setting == Setting::NoiseControl {
+        let bytes = noise_bytes(value).ok_or_else(|| Refused::BadParameters(opcode::NOISE_CONTROL, vec![value]))?;
+        return build(opcode::NOISE_CONTROL, &bytes);
+    }
     build(setting.opcode(), &[value])
 }
 
@@ -209,6 +267,9 @@ pub fn confirms(sent: &[u8], got: &[u8]) -> bool {
 pub fn confirms_for(setting: Setting, sent: &[u8], got: &[u8]) -> bool {
     if setting.is_toggle() {
         confirms(sent, got)
+    } else if setting == Setting::NoiseControl {
+        // All three bytes, exactly
+        sent.len() == 3 && got.get(..3) == Some(sent)
     } else {
         matches!((sent.first(), got.first()), (Some(s), Some(g)) if s == g)
     }
@@ -217,7 +278,11 @@ pub fn confirms_for(setting: Setting, sent: &[u8], got: &[u8]) -> bool {
 /// The value of a read as the raw parameter of a write: a toggle's 01 /
 /// 02 (00 reads as 02), a level's first byte
 pub fn read_value(setting: Setting, got: &[u8]) -> Option<u8> {
-    if setting.is_toggle() { read_on(got).map(on_off) } else { got.first().copied() }
+    match setting {
+        Setting::NoiseControl => noise_code(got),
+        s if s.is_toggle() => read_on(got).map(on_off),
+        _ => got.first().copied(),
+    }
 }
 
 /// The maximum prompt volume a read reports (second byte), if any
@@ -293,6 +358,9 @@ pub struct Outcome {
     pub read_back: Option<Vec<u8>>,
     /// None: confirmed by the read-back
     pub failure: Option<Failure>,
+    /// 0x2A read again after a confirmed 0x17 write (its parameters; None:
+    /// not read or no answer). Never written.
+    pub wind_after: Option<Vec<u8>>,
     pub steps: Vec<Step>,
 }
 
@@ -341,6 +409,7 @@ pub fn run<T: Transport>(t: &mut T, setting: Setting, value: u8, timeout: Durati
         sent: None,
         read_back: None,
         failure: None,
+        wind_after: None,
         steps: Vec::new(),
     };
     let frame = match frame_for(setting, value) {
@@ -359,10 +428,15 @@ pub fn run<T: Transport>(t: &mut T, setting: Setting, value: u8, timeout: Durati
     match read.as_deref().and_then(|p| read_value(setting, p).map(|v| (v, p))) {
         Some((p, raw)) => {
             out.previous = Some(p);
-            out.max = if setting.is_toggle() { None } else { read_max(raw) };
+            out.max = if setting == Setting::PromptVolume { read_max(raw) } else { None };
             out.steps.push(Step {
                 what: "read_previous",
-                detail: format!("{} -> {}", packet::to_hex(&request), value_text(setting, p, out.max)),
+                detail: format!(
+                    "{} -> {} ({})",
+                    packet::to_hex(&request),
+                    value_text(setting, p, out.max),
+                    packet::to_hex(raw)
+                ),
             });
         }
         None => {
@@ -420,11 +494,26 @@ pub fn run<T: Transport>(t: &mut T, setting: Setting, value: u8, timeout: Durati
             out.read_back = Some(p);
         }
     }
+
+    // 5. Noise control confirmed: read 0x2A again (wind reduction only
+    //    works with ANC; the earbuds may have turned it off). A read, never
+    //    a write.
+    if setting == Setting::NoiseControl && out.failure.is_none() {
+        let wind = commands::request(opcode::WIND_DETECTION);
+        let got = t.send(&wind).ok().and_then(|()| wait_for(t, opcode::WIND_DETECTION, Instant::now() + timeout));
+        out.steps.push(Step {
+            what: if got.is_some() { "read_wind" } else { "read_wind_failed" },
+            detail: got.as_deref().map_or_else(|| packet::to_hex(&wind), packet::to_hex),
+        });
+        out.wind_after = got;
+    }
     out
 }
 
 fn value_text(setting: Setting, v: u8, max: Option<u8>) -> String {
-    if setting.is_toggle() {
+    if setting == Setting::NoiseControl {
+        noise_name(v).to_string()
+    } else if setting.is_toggle() {
         on_text(v == 0x01).to_string()
     } else {
         format!("{v}/{}", max.map_or_else(|| "?".to_string(), |m| m.to_string()))
@@ -466,13 +555,14 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_three_settings_are_allowed() {
-        assert_eq!(ALLOWED, [0x09, 0x10, 0x2A]);
+    fn exactly_the_four_settings_are_allowed() {
+        assert_eq!(ALLOWED, [0x09, 0x10, 0x2A, 0x17]);
         for op in 0..=u8::MAX {
             for p in [&[0x01u8][..], &[0x02], &[0x00], &[0x0F], &[0x64], &[0x65], &[0xFF], &[0x01, 0x02], &[]] {
                 let r = build(op, p);
                 let ok = match op {
                     0x09 | 0x10 | 0x2A => p == [0x01] || p == [0x02],
+                    // 0x17 takes three bytes: none of these
                     _ => false,
                 };
                 assert_eq!(r.is_ok(), ok, "0x{op:02X} {p:?}");
@@ -725,5 +815,193 @@ mod tests {
             o.steps.iter().map(|s| s.what).collect::<Vec<_>>(),
             ["read_previous", "sent", "notify", "read_back"]
         );
+    }
+
+    #[test]
+    fn noise_control_takes_only_the_seven_states() {
+        let want = [
+            (0, "FF05170302 0000"),
+            (1, "FF05170301 0500"),
+            (2, "FF05170301 0102"),
+            (3, "FF05170301 0202"),
+            (4, "FF05170301 0302"),
+            (5, "FF05170301 0400"),
+            (6, "FF05170303 0104"),
+        ];
+        for (code, frame) in want {
+            assert_eq!(frame_for(Setting::NoiseControl, code).unwrap(), hex(frame), "code {code}");
+        }
+        // Same bytes as the crate's builders for the ANC scenes and normal
+        use commands::{NoiseMode, NoiseScene};
+        assert_eq!(
+            frame_for(Setting::NoiseControl, 1).unwrap(),
+            commands::set_noise_mode(NoiseMode::NoiseCancellation, NoiseScene::Adaptive)
+        );
+        assert_eq!(
+            frame_for(Setting::NoiseControl, 4).unwrap(),
+            commands::set_noise_mode(NoiseMode::NoiseCancellation, NoiseScene::Noisy)
+        );
+        assert_eq!(
+            frame_for(Setting::NoiseControl, 0).unwrap(),
+            commands::set_noise_mode(NoiseMode::Normal, NoiseScene::Adaptive)
+        );
+        for code in [7, 8, 0x17, 0xFF] {
+            assert!(frame_for(Setting::NoiseControl, code).is_err(), "code {code}");
+        }
+        // Every other 3-byte combination is refused
+        let mut ok = 0;
+        for a in 0..=4u8 {
+            for b in 0..=6u8 {
+                for c in 0..=5u8 {
+                    if build(0x17, &[a, b, c]).is_ok() {
+                        ok += 1;
+                        assert!(NOISE_PRESETS.iter().any(|n| n.2 == [a, b, c]));
+                    }
+                }
+            }
+        }
+        assert_eq!(ok, 7);
+        assert!(build(0x17, &[0x01]).is_err());
+        assert!(build(0x17, &[0x01, 0x05, 0x00, 0x00]).is_err());
+        assert!(build(0x17, &[]).is_err());
+        assert_eq!(Setting::from_kind("noise_control"), Some(Setting::NoiseControl));
+        assert!(Setting::from_kind("noise").is_none());
+    }
+
+    #[test]
+    fn noise_reads_and_exact_confirmation() {
+        assert_eq!(noise_code(&[0x01, 0x05, 0x00]), Some(1));
+        assert_eq!(noise_code(&[0x03, 0x01, 0x04]), Some(6));
+        assert_eq!(noise_code(&[0x02, 0x00, 0x00]), Some(0));
+        // Same mode and scene, other firmware parameter: the canonical code
+        assert_eq!(noise_code(&[0x01, 0x03, 0x01]), Some(4));
+        assert_eq!(noise_code(&[0x03, 0x02, 0x07]), Some(6));
+        assert_eq!(noise_code(&[0x09, 0x00, 0x00]), None);
+        assert_eq!(noise_code(&[0x01, 0x05]), None);
+        assert!(confirms_for(Setting::NoiseControl, &[0x01, 0x03, 0x02], &[0x01, 0x03, 0x02]));
+        assert!(!confirms_for(Setting::NoiseControl, &[0x01, 0x03, 0x02], &[0x01, 0x03, 0x01]));
+        assert!(!confirms_for(Setting::NoiseControl, &[0x03, 0x01, 0x04], &[0x03, 0x01]));
+        assert!(!confirms_for(Setting::NoiseControl, &[0x02, 0x00, 0x00], &[0x00]));
+    }
+
+    /// Earbuds with a 0x17 state and a 0x2A state
+    struct NoiseMock {
+        noise: [u8; 3],
+        wind: u8,
+        applies: bool,
+        /// Answers reads after the write
+        answers_after: bool,
+        /// Wind reduction turns off when ANC goes off (as on the N70)
+        drops_wind: bool,
+        written: bool,
+        sent: Vec<Vec<u8>>,
+        inbox: VecDeque<Vec<u8>>,
+    }
+
+    impl NoiseMock {
+        fn new(noise: [u8; 3]) -> NoiseMock {
+            NoiseMock {
+                noise,
+                wind: 0x01,
+                applies: true,
+                answers_after: true,
+                drops_wind: true,
+                written: false,
+                sent: Vec::new(),
+                inbox: VecDeque::new(),
+            }
+        }
+        fn writes(&self) -> Vec<&Vec<u8>> {
+            self.sent.iter().filter(|f| f[2] != 0xFE).collect()
+        }
+    }
+
+    impl Transport for NoiseMock {
+        fn send(&mut self, frame: &[u8]) -> Result<(), String> {
+            self.sent.push(frame.to_vec());
+            if frame[2] == 0xFE {
+                if self.written && !self.answers_after {
+                    return Ok(());
+                }
+                match frame[4] {
+                    0x17 => self.inbox.push_back(packet::frame(0x17, &self.noise)),
+                    0x2A => self.inbox.push_back(packet::frame(0x2A, &[self.wind])),
+                    _ => {}
+                }
+            } else {
+                self.written = true;
+                if self.applies && frame[2] == 0x17 {
+                    self.noise = [frame[4], frame[5], frame[6]];
+                    if self.drops_wind && frame[4] != 0x01 {
+                        self.wind = 0x00;
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn recv(&mut self, wait: Duration) -> Option<Vec<u8>> {
+            let v = self.inbox.pop_front();
+            if v.is_none() && !wait.is_zero() {
+                std::thread::sleep(wait.min(Duration::from_millis(5)));
+            }
+            v
+        }
+    }
+
+    #[test]
+    fn transparency_is_confirmed_and_wind_is_read_not_written() {
+        let mut m = NoiseMock::new([0x01, 0x05, 0x00]);
+        let o = run(&mut m, Setting::NoiseControl, 6, T);
+        assert!(o.confirmed(), "{o:?}");
+        assert_eq!(o.previous, Some(1));
+        assert_eq!(o.sent, Some(hex("FF05170303 0104")));
+        assert_eq!(m.writes(), [&hex("FF05170303 0104")], "one write, no 0x2A write");
+        assert_eq!(m.sent[0], hex("FF03FE0117"));
+        assert_eq!(m.sent.last().unwrap(), &hex("FF03FE012A"), "0x2A is only read");
+        assert_eq!(o.wind_after, Some(vec![0x00]));
+        assert_eq!(
+            o.steps.iter().map(|s| s.what).collect::<Vec<_>>(),
+            ["read_previous", "sent", "read_back", "read_wind"]
+        );
+        // Desfazer: the saved code, the same way
+        let undo = run(&mut m, Setting::NoiseControl, o.previous.unwrap(), T);
+        assert!(undo.confirmed());
+        assert_eq!(m.writes(), [&hex("FF05170303 0104"), &hex("FF05170301 0500")]);
+    }
+
+    #[test]
+    fn a_silent_noise_write_times_out_once() {
+        let mut m = NoiseMock::new([0x01, 0x05, 0x00]);
+        m.answers_after = false;
+        let started = Instant::now();
+        let o = run(&mut m, Setting::NoiseControl, 4, T);
+        assert_eq!(o.failure, Some(Failure::Timeout));
+        assert!(started.elapsed() >= T);
+        assert_eq!(m.writes(), [&hex("FF05170301 0302")], "never re-sent");
+        assert_eq!(o.previous, Some(1));
+        assert_eq!(o.wind_after, None, "no 0x2A read after a failure");
+        assert!(!m.sent.iter().any(|f| f == &hex("FF03FE012A")));
+    }
+
+    #[test]
+    fn a_noise_read_back_with_other_bytes_fails() {
+        let mut m = NoiseMock::new([0x01, 0x05, 0x00]);
+        m.applies = false;
+        let o = run(&mut m, Setting::NoiseControl, 0, T);
+        assert_eq!(o.failure, Some(Failure::Mismatch));
+        assert_eq!(o.read_back, Some(vec![0x01, 0x05, 0x00]));
+        assert_eq!(m.writes().len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_noise_state_is_never_overwritten() {
+        let mut m = NoiseMock::new([0x07, 0x00, 0x00]);
+        let o = run(&mut m, Setting::NoiseControl, 1, T);
+        assert_eq!(o.failure, Some(Failure::NoPrevious));
+        assert!(m.writes().is_empty());
+        let mut m = NoiseMock::new([0x01, 0x05, 0x00]);
+        let o = run(&mut m, Setting::NoiseControl, 9, T);
+        assert_eq!(o.failure, Some(Failure::OutOfRange));
+        assert!(m.sent.is_empty(), "a bad code sends nothing, not even a read");
     }
 }

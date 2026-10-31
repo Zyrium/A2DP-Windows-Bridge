@@ -204,17 +204,20 @@ fn keep_known(previous: Option<&Reading>, mut r: Reading) -> Reading {
 /// A change the UI asked for (`qcy.set`) that this version accepts, as the
 /// setting and its write parameter byte; None (nothing sent) for anything
 /// else. Only `{ "kind": "game_mode" | "sleep_mode" | "wind_reduction",
-/// "enabled": bool }` passes (the prompt volume is read-only).
+/// "enabled": bool }` and, since phase F3, `{ "kind": "noise_control",
+/// "value": 0..=6 }` (a code of `write::NOISE_PRESETS`) pass (the prompt
+/// volume is read-only).
 pub fn allowed_change(change: &Value) -> Option<(Setting, u8)> {
     let setting = Setting::from_kind(change.get("kind")?.as_str()?)?;
     // Exactly kind + one value: no extra parameters ride along
     if change.as_object()?.len() != 2 {
         return None;
     }
-    if !setting.is_toggle() {
-        return None;
-    }
-    let value = write::on_off(change.get("enabled")?.as_bool()?);
+    let value = match setting {
+        s if s.is_toggle() => write::on_off(change.get("enabled")?.as_bool()?),
+        Setting::NoiseControl => u8::try_from(change.get("value")?.as_u64()?).ok()?,
+        _ => return None,
+    };
     // The same check the frame builder makes
     write::frame_for(setting, value).ok()?;
     Some((setting, value))
@@ -232,7 +235,11 @@ pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
     tracing::info!(
         "QCY write: {} -> {} (one command, confirmed by a read-back)",
         setting.key(),
-        if setting.is_toggle() { (if value == 0x01 { "on" } else { "off" }).to_string() } else { value.to_string() }
+        match setting {
+            Setting::NoiseControl => write::noise_name(value).to_string(),
+            s if s.is_toggle() => (if value == 0x01 { "on" } else { "off" }).to_string(),
+            _ => value.to_string(),
+        }
     );
     let outcome = host_for_read(service).and_then(|h| write_at(&h, service.config_dir(), setting, value));
     let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -244,6 +251,10 @@ pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
                     Setting::GameMode => r.state.game_mode = on.or(r.state.game_mode),
                     Setting::SleepMode => r.state.sleep_mode = on.or(r.state.sleep_mode),
                     Setting::WindReduction => r.state.wind_detection = on.or(r.state.wind_detection),
+                    Setting::NoiseControl => {
+                        r.state.noise_control =
+                            qcy_protocol::commands::NoiseControlState::parse(p).or(r.state.noise_control);
+                    }
                     Setting::PromptVolume => {
                         if let Some(v) = p.first() {
                             r.state.prompt_volume = Some(*v);
@@ -252,6 +263,10 @@ pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
                             r.state.prompt_volume_max = m;
                         }
                     }
+                }
+                // 0x2A read again after the noise change (never written)
+                if let Some(w) = o.wind_after.as_deref() {
+                    r.state.wind_detection = write::read_on(w).or(r.state.wind_detection);
                 }
                 r.at_ms = now_ms();
             }
@@ -595,7 +610,10 @@ pub fn view(last: Option<&Reading>, link: Option<Unavailable>) -> Value {
 fn write_view(w: &LastWrite) -> Value {
     // Toggles: enabled / previous as booleans; the level: value / previous
     // as numbers, with the reported maximum
-    let (enabled, value, previous) = if w.toggle {
+    let (enabled, value, previous) = if w.setting == "noise_control" {
+        // The code and its name: the screen maps it to mode + scene
+        (Value::Null, json!(w.value), w.previous.map_or(Value::Null, |p| json!(p)))
+    } else if w.toggle {
         (json!(w.value == 0x01), Value::Null, w.previous.map_or(Value::Null, |p| json!(p == 0x01)))
     } else {
         (Value::Null, json!(w.value), w.previous.map_or(Value::Null, |p| json!(p)))
@@ -606,6 +624,11 @@ fn write_view(w: &LastWrite) -> Value {
         "value": value,
         "previous": previous,
         "max": w.max,
+        "preset": if w.setting == "noise_control" { json!(write::noise_name(w.value)) } else { Value::Null },
+        "previous_preset": match (w.setting, w.previous) {
+            ("noise_control", Some(p)) => json!(write::noise_name(p)),
+            _ => Value::Null,
+        },
         "status": if w.failure.is_none() { "confirmed" } else { "failed" },
         "failure": w.failure,
         "sent": w.sent,
@@ -661,7 +684,7 @@ pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option
         "link": link,
         "read_only": false,
         "writable": Setting::ALL.iter().filter(|s| write::ALLOWED.contains(&s.opcode())).map(|s| s.key()).collect::<Vec<_>>(),
-        "verified": ["game_mode", "sleep_mode", "wind_reduction"],
+        "verified": ["game_mode", "sleep_mode", "wind_reduction", "noise_control"],
         "write": write.map_or(Value::Null, write_view),
         "device_name": last.map_or("", |r| r.name.as_str()),
         "address": last.map_or("", |r| r.address.as_str()),
@@ -714,8 +737,8 @@ mod tests {
         let v = current_of(None, None);
         assert_eq!(v["link"]["state"], "none");
         assert_eq!(v["read_only"], false);
-        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction"]));
-        assert_eq!(v["verified"], json!(["game_mode", "sleep_mode", "wind_reduction"]));
+        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
+        assert_eq!(v["verified"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
         assert_eq!(v["write"], Value::Null);
         assert_eq!(v["synced_at"], Value::Null);
         assert_eq!(v["battery"]["left"]["level"], Value::Null);
@@ -779,6 +802,16 @@ mod tests {
             json!({ "kind": "wear_detection", "enabled": true }),
             json!({ "kind": "reapply_on_connect", "enabled": true }),
             json!({ "kind": "noise", "mode": "anc" }),
+            json!({ "kind": "noise_control", "value": 7 }),
+            json!({ "kind": "noise_control", "value": 255 }),
+            json!({ "kind": "noise_control", "value": 256 }),
+            json!({ "kind": "noise_control", "value": -1 }),
+            json!({ "kind": "noise_control", "value": 1.5 }),
+            json!({ "kind": "noise_control", "value": "6" }),
+            json!({ "kind": "noise_control", "enabled": true }),
+            json!({ "kind": "noise_control" }),
+            json!({ "kind": "noise_control", "value": 6, "bytes": [3, 1, 4] }),
+            json!({ "kind": "noise_control", "mode": "transparency" }),
             json!({ "kind": "auto_off", "minutes": 5 }),
             json!({ "kind": "game_mode" }),
             json!({ "kind": "game_mode", "enabled": 1 }),
@@ -823,10 +856,43 @@ mod tests {
     }
 
     #[test]
+    fn the_seven_noise_codes_pass() {
+        for code in 0..=6u8 {
+            assert_eq!(
+                allowed_change(&json!({ "kind": "noise_control", "value": code })),
+                Some((Setting::NoiseControl, code))
+            );
+        }
+    }
+
+    #[test]
+    fn a_noise_write_shows_the_codes() {
+        let w = LastWrite {
+            setting: "noise_control",
+            toggle: false,
+            value: 6,
+            previous: Some(1),
+            max: None,
+            sent: Some("FF0517030301 04".replace(' ', "")),
+            read_back: Some("030104".into()),
+            failure: None,
+            steps: vec![],
+            at_ms: 7,
+        };
+        let v = view_all(Some(&reading()), None, Some(&w));
+        assert_eq!(v["write"]["value"], 6);
+        assert_eq!(v["write"]["previous"], 1);
+        assert_eq!(v["write"]["preset"], "transparency");
+        assert_eq!(v["write"]["previous_preset"], "anc_adaptive");
+        assert_eq!(v["write"]["enabled"], Value::Null);
+        assert_eq!(v["write"]["max"], Value::Null);
+    }
+
+    #[test]
     fn writable_and_verified() {
         let v = view_all(Some(&reading()), None, None);
-        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction"]));
-        assert_eq!(v["verified"], json!(["game_mode", "sleep_mode", "wind_reduction"]));
+        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
+        assert_eq!(v["verified"], json!(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]));
     }
 
     #[test]

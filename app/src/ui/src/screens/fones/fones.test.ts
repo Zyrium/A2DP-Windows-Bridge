@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { parseRoute, routeHash } from "../../app/context";
 import { MockQcy } from "../../ipc/qcyMock";
-import { EQ_BANDS_HZ } from "../../ipc/qcy";
+import { EQ_BANDS_HZ, NOISE_CODES, noiseCode } from "../../ipc/qcy";
 import { EQ_PRESETS, matchPreset } from "../../lib/eqPresets";
-import { canRefresh, curvePath, F2_SETTINGS, promptMax, settingName, windAllowed, writeChange, writeStepLines } from "./Fones";
+import { canRefresh, curvePath, F2_SETTINGS, needsNoiseWarning, noiseChange, noiseText, promptMax, settingName, windAllowed, writeChange, writeStepLines } from "./Fones";
 import { F2_OPCODES, sampleQcyState } from "../../ipc/qcyMock";
 
 describe("fones", () => {
@@ -51,8 +51,8 @@ import { placeholderQcyState } from "../../ipc/qcy";
 describe("placeholder (real build, no qcy_* commands)", () => {
   it("phase 2: reads, one command, read-back; the rest is refused", async () => {
     const q = new MockQcy({ speed: 0, gameOnly: true });
-    expect((await q.state()).writable).toEqual(["game_mode", "sleep_mode", "wind_reduction"]);
-    expect((await q.state()).verified).toEqual(["game_mode", "sleep_mode", "wind_reduction"]);
+    expect((await q.state()).writable).toEqual(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]);
+    expect((await q.state()).verified).toEqual(["game_mode", "sleep_mode", "wind_reduction", "noise_control"]);
     const on = await q.set({ kind: "game_mode", enabled: true });
     expect(on.game_mode).toBe(true);
     expect(on.write).toMatchObject({ status: "confirmed", previous: false, sent: "FF03090101", failure: null });
@@ -105,8 +105,8 @@ describe("Atualizar", () => {
 });
 
 describe("phase 2 (sleep, wind; prompt volume read-only)", () => {
-  it("allowlist is exactly 0x09, 0x10, 0x2A", () => {
-    expect(F2_OPCODES).toEqual({ game_mode: 0x09, sleep_mode: 0x10, wind_reduction: 0x2a });
+  it("allowlist is exactly 0x09, 0x10, 0x2A (+ 0x17 since phase 3)", () => {
+    expect(F2_OPCODES).toEqual({ game_mode: 0x09, sleep_mode: 0x10, wind_reduction: 0x2a, noise_control: 0x17 });
     expect(F2_SETTINGS).toEqual(["game_mode", "sleep_mode", "wind_reduction"]);
     for (const op of Object.values(F2_OPCODES)) expect([0x01, 0x02, 0x03]).not.toContain(op);
   });
@@ -161,3 +161,79 @@ describe("phase 2 (sleep, wind; prompt volume read-only)", () => {
   });
 });
 
+
+describe("phase 3 (noise control 0x17)", () => {
+  it("exactly the seven states of the mockup", () => {
+    expect(NOISE_CODES.map((n) => [n.code, n.bytes])).toEqual([
+      [0, "020000"],
+      [1, "010500"],
+      [2, "010102"],
+      [3, "010202"],
+      [4, "010302"],
+      [5, "010400"],
+      [6, "030104"],
+    ]);
+    expect(noiseCode("off")).toBe(0);
+    expect(noiseCode("transparency", "noisy")).toBe(6);
+    expect(noiseCode("anc", "anti_wind")).toBe(5);
+    expect(noiseCode("anc")).toBe(1);
+  });
+
+  it("sends a code in write mode, the old change in the full mock", async () => {
+    const w = await new MockQcy({ speed: 0, gameOnly: true }).state();
+    expect(w.writable).toContain("noise_control");
+    expect(noiseChange(w, "anc", "indoor")).toEqual({ kind: "noise_control", value: 2 });
+    expect(noiseChange(w, "transparency")).toEqual({ kind: "noise_control", value: 6 });
+    // ANC with no scene picked keeps the scene read
+    expect(noiseChange({ ...w, noise_scene: "noisy" }, "anc")).toEqual({ kind: "noise_control", value: 4 });
+    const full = await new MockQcy({ speed: 0 }).state();
+    expect(noiseChange(full, "off")).toEqual({ kind: "noise", mode: "off" });
+  });
+
+  it("asks before Desligado or Transparência, not for the ANC scenes", async () => {
+    const w = await new MockQcy({ speed: 0, gameOnly: true }).state();
+    expect(w.noise_mode).toBe("anc");
+    expect(needsNoiseWarning(w, "transparency")).toBe(true);
+    expect(needsNoiseWarning(w, "off")).toBe(true);
+    expect(needsNoiseWarning(w, "anc")).toBe(false);
+    expect(needsNoiseWarning({ ...w, noise_mode: "transparency" }, "transparency")).toBe(false);
+    expect(needsNoiseWarning(await new MockQcy({ speed: 0 }).state(), "off")).toBe(false);
+  });
+
+  it("transparency confirmed: 3 bytes read back, wind read again, Desfazer", async () => {
+    const q = new MockQcy({ speed: 0, gameOnly: true });
+    const s = await q.set({ kind: "noise_control", value: 6 });
+    expect(s.noise_mode).toBe("transparency");
+    expect(s.wind_reduction).toBe(false);
+    expect(s.write).toMatchObject({ setting: "noise_control", status: "confirmed", value: 6, previous: 1, sent: "FF051703030104", read_back: "030104" });
+    expect(s.write!.steps.map((x) => x.what)).toEqual(["read_previous", "sent", "read_back", "read_wind"]);
+    expect(s.write!.steps.filter((x) => x.what === "sent")).toHaveLength(1);
+    expect(writeChange(s.write!, "undo")).toEqual({ kind: "noise_control", value: 1 });
+    expect(writeChange(s.write!, "retry")).toEqual({ kind: "noise_control", value: 6 });
+    expect(writeStepLines(s.write!)).toHaveLength(4);
+    expect(noiseText(5)).not.toBe("?");
+    expect(noiseText(9)).toBe("?");
+    expect(settingName("noise_control")).not.toBe("noise_control");
+    // No wind write is ever sent with it
+    expect(q.calls).toEqual([{ kind: "noise_control", value: 6 }]);
+  });
+
+  it("timeout: the mode read stays, nothing re-sent, wind untouched", async () => {
+    const q = new MockQcy({ speed: 0, gameOnly: "fail" });
+    const s = await q.set({ kind: "noise_control", value: 0 });
+    expect(s.write).toMatchObject({ status: "failed", failure: "timeout", read_back: null, previous: 1 });
+    expect(s.write!.steps.filter((x) => x.what === "sent")).toHaveLength(1);
+    expect(s.write!.steps.some((x) => x.what === "read_wind")).toBe(false);
+    expect(s.noise_mode).toBe("anc");
+    expect(s.noise_scene).toBe("adaptive");
+    expect(s.wind_reduction).toBe(true);
+    expect(q.calls).toHaveLength(1);
+  });
+
+  it("refuses codes outside the seven", async () => {
+    const q = new MockQcy({ speed: 0, gameOnly: true });
+    await expect(q.set({ kind: "noise_control", value: 7 })).rejects.toMatchObject({ code: "qcy.read_only" });
+    expect((await q.state()).write).toBeNull();
+    expect(writeChange({ setting: "noise_control", enabled: null, value: 1, previous: 9, status: "confirmed", failure: null, sent: null, read_back: null, steps: [], at_ms: 0 }, "undo")).toBeNull();
+  });
+});
