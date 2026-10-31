@@ -3,7 +3,8 @@ import { parseRoute, routeHash } from "../../app/context";
 import { MockQcy } from "../../ipc/qcyMock";
 import { EQ_BANDS_HZ } from "../../ipc/qcy";
 import { EQ_PRESETS, matchPreset } from "../../lib/eqPresets";
-import { canRefresh, curvePath, writeStepLines } from "./Fones";
+import { canRefresh, curvePath, F2_SETTINGS, promptMax, settingName, windAllowed, writeChange, writeStepLines } from "./Fones";
+import { F2_OPCODES, sampleQcyState } from "../../ipc/qcyMock";
 
 describe("fones", () => {
   it("routes the three views", () => {
@@ -48,19 +49,27 @@ describe("read only (this version)", () => {
 
 import { placeholderQcyState } from "../../ipc/qcy";
 describe("placeholder (real build, no qcy_* commands)", () => {
-  it("game mode only: reads, one command, read-back; the rest is refused", async () => {
+  it("phase 2: reads, one command, read-back; the rest is refused", async () => {
     const q = new MockQcy({ speed: 0, gameOnly: true });
-    expect((await q.state()).writable).toEqual(["game_mode"]);
+    expect((await q.state()).writable).toEqual(["game_mode", "sleep_mode", "wind_reduction"]);
+    expect((await q.state()).verified).toEqual(["game_mode", "sleep_mode", "wind_reduction"]);
     const on = await q.set({ kind: "game_mode", enabled: true });
     expect(on.game_mode).toBe(true);
     expect(on.write).toMatchObject({ status: "confirmed", previous: false, sent: "FF03090101", failure: null });
     expect(on.write!.steps.map((s) => s.what)).toEqual(["read_previous", "sent", "read_back"]);
     expect(writeStepLines(on.write!)).toHaveLength(3);
     // Desfazer: the same flow back to the saved value
-    const undo = await q.set({ kind: "game_mode", enabled: on.write!.previous! });
+    const undo = await q.set({ kind: "game_mode", enabled: on.write!.previous as boolean });
     expect(undo.game_mode).toBe(false);
     expect(undo.write).toMatchObject({ status: "confirmed", previous: true, sent: "FF03090102" });
-    for (const c of [{ kind: "sleep_mode", enabled: true }, { kind: "ldac", enabled: false }, { kind: "noise", mode: "off" }] as const) {
+    for (const c of [
+      { kind: "ldac", enabled: false },
+      { kind: "noise", mode: "off" },
+      { kind: "wear_detection", enabled: false },
+      { kind: "multipoint", enabled: true },
+      { kind: "reapply_on_connect", enabled: true },
+      { kind: "auto_off", minutes: 5 },
+    ] as const) {
       await expect(q.set(c)).rejects.toMatchObject({ code: "qcy.read_only" });
     }
   });
@@ -94,3 +103,61 @@ describe("Atualizar", () => {
     expect(canRefresh(off, false)).toBe(true);
   });
 });
+
+describe("phase 2 (sleep, wind; prompt volume read-only)", () => {
+  it("allowlist is exactly 0x09, 0x10, 0x2A", () => {
+    expect(F2_OPCODES).toEqual({ game_mode: 0x09, sleep_mode: 0x10, wind_reduction: 0x2a });
+    expect(F2_SETTINGS).toEqual(["game_mode", "sleep_mode", "wind_reduction"]);
+    for (const op of Object.values(F2_OPCODES)) expect([0x01, 0x02, 0x03]).not.toContain(op);
+  });
+
+  it("sleep and wind: one frame each, read back, Desfazer", async () => {
+    const q = new MockQcy({ speed: 0, gameOnly: true });
+    const sl = await q.set({ kind: "sleep_mode", enabled: true });
+    expect(sl.sleep_mode).toBe(true);
+    expect(sl.write).toMatchObject({ setting: "sleep_mode", status: "confirmed", previous: false, sent: "FF03100101", read_back: "100101" });
+    expect(writeChange(sl.write!, "undo")).toEqual({ kind: "sleep_mode", enabled: false });
+    expect(writeStepLines(sl.write!)).toHaveLength(3);
+    const wd = await q.set({ kind: "wind_reduction", enabled: false });
+    expect(wd.write).toMatchObject({ setting: "wind_reduction", status: "confirmed", previous: true, sent: "FF032A0102", read_back: "2A0102" });
+    expect(writeChange(wd.write!, "undo")).toEqual({ kind: "wind_reduction", enabled: true });
+    expect(q.calls).toHaveLength(2);
+  });
+
+  it("prompt volume is read-only: refused, nothing sent", async () => {
+    const q = new MockQcy({ speed: 0, gameOnly: true });
+    await expect(q.set({ kind: "prompt_volume", value: 10 })).rejects.toMatchObject({ code: "qcy.read_only" });
+    const s = await q.state();
+    expect(s.prompt_volume).toBe(9);
+    expect(s.write).toBeNull();
+  });
+
+  it("timeout: value kept, nothing re-sent, for every new setting", async () => {
+    for (const c of [{ kind: "sleep_mode", enabled: true }, { kind: "wind_reduction", enabled: false }] as const) {
+      const q = new MockQcy({ speed: 0, gameOnly: "fail" });
+      const s = await q.set(c);
+      expect(s.write).toMatchObject({ status: "failed", failure: "timeout", read_back: null });
+      expect(s.write!.steps.filter((x) => x.what === "sent")).toHaveLength(1);
+      expect(s.sleep_mode).toBe(false);
+      expect(s.wind_reduction).toBe(true);
+      expect(s.prompt_volume).toBe(9);
+      expect(q.calls).toHaveLength(1);
+    }
+  });
+
+  it("wind reduction needs ANC", () => {
+    const s = sampleQcyState();
+    expect(windAllowed({ ...s, noise_mode: "anc" })).toBe(true);
+    expect(windAllowed({ ...s, noise_mode: "off" })).toBe(false);
+    expect(windAllowed({ ...s, noise_mode: "transparency" })).toBe(false);
+    expect(windAllowed({ ...s, noise_mode: null })).toBe(true);
+  });
+
+  it("prompt volume shows the reported level (fallback max 15)", () => {
+    const s = sampleQcyState();
+    expect(promptMax({ ...s, prompt_volume_max: 0 })).toBe(15);
+    expect(promptMax({ ...s, prompt_volume_max: 15 })).toBe(15);
+    expect(settingName("prompt_volume")).not.toBe("prompt_volume");
+  });
+});
+
