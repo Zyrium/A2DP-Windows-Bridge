@@ -157,8 +157,8 @@ pub fn eq_read(got: &[u8]) -> Option<(u8, EqCurve)> {
 }
 
 /// A 0x22 read-back confirms a write when its first ten bands are byte for
-/// byte the ten written (frequency, gain, Q, type). The preset byte (8 or
-/// 1) and the master gain are not compared; the slots after the tenth (the
+/// byte the ten written (frequency, gain, Q, type). The preset byte (8 or 1)
+/// and the master gain are not compared; the slots after the tenth (the
 /// N70 answers 20) are ignored. Anything not comparable: not confirmed.
 pub fn eq_confirms(sent: &[u8], got: &[u8]) -> bool {
     if sent.len() != EQ_PARAMS_LEN || got.len() < EQ_PARAMS_LEN || !(got.len() - 3).is_multiple_of(7) {
@@ -1581,6 +1581,7 @@ mod tests {
     // ---- Phase F4: equalizer (0x22) ----
 
     /// The N70's answer to FE 22: preset, master gain, `slots` bands
+    #[allow(clippy::needless_range_loop)]
     fn eq_answer(preset: u8, curve: &EqCurve, slots: usize) -> Vec<u8> {
         let mut p = vec![preset, 0, 0];
         for i in 0..slots {
