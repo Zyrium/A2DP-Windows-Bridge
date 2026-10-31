@@ -87,7 +87,8 @@ pub enum Setting {
 }
 
 impl Setting {
-    pub const ALL: [Setting; 4] = [Setting::GameMode, Setting::SleepMode, Setting::WindReduction, Setting::PromptVolume];
+    pub const ALL: [Setting; 4] =
+        [Setting::GameMode, Setting::SleepMode, Setting::WindReduction, Setting::PromptVolume];
 
     pub fn opcode(self) -> u8 {
         match self {
