@@ -87,7 +87,7 @@ export function Fones(props: { tab?: string }) {
         <span class="muted sync">
           <Icon name="arrow_sync" /> {syncText()}
         </span>
-        <Button icon="arrow_sync" disabled={busy() || (!live() && !readOnly())} onClick={() => void act((q) => q.refresh())}>
+        <Button icon="arrow_sync" disabled={!canRefresh(state(), busy())} onClick={() => void act((q) => q.refresh())}>
           {ft("refresh")}
         </Button>
         <span class="muted refresh-hint">{ft("refresh_hint")}</span>
@@ -441,6 +441,13 @@ function MainTab(props: {
 const live = (s: QcyState) => s.link.state === "connected";
 
 /** The small curve of a preset chip */
+/** Atualizar: always usable unless busy or already connecting. It is the
+ *  only way to open the headset link after a core restart (link "none"),
+ *  in read-only and writable builds alike; refresh only reads. */
+export function canRefresh(s: QcyState | null | undefined, busy: boolean): boolean {
+  return !busy && s?.link.state !== "connecting";
+}
+
 export function curvePath(gains: number[], w = 56, h = 18): string {
   const y = (g: number) => h / 2 - (g / EQ_GAIN_MAX) * (h / 2 - 1);
   return gains.map((g, i) => `${i ? "L" : "M"}${((i * w) / (gains.length - 1)).toFixed(1)} ${y(g).toFixed(1)}`).join(" ");

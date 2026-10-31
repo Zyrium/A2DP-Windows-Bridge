@@ -3,7 +3,7 @@ import { parseRoute, routeHash } from "../../app/context";
 import { MockQcy } from "../../ipc/qcyMock";
 import { EQ_BANDS_HZ } from "../../ipc/qcy";
 import { EQ_PRESETS, matchPreset } from "../../lib/eqPresets";
-import { curvePath, writeStepLines } from "./Fones";
+import { canRefresh, curvePath, writeStepLines } from "./Fones";
 
 describe("fones", () => {
   it("routes the three views", () => {
@@ -80,5 +80,17 @@ describe("placeholder (real build, no qcy_* commands)", () => {
     expect(s.device_name).toBe("");
     expect(s.battery.left.level).toBeNull();
     expect(s.synced_at).toBeNull();
+  });
+});
+
+describe("Atualizar", () => {
+  it("is enabled with link none in the game-mode build (read_only false)", async () => {
+    const s = { ...(await new MockQcy({ speed: 0, gameOnly: true }).state()), read_only: false, writable: ["game_mode"], link: { state: "none" as const } };
+    expect(canRefresh(s, false)).toBe(true);
+    expect(canRefresh(s, true)).toBe(false);
+    expect(canRefresh({ ...s, link: { state: "connecting" as const } }, false)).toBe(false);
+    const off = await new MockQcy({ speed: 0, unavailable: true }).state();
+    expect(off.link.state).toBe("unavailable");
+    expect(canRefresh(off, false)).toBe(true);
   });
 });
