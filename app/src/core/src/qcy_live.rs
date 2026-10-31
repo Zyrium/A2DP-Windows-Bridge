@@ -173,6 +173,12 @@ pub fn refresh(service: &Service) -> Value {
     match result {
         Ok(r) => {
             tracing::info!("QCY: read {} of {} queries from {}", r.answered, commands::STATE_QUERIES.len(), r.address);
+            // The 0x17 parameter bytes as read (mode, sub-scene, value), so
+            // a "Desligado" on screen can be told apart from a decoding bug
+            match r.state.noise_control {
+                Some(n) => tracing::info!("QCY: 0x17 = {n} ({:?})", n.mode),
+                None => tracing::info!("QCY: 0x17 not read (noise mode unknown)"),
+            }
             c.last = Some(keep_known(c.last.as_ref(), r));
             c.link = None;
         }

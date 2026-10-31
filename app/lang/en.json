@@ -679,7 +679,7 @@
   "fones.tag.verified": "Verified",
   "fones.tag.unverified": "Not verified yet",
   "fones.write_test.title": "Write test",
-  "fones.write_test.text": "This version can change Game mode, Sleep mode, Wind reduction and Prompt volume. Each tap reads the current value, sends 1 command and checks it with the earbuds. Everything else stays read-only.",
+  "fones.write_test.text": "This version can change Game mode, Sleep mode and Wind reduction (Prompt volume is shown read-only). Each tap reads the current value, sends 1 command and checks it with the earbuds. Everything else stays read-only.",
   "fones.write.sending": "Sending… (reading the current value, 1 command, checking)",
   "fones.write.ok_on": "%s on — confirmed by the earbuds",
   "fones.write.ok_off": "%s off — confirmed by the earbuds",
