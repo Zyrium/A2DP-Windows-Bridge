@@ -453,7 +453,9 @@ fn set_eq(service: &Service, curve: &write::EqCurve) -> Value {
     };
     match w.failure {
         None => tracing::info!("QCY write: equalizer confirmed by the earbuds"),
-        Some(f) => tracing::warn!("QCY write: equalizer NOT confirmed ({f}); the screen shows the curve read, nothing is re-sent"),
+        Some(f) => tracing::warn!(
+            "QCY write: equalizer NOT confirmed ({f}); the screen shows the curve read, nothing is re-sent"
+        ),
     }
     c.write = Some(w);
     view_all(c.last.as_ref(), c.link, c.write.as_ref())
@@ -866,7 +868,8 @@ pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option
     // The first ten slots (the N70 answers 20); unknown: zeros, eq_known false
     let eq_known = s.equalizer_gains.len() >= 10;
     let gains: Vec<f64> = if eq_known { s.equalizer_gains[..10].to_vec() } else { vec![0.0; 10] };
-    let original = EQ_ORIGINAL.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(Value::Null, EqOriginal::to_json);
+    let original =
+        EQ_ORIGINAL.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(Value::Null, EqOriginal::to_json);
     let wear = s.wearing_detection.map(|w| w.enabled).or(s.wear_detection_enabled);
     // The 0x2C bytes as read (state, music action, ANC action, tone): the
     // screen shows them; a write copies them from a fresh read, not these
@@ -1279,6 +1282,9 @@ mod tests {
         assert_eq!(v["write"]["previous_preset_index"], 1);
         let o = EqOriginal { preset: 1, curve: [0, 0, 0, 0, 0, 0, 0, 0, 0, 25], saved_at: 5 };
         assert_eq!(EqOriginal::from_json(&o.to_json()), Some(o));
-        assert_eq!(EqOriginal::from_json(&json!({ "preset": 1, "gains": [9, 0, 0, 0, 0, 0, 0, 0, 0, 0], "saved_at": 5 })), None);
+        assert_eq!(
+            EqOriginal::from_json(&json!({ "preset": 1, "gains": [9, 0, 0, 0, 0, 0, 0, 0, 0, 0], "saved_at": 5 })),
+            None
+        );
     }
 }

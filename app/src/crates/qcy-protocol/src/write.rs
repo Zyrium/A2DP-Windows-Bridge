@@ -785,7 +785,8 @@ impl EqOutcome {
 /// answer within `timeout` is a failure; nothing is ever re-sent.
 pub fn run_eq<T: Transport>(t: &mut T, curve: &EqCurve, timeout: Duration) -> EqOutcome {
     let op = opcode::EQUALIZER;
-    let mut out = EqOutcome { curve: *curve, previous: None, sent: None, read_back: None, failure: None, steps: Vec::new() };
+    let mut out =
+        EqOutcome { curve: *curve, previous: None, sent: None, read_back: None, failure: None, steps: Vec::new() };
     // Validate before any traffic
     let frame = match eq_frame(curve) {
         Ok(f) => f,
@@ -859,7 +860,13 @@ pub fn run_eq<T: Transport>(t: &mut T, curve: &EqCurve, timeout: Duration) -> Eq
         Some(p) => {
             let same = commands::EQUALIZER_FREQUENCIES.len();
             let matching = if p.len() >= EQ_PARAMS_LEN {
-                p[3..EQ_PARAMS_LEN].as_chunks::<7>().0.iter().zip(frame[7..].as_chunks::<7>().0).filter(|(a, b)| a == b).count()
+                p[3..EQ_PARAMS_LEN]
+                    .as_chunks::<7>()
+                    .0
+                    .iter()
+                    .zip(frame[7..].as_chunks::<7>().0)
+                    .filter(|(a, b)| a == b)
+                    .count()
             } else {
                 0
             };
@@ -1602,7 +1609,10 @@ mod tests {
         // The same bytes as the crate's own builder (OpenQCY's port)
         let db: Vec<f64> = ROCK.iter().map(|g| f64::from(*g) / 100.0).collect();
         assert_eq!(f[..], commands::build_custom_equalizer(&db, EQ_PRESET_CUSTOM).unwrap()[..]);
-        assert_eq!(eq_frame(&[0; 10]).unwrap()[..14], hex("FF4B22490800001F0000006400 00".replace(' ', "").as_str())[..]);
+        assert_eq!(
+            eq_frame(&[0; 10]).unwrap()[..14],
+            hex("FF4B22490800001F0000006400 00".replace(' ', "").as_str())[..]
+        );
         assert_eq!(eq_frame(&[800, -800, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap()[9..11], [0x20, 0x03]);
     }
 
@@ -1619,7 +1629,15 @@ mod tests {
         };
         // preset not 8, master gain not 0, a moved frequency, Q, type
         for (i, v) in [(0, 1), (0, 0), (1, 1), (2, 0xFF), (3, 0x20), (8, 0x20), (8, 0x65), (9, 1), (73 - 1, 2)] {
-            assert_eq!(bad(i, v), Err(Refused::BadParameters(0x22, { let mut p = good.clone(); p[i] = v; p })), "{i}={v}");
+            assert_eq!(
+                bad(i, v),
+                Err(Refused::BadParameters(0x22, {
+                    let mut p = good.clone();
+                    p[i] = v;
+                    p
+                })),
+                "{i}={v}"
+            );
         }
         // gain +8.01 dB written raw
         let mut p = good.clone();
@@ -1637,7 +1655,10 @@ mod tests {
         assert!(check_value(Setting::Equalizer, 1).is_err());
         // The UI's dB: hundredths, ±8, never clamped
         assert_eq!(eq_curve_from_db(&[4.0, 3.0, 1.5, -0.5, -1.5, -1.0, 1.0, 2.5, 3.5, 3.5]), Some(ROCK));
-        assert_eq!(eq_curve_from_db(&[8.0, -8.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).unwrap()[..3], [800, -800, 1]);
+        assert_eq!(
+            eq_curve_from_db(&[8.0, -8.0, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).unwrap()[..3],
+            [800, -800, 1]
+        );
         assert!(eq_curve_from_db(&[8.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).is_none());
         assert!(eq_curve_from_db(&[0.001, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).is_none());
         assert!(eq_curve_from_db(&[f64::NAN, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).is_none());
@@ -1723,7 +1744,8 @@ mod tests {
                     return Ok(());
                 }
                 self.answers = self.answers.map(|n| n - 1);
-                let a = if self.garbled { vec![1, 0, 0, 0x1F] } else { eq_answer(self.preset, &self.curve, self.slots) };
+                let a =
+                    if self.garbled { vec![1, 0, 0, 0x1F] } else { eq_answer(self.preset, &self.curve, self.slots) };
                 self.inbox.push_back(packet::frame(0x22, &a));
             } else if self.applies {
                 self.curve = eq_read(&frame[4..]).unwrap().1;

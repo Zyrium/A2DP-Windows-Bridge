@@ -278,7 +278,9 @@ mod qcy_tests {
             qcy_allowed(Some(&rock)),
             Some(json!({ "kind": "equalizer", "gains": [4.0, 3.0, 1.5, -0.5, -1.5, -1.0, 1.0, 2.5, 3.5, 3.5] }))
         );
-        assert!(qcy_allowed(Some(&json!({ "kind": "equalizer", "gains": [8, -8, 0, 0, 0, 0, 0, 0, 0, 0.25] }))).is_some());
+        assert!(
+            qcy_allowed(Some(&json!({ "kind": "equalizer", "gains": [8, -8, 0, 0, 0, 0, 0, 0, 0, 0.25] }))).is_some()
+        );
         assert_eq!(qcy_save_profile().unwrap_err().code, "qcy.read_only");
     }
 
