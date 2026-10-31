@@ -111,7 +111,7 @@ export interface Option<T extends string | number> {
 
 export function Segmented<T extends string | number>(props: {
   label: string;
-  value: T;
+  value: T | null;
   options: Option<T>[];
   onChange: (v: T) => void;
 }) {

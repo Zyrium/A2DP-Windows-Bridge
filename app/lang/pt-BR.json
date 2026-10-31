@@ -710,7 +710,5 @@
   "fones.write.step.refused": "Fora do limite do fone ✕ (nada enviado)",
   "fones.sleep.warn": "Atenção: com o Modo sono ligado, os controles de toque dos fones ficam bloqueados até você desligar aqui.",
   "fones.wind.needs_anc": "Ligue o Cancelamento de ruído para usar a Redução de vento.",
-  "fones.prompt_volume.hint": "Cada toque em − ou + envia 1 comando ao fone.",
-  "fones.prompt_volume.down": "Diminuir volume dos avisos",
-  "fones.prompt_volume.up": "Aumentar volume dos avisos"
+  "fones.prompt_volume.readonly": "O fone ainda não aceita a mudança por aqui; só leitura."
 }

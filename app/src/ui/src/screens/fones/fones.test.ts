@@ -3,7 +3,7 @@ import { parseRoute, routeHash } from "../../app/context";
 import { MockQcy } from "../../ipc/qcyMock";
 import { EQ_BANDS_HZ } from "../../ipc/qcy";
 import { EQ_PRESETS, matchPreset } from "../../lib/eqPresets";
-import { canRefresh, curvePath, promptMax, settingName, stepperNext, windAllowed, writeChange, writeStepLines } from "./Fones";
+import { canRefresh, curvePath, F2_SETTINGS, promptMax, settingName, windAllowed, writeChange, writeStepLines } from "./Fones";
 import { F2_OPCODES, sampleQcyState } from "../../ipc/qcyMock";
 
 describe("fones", () => {
@@ -51,7 +51,7 @@ import { placeholderQcyState } from "../../ipc/qcy";
 describe("placeholder (real build, no qcy_* commands)", () => {
   it("phase 2: reads, one command, read-back; the rest is refused", async () => {
     const q = new MockQcy({ speed: 0, gameOnly: true });
-    expect((await q.state()).writable).toEqual(["game_mode", "sleep_mode", "wind_reduction", "prompt_volume"]);
+    expect((await q.state()).writable).toEqual(["game_mode", "sleep_mode", "wind_reduction"]);
     expect((await q.state()).verified).toEqual(["game_mode"]);
     const on = await q.set({ kind: "game_mode", enabled: true });
     expect(on.game_mode).toBe(true);
@@ -104,9 +104,10 @@ describe("Atualizar", () => {
   });
 });
 
-describe("phase 2 (sleep, wind, prompt volume)", () => {
-  it("allowlist is exactly 0x09, 0x10, 0x2A, 0x1D", () => {
-    expect(F2_OPCODES).toEqual({ game_mode: 0x09, sleep_mode: 0x10, wind_reduction: 0x2a, prompt_volume: 0x1d });
+describe("phase 2 (sleep, wind; prompt volume read-only)", () => {
+  it("allowlist is exactly 0x09, 0x10, 0x2A", () => {
+    expect(F2_OPCODES).toEqual({ game_mode: 0x09, sleep_mode: 0x10, wind_reduction: 0x2a });
+    expect(F2_SETTINGS).toEqual(["game_mode", "sleep_mode", "wind_reduction"]);
     for (const op of Object.values(F2_OPCODES)) expect([0x01, 0x02, 0x03]).not.toContain(op);
   });
 
@@ -123,25 +124,16 @@ describe("phase 2 (sleep, wind, prompt volume)", () => {
     expect(q.calls).toHaveLength(2);
   });
 
-  it("prompt volume: one frame per step, exact read-back, Desfazer to the saved level", async () => {
+  it("prompt volume is read-only: refused, nothing sent", async () => {
     const q = new MockQcy({ speed: 0, gameOnly: true });
-    const s = await q.set({ kind: "prompt_volume", value: 10 });
-    expect(s.prompt_volume).toBe(10);
-    expect(s.write).toMatchObject({ setting: "prompt_volume", value: 10, previous: 9, max: 15, status: "confirmed", sent: "FF031D010A", read_back: "1D020A0F" });
-    expect(writeChange(s.write!, "undo")).toEqual({ kind: "prompt_volume", value: 9 });
-    expect(writeChange(s.write!, "retry")).toEqual({ kind: "prompt_volume", value: 10 });
-    expect(writeStepLines(s.write!)[1]).toContain("10/15");
-  });
-
-  it("prompt volume above the reported max is not sent", async () => {
-    const q = new MockQcy({ speed: 0, gameOnly: true });
-    const s = await q.set({ kind: "prompt_volume", value: 16 });
+    await expect(q.set({ kind: "prompt_volume", value: 10 })).rejects.toMatchObject({ code: "qcy.read_only" });
+    const s = await q.state();
     expect(s.prompt_volume).toBe(9);
-    expect(s.write).toMatchObject({ status: "failed", failure: "out_of_range", sent: null });
+    expect(s.write).toBeNull();
   });
 
   it("timeout: value kept, nothing re-sent, for every new setting", async () => {
-    for (const c of [{ kind: "sleep_mode", enabled: true }, { kind: "wind_reduction", enabled: false }, { kind: "prompt_volume", value: 10 }] as const) {
+    for (const c of [{ kind: "sleep_mode", enabled: true }, { kind: "wind_reduction", enabled: false }] as const) {
       const q = new MockQcy({ speed: 0, gameOnly: "fail" });
       const s = await q.set(c);
       expect(s.write).toMatchObject({ status: "failed", failure: "timeout", read_back: null });
@@ -158,17 +150,13 @@ describe("phase 2 (sleep, wind, prompt volume)", () => {
     expect(windAllowed({ ...s, noise_mode: "anc" })).toBe(true);
     expect(windAllowed({ ...s, noise_mode: "off" })).toBe(false);
     expect(windAllowed({ ...s, noise_mode: "transparency" })).toBe(false);
+    expect(windAllowed({ ...s, noise_mode: null })).toBe(true);
   });
 
-  it("stepper: one level per tap, clamped to 0..max (fallback 15)", () => {
+  it("prompt volume shows the reported level (fallback max 15)", () => {
     const s = sampleQcyState();
-    expect(stepperNext({ ...s, prompt_volume: 9 }, 1)).toBe(10);
-    expect(stepperNext({ ...s, prompt_volume: 9 }, -1)).toBe(8);
-    expect(stepperNext({ ...s, prompt_volume: 15 }, 1)).toBeNull();
-    expect(stepperNext({ ...s, prompt_volume: 0 }, -1)).toBeNull();
-    expect(stepperNext({ ...s, prompt_volume: 4, prompt_volume_max: 4 }, 1)).toBeNull();
     expect(promptMax({ ...s, prompt_volume_max: 0 })).toBe(15);
-    expect(stepperNext({ ...s, prompt_volume: 40, prompt_volume_max: 0 }, -1)).toBe(14);
+    expect(promptMax({ ...s, prompt_volume_max: 15 })).toBe(15);
     expect(settingName("prompt_volume")).not.toBe("prompt_volume");
   });
 });

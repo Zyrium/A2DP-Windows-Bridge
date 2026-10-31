@@ -1,13 +1,14 @@
 //! Changing a setting of the earbuds: the ONLY place that frames a write.
 //!
-//! Phase F2 (plano_escrita_qcy.md): four settings may change. Everything
+//! Phase F2 (plano_escrita_qcy.md): three settings may change. Everything
 //! else is refused here, whatever the caller asks:
 //!
-//! - [`ALLOWED`]: exactly 0x09 game mode, 0x10 sleep mode, 0x2A wind
-//!   reduction (on/off: one parameter byte, `01` on or `02` off) and 0x1D
-//!   prompt volume (one parameter byte, 0..=[`PROMPT_VOLUME_LIMIT`]; [`run`]
-//!   also refuses a value above the maximum the earbuds report). Any other
+//! - [`ALLOWED`]: exactly 0x09 game mode, 0x10 sleep mode and 0x2A wind
+//!   reduction (on/off: one parameter byte, `01` on or `02` off). Any other
 //!   opcode, length or value: [`Refused`].
+//! - 0x1D prompt volume is NOT written (fase 2b): on the N70 every
+//!   `FF 03 1D 01 <v>` read back the old level (04/0F, 2026-10-31), so it
+//!   stays read-only until the earbuds' answer is understood.
 //! - [`BLOCKED`]: opcodes that are never written, even if a later phase
 //!   widens [`ALLOWED`] by mistake (restore defaults, clear pairings,
 //!   factory reset, test modes, standby, rename, fit/EQ tests).
@@ -54,7 +55,11 @@ use crate::commands::{self, opcode};
 use crate::packet;
 
 /// The opcodes this build may write (exactly these four)
-pub const ALLOWED: [u8; 4] = [opcode::GAME_MODE, opcode::SLEEP_MODE, opcode::WIND_DETECTION, opcode::PROMPT_VOLUME];
+pub const ALLOWED: [u8; 3] = [opcode::GAME_MODE, opcode::SLEEP_MODE, opcode::WIND_DETECTION];
+
+/// How long the raw notifications of 1002 are kept after a write (logged as
+/// `notify` steps; at most half the timeout)
+pub const NOTIFY_WINDOW: Duration = Duration::from_millis(500);
 
 /// The largest prompt volume ever framed (Quicky: the default maximum when
 /// the earbuds report none); [`run`] also caps it at the reported maximum
@@ -83,12 +88,14 @@ pub enum Setting {
     GameMode,
     SleepMode,
     WindReduction,
+    /// Read-only in this build: not in [`Setting::ALL`] nor [`ALLOWED`], so
+    /// [`run`] refuses it before any traffic
     PromptVolume,
 }
 
 impl Setting {
-    pub const ALL: [Setting; 4] =
-        [Setting::GameMode, Setting::SleepMode, Setting::WindReduction, Setting::PromptVolume];
+    /// The writable settings (prompt volume is read-only)
+    pub const ALL: [Setting; 3] = [Setting::GameMode, Setting::SleepMode, Setting::WindReduction];
 
     pub fn opcode(self) -> u8 {
         match self {
@@ -152,7 +159,6 @@ pub fn build(op: u8, parameters: &[u8]) -> Result<Vec<u8>, Refused> {
         (opcode::GAME_MODE | opcode::SLEEP_MODE | opcode::WIND_DETECTION, [0x01] | [0x02]) => {
             Ok(packet::frame(op, parameters))
         }
-        (opcode::PROMPT_VOLUME, [v]) if *v <= PROMPT_VOLUME_LIMIT => Ok(packet::frame(op, parameters)),
         _ => Err(Refused::BadParameters(op, parameters.to_vec())),
     }
 }
@@ -384,10 +390,20 @@ pub fn run<T: Transport>(t: &mut T, setting: Setting, value: u8, timeout: Durati
     out.sent = Some(frame.clone());
     out.steps.push(Step { what: "sent", detail: packet::to_hex(&frame) });
 
-    // 3. Read back (an echo of the write is not taken as the read-back:
-    //    what came before the request is discarded)
-    std::thread::sleep(Duration::from_millis(150).min(timeout / 4));
-    drain(t);
+    // 3. The raw notifications of 1002 right after the write (an ack, an
+    //    echo or a state push), kept as steps for the log; none of them is
+    //    taken as the read-back
+    let listen_until = written + NOTIFY_WINDOW.min(timeout / 2);
+    while let Some(left) = listen_until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
+        if let Some(v) = t.recv(left) {
+            out.steps.push(Step { what: "notify", detail: packet::to_hex(&v) });
+        }
+    }
+    while let Some(v) = t.recv(Duration::ZERO) {
+        out.steps.push(Step { what: "notify", detail: packet::to_hex(&v) });
+    }
+
+    // 4. Read back
     let deadline = written + timeout;
     let got = t.send(&request).ok().and_then(|()| wait_for(t, op, deadline));
     let sent_params = &frame[4..];
@@ -440,25 +456,23 @@ mod tests {
         assert_eq!(toggle_frame(Setting::SleepMode, false).unwrap(), hex("FF03 10 01 02"));
         assert_eq!(toggle_frame(Setting::WindReduction, true).unwrap(), hex("FF03 2A 01 01"));
         assert_eq!(toggle_frame(Setting::WindReduction, false).unwrap(), hex("FF03 2A 01 02"));
-        assert_eq!(frame_for(Setting::PromptVolume, 12).unwrap(), hex("FF03 1D 01 0C"));
-        assert_eq!(frame_for(Setting::PromptVolume, 0).unwrap(), hex("FF03 1D 01 00"));
+        // Prompt volume is read-only in this build
+        assert_eq!(frame_for(Setting::PromptVolume, 12), Err(Refused::NotAllowed(0x1D)));
         // The same bytes as the crate's builders (ports of OpenQCY-Desktop)
         assert_eq!(toggle_frame(Setting::SleepMode, true).unwrap(), commands::set_sleep_mode(true));
         assert_eq!(toggle_frame(Setting::WindReduction, false).unwrap(), commands::set_wind_detection(false));
-        assert_eq!(frame_for(Setting::PromptVolume, 15).unwrap(), commands::set_prompt_volume(15));
         // A level is not a toggle
         assert!(toggle_frame(Setting::PromptVolume, true).is_err());
     }
 
     #[test]
-    fn exactly_the_four_settings_are_allowed() {
-        assert_eq!(ALLOWED, [0x09, 0x10, 0x2A, 0x1D]);
+    fn exactly_the_three_settings_are_allowed() {
+        assert_eq!(ALLOWED, [0x09, 0x10, 0x2A]);
         for op in 0..=u8::MAX {
             for p in [&[0x01u8][..], &[0x02], &[0x00], &[0x0F], &[0x64], &[0x65], &[0xFF], &[0x01, 0x02], &[]] {
                 let r = build(op, p);
                 let ok = match op {
                     0x09 | 0x10 | 0x2A => p == [0x01] || p == [0x02],
-                    0x1D => p.len() == 1 && p[0] <= PROMPT_VOLUME_LIMIT,
                     _ => false,
                 };
                 assert_eq!(r.is_ok(), ok, "0x{op:02X} {p:?}");
@@ -467,7 +481,8 @@ mod tests {
         assert_eq!(build(0x09, &[0x03]), Err(Refused::BadParameters(0x09, vec![3])));
         assert_eq!(build(0x10, &[0x00]), Err(Refused::BadParameters(0x10, vec![0])));
         assert_eq!(build(0x2A, &[]), Err(Refused::BadParameters(0x2A, vec![])));
-        assert_eq!(build(0x1D, &[0x04, 0x0F]), Err(Refused::BadParameters(0x1D, vec![4, 15])));
+        assert_eq!(build(0x1D, &[0x04]), Err(Refused::NotAllowed(0x1D)));
+        assert!(Setting::from_kind("prompt_volume").is_none());
         assert_eq!(build(0x23, &[0x01]), Err(Refused::NotAllowed(0x23)));
         assert_eq!(build(0x24, &[0x01]), Err(Refused::NotAllowed(0x24)));
         assert_eq!(build(0x2C, &[0x01]), Err(Refused::NotAllowed(0x2C)));
@@ -686,43 +701,29 @@ mod tests {
     }
 
     #[test]
-    fn prompt_volume_one_step() {
-        let mut m = Mock::new(9);
-        m.max = 15;
-        let o = run(&mut m, Setting::PromptVolume, 10, T);
-        assert!(o.confirmed(), "{o:?}");
-        assert_eq!((o.previous, o.max), (Some(9), Some(15)));
-        assert_eq!(m.sent[0], hex("FF03FE011D"));
-        assert_eq!(m.writes(), [&hex("FF031D010A")]);
-        assert_eq!(o.read_back, Some(vec![10, 15]));
-        let undo = run(&mut m, Setting::PromptVolume, o.previous.unwrap(), T);
-        assert!(undo.confirmed());
-        assert_eq!(m.state, 9);
+    fn prompt_volume_is_refused_before_any_traffic() {
+        for v in [0, 5, 10, 15, 0xFF] {
+            let mut m = Mock::new(4);
+            m.max = 15;
+            let o = run(&mut m, Setting::PromptVolume, v, T);
+            assert_eq!(o.failure, Some(Failure::OutOfRange), "{o:?}");
+            assert!(m.sent.is_empty(), "nothing sent for {v}");
+            assert_eq!(o.sent, None);
+        }
     }
 
     #[test]
-    fn prompt_volume_above_the_reported_maximum_is_not_sent() {
-        let mut m = Mock::new(15);
-        m.max = 15;
-        let o = run(&mut m, Setting::PromptVolume, 16, T);
-        assert_eq!(o.failure, Some(Failure::OutOfRange));
-        assert!(m.writes().is_empty());
-        assert_eq!(o.sent, None);
-        let mut m = Mock::new(15);
-        let o = run(&mut m, Setting::PromptVolume, 0xFF, T);
-        assert_eq!(o.failure, Some(Failure::OutOfRange));
-        assert!(m.writes().is_empty());
-        assert!(m.sent.is_empty(), "refused before any traffic");
-    }
-
-    #[test]
-    fn prompt_volume_mismatch_and_timeout() {
-        let mut m = Mock::new(4);
-        m.max = 15;
+    fn notifications_after_the_write_are_logged_not_confirmations() {
+        let mut m = Mock::new(0x02);
         m.applies = false;
         m.echo = true;
-        let o = run(&mut m, Setting::PromptVolume, 5, T);
+        let o = run_toggle(&mut m, Setting::SleepMode, true, T);
         assert_eq!(o.failure, Some(Failure::Mismatch));
-        assert_eq!(m.writes().len(), 1);
+        let notes: Vec<_> = o.steps.iter().filter(|s| s.what == "notify").map(|s| s.detail.as_str()).collect();
+        assert_eq!(notes, ["FF03100101"]);
+        assert_eq!(
+            o.steps.iter().map(|s| s.what).collect::<Vec<_>>(),
+            ["read_previous", "sent", "notify", "read_back"]
+        );
     }
 }

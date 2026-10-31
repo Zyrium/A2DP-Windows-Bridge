@@ -309,7 +309,7 @@ function WriteBanner(props: { s: QcyState; busy: boolean; send: (c: QcyChange) =
 }
 
 /** The writable settings of this version (phase F2) */
-export const F2_SETTINGS = ["game_mode", "sleep_mode", "wind_reduction", "prompt_volume"] as const;
+export const F2_SETTINGS = ["game_mode", "sleep_mode", "wind_reduction"] as const;
 
 /** The name a setting has on screen */
 export function settingName(k: string): string {
@@ -355,22 +355,15 @@ export function writeChange(w: QcyWrite, which: "retry" | "undo"): QcyChange | n
   return null;
 }
 
-/** Wind reduction only works with noise cancelling on */
+/** Wind reduction only works with noise cancelling on; an unread mode
+ *  (null) does not grey it, the read-back confirms the write */
 export function windAllowed(s: QcyState): boolean {
-  return s.noise_mode === "anc";
+  return s.noise_mode === "anc" || s.noise_mode === null;
 }
 
 /** The prompt volume's maximum: what the earbuds reported, else 15 */
 export function promptMax(s: QcyState): number {
   return s.prompt_volume_max > 0 ? s.prompt_volume_max : 15;
-}
-
-/** The level one −/+ tap asks for, or null at the ends (no command) */
-export function stepperNext(s: QcyState, delta: -1 | 1): number | null {
-  const max = promptMax(s);
-  const cur = Math.max(0, Math.min(max, Math.round(s.prompt_volume)));
-  const next = cur + delta;
-  return next < 0 || next > max ? null : next;
 }
 
 function failureText(f: QcyWrite["failure"]) {
@@ -721,16 +714,13 @@ function SettingsTab(props: {
 }) {
   const s = () => props.s;
   const can = (k: string) => props.can?.(k) ?? true;
-  const ok = (k: string) => props.verified?.includes(k) === true;
-  /** In the partial (write test) mode everything but the prompt volume
-   *  stays greyed and inert */
+  /** In the partial (write test) mode this tab stays greyed and inert
+   *  (the prompt volume is shown, read-only) */
   const locked = (k: string) => props.partial === true && !can(k);
   const lockAll = () => props.partial === true;
-  const [vol, setVol] = createSignal(s().prompt_volume);
   // The switch stays on until the dialog's answer: the click flipped the
   // native checkbox, so it is put back (off -> on makes Solid set it again)
   const [ldacUi, setLdacUi] = createSignal(true);
-  createEffect(() => setVol(s().prompt_volume));
   const savedAt = () => {
     const t = s().profile_saved_at;
     return t === null ? ft("profile.none") : new Date(t).toLocaleString(lang(), { dateStyle: "short", timeStyle: "short" });
@@ -756,34 +746,16 @@ function SettingsTab(props: {
         />
         <Toggle label={ft("multipoint")} hint={ft("multipoint.hint")} checked={s().multipoint} onChange={(enabled) => void props.send({ kind: "multipoint", enabled })} />
         </div>
-        <Show
-          when={props.partial}
-          fallback={
-            <div class="row">
-              <div class="row-text">
-                <span class="row-label">{ft("prompt_volume")}</span>
-              </div>
-              <div class="range">
-                <input
-                  type="range"
-                  min={0}
-                  max={s().prompt_volume_max}
-                  step={1}
-                  value={vol()}
-                  aria-label={ft("prompt_volume")}
-                  onInput={(e) => setVol(Number(e.currentTarget.value))}
-                  onChange={(e) => void props.send({ kind: "prompt_volume", value: Number(e.currentTarget.value) })}
-                />
-                <span class="num">
-                  {vol()}/{s().prompt_volume_max}
-                </span>
-              </div>
-            </div>
-          }
-        >
-          <PromptVolumeStepper s={s()} send={props.send} busy={props.busy === true} can={can("prompt_volume")} verified={ok("prompt_volume")} />
-          <Show when={s().write?.setting === "prompt_volume" ? s().write : null}>{(w) => <WriteSteps w={w()} />}</Show>
-        </Show>
+        {/* Read-only: the N70 did not take 0x1D writes (fase 2b) */}
+        <div class="row">
+          <div class="row-text">
+            <span class="row-label">{ft("prompt_volume")}</span>
+            <span class="hint">{ft("prompt_volume.readonly")}</span>
+          </div>
+          <span class="num">
+            {Math.max(0, Math.min(promptMax(s()), s().prompt_volume))}/{promptMax(s())}
+          </span>
+        </div>
         <div class="fones-lock" classList={{ locked: lockAll() }} inert={lockAll() ? true : undefined}>
         <div class="row">
           <div class="row-text">
@@ -816,38 +788,3 @@ function SettingsTab(props: {
   );
 }
 
-/** Volume dos avisos in the write test: − and + send ONE command per tap
- *  (the next level), never past 0 or the maximum the earbuds reported
- *  (15 when none); both are off while a write is in flight. */
-function PromptVolumeStepper(props: { s: QcyState; send: (c: QcyChange) => Promise<boolean>; busy: boolean; can: boolean; verified: boolean }) {
-  const down = () => stepperNext(props.s, -1);
-  const up = () => stepperNext(props.s, 1);
-  const tap = (v: number | null) => {
-    if (v === null || props.busy || !props.can) return;
-    void props.send({ kind: "prompt_volume", value: v });
-  };
-  return (
-    <div class="row stepper-row">
-      <div class="row-text">
-        <span class="row-label">
-          {ft("prompt_volume")}{" "}
-          <span class="codec-badge fones-tag" classList={{ "tag-verified": props.can && props.verified, "tag-testing": props.can && !props.verified, "tag-unverified": !props.can }}>
-            {ft(!props.can ? "tag.unverified" : props.verified ? "tag.verified" : "tag.testing")}
-          </span>
-        </span>
-        <span class="hint">{props.busy ? ft("write.sending") : ft("prompt_volume.hint")}</span>
-      </div>
-      <div class="stepper">
-        <Button aria-label={ft("prompt_volume.down")} disabled={props.busy || !props.can || down() === null} onClick={() => tap(down())}>
-          −
-        </Button>
-        <span class="num" aria-live="polite">
-          {Math.max(0, Math.min(promptMax(props.s), props.s.prompt_volume))}/{promptMax(props.s)}
-        </span>
-        <Button aria-label={ft("prompt_volume.up")} disabled={props.busy || !props.can || up() === null} onClick={() => tap(up())}>
-          +
-        </Button>
-      </div>
-    </div>
-  );
-}

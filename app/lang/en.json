@@ -710,7 +710,5 @@
   "fones.write.step.refused": "Outside the earbuds' range ✕ (nothing sent)",
   "fones.sleep.warn": "Note: with Sleep mode on, the earbuds' touch controls stay locked until you turn it off here.",
   "fones.wind.needs_anc": "Turn on Noise cancelling to use Wind reduction.",
-  "fones.prompt_volume.hint": "Each tap on − or + sends 1 command to the earbuds.",
-  "fones.prompt_volume.down": "Lower prompt volume",
-  "fones.prompt_volume.up": "Raise prompt volume"
+  "fones.prompt_volume.readonly": "The earbuds don't accept this change from here yet; read only."
 }

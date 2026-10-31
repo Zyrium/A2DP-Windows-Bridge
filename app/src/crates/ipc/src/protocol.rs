@@ -779,8 +779,8 @@ pub enum Method {
     QcyReconnect,
     /// Changes ONE setting of the QCY earbuds: kind "game_mode",
     /// "sleep_mode" or "wind_reduction" with `enabled` (opcodes 0x09 / 0x10 /
-    /// 0x2A, 01/02), or "prompt_volume" with `value` (0x1D, one level byte,
-    /// at most the maximum the earbuds report); anything else is refused
+    /// 0x2A, 01/02); anything else (the prompt volume 0x1D too: read-only)
+    /// is refused
     /// with qcy.read_only before any Bluetooth traffic. Reads the old value,
     /// sends one command, reads it back (3 s each) -> QcyState with `write`
     /// (confirmed or failed, never re-sent); also sent as Event::Qcy

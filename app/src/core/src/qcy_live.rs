@@ -1,10 +1,10 @@
 //! The Fones screen's QCY reads (MeloBuds N70): `qcy.state`, `qcy.refresh`,
 //! `qcy.reconnect` and the `qcy` event, plus ONE write per click: `qcy.set`
-//! for game mode, sleep mode, wind reduction or the prompt volume (phase
-//! F2). The reads only send the `FF 03 FE <op>` state requests
+//! for game mode, sleep mode or wind reduction (phase F2; the prompt
+//! volume is read-only since fase 2b: the N70 did not take 0x1D). The reads only send the `FF 03 FE <op>` state requests
 //! of [`commands::STATE_QUERIES`] (opcode 0xFE). The write goes through
-//! [`qcy_protocol::write`] (allowlist: 0x09 / 0x10 / 0x2A with 01/02, 0x1D
-//! with one level byte; every other change is refused before any Bluetooth traffic) and only on an
+//! [`qcy_protocol::write`] (allowlist: 0x09 / 0x10 / 0x2A with 01/02;
+//! every other change is refused before any Bluetooth traffic) and only on an
 //! explicit qcy.set: never when the app opens or the link comes up.
 //! `le_connect_plain` never pairs.
 //!
@@ -173,7 +173,7 @@ pub fn refresh(service: &Service) -> Value {
     match result {
         Ok(r) => {
             tracing::info!("QCY: read {} of {} queries from {}", r.answered, commands::STATE_QUERIES.len(), r.address);
-            c.last = Some(r);
+            c.last = Some(keep_known(c.last.as_ref(), r));
             c.link = None;
         }
         Err(why) => {
@@ -184,26 +184,31 @@ pub fn refresh(service: &Service) -> Value {
     view_all(c.last.as_ref(), c.link, c.write.as_ref())
 }
 
+/// A read that missed 0x17 keeps the last good noise control of the same
+/// earbuds (the screen showed "Desligado" when ANC was simply unanswered)
+fn keep_known(previous: Option<&Reading>, mut r: Reading) -> Reading {
+    if r.state.noise_control.is_none()
+        && let Some(p) = previous.filter(|p| p.address == r.address)
+    {
+        r.state.noise_control = p.state.noise_control;
+    }
+    r
+}
+
 /// A change the UI asked for (`qcy.set`) that this version accepts, as the
 /// setting and its write parameter byte; None (nothing sent) for anything
 /// else. Only `{ "kind": "game_mode" | "sleep_mode" | "wind_reduction",
-/// "enabled": bool }` and `{ "kind": "prompt_volume", "value": 0..=100 }`
-/// pass (the reported maximum is checked again before the write).
+/// "enabled": bool }` passes (the prompt volume is read-only).
 pub fn allowed_change(change: &Value) -> Option<(Setting, u8)> {
     let setting = Setting::from_kind(change.get("kind")?.as_str()?)?;
     // Exactly kind + one value: no extra parameters ride along
     if change.as_object()?.len() != 2 {
         return None;
     }
-    let value = if setting.is_toggle() {
-        write::on_off(change.get("enabled")?.as_bool()?)
-    } else {
-        let v = change.get("value")?.as_u64()?;
-        if v > u64::from(write::PROMPT_VOLUME_LIMIT) {
-            return None;
-        }
-        v as u8
-    };
+    if !setting.is_toggle() {
+        return None;
+    }
+    let value = write::on_off(change.get("enabled")?.as_bool()?);
     // The same check the frame builder makes
     write::frame_for(setting, value).ok()?;
     Some((setting, value))
@@ -518,6 +523,10 @@ fn query(host: &BtHost, id: bt_host::LeDeviceId, services: &[GattService]) -> Re
     let sent = commands::STATE_QUERIES.len();
     let mut answered = collect(&responses, &mut state, &mut pending, ANSWERS_TIMEOUT);
     answered = answered.min(sent);
+    if !pending.is_empty() {
+        let ops: Vec<String> = pending.iter().map(|op| format!("0x{op:02X}")).collect();
+        tracing::info!("QCY: no answer to {}", ops.join(" "));
+    }
     if answered == 0 && state.battery.left.is_none() && state.firmware_version.is_none() {
         return Err(Unavailable::Timeout);
     }
@@ -615,11 +624,11 @@ pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option
     let battery = |level: Option<u8>, charging: bool| json!({ "level": level, "charging": charging });
     let (noise_mode, noise_scene) = match s.noise_control {
         Some(n) => (
-            match n.mode {
+            Some(match n.mode {
                 NoiseMode::NoiseCancellation => "anc",
                 NoiseMode::Transparency => "transparency",
                 NoiseMode::Normal => "off",
-            },
+            }),
             match n.scene {
                 Some(NoiseScene::Indoor) => "indoor",
                 Some(NoiseScene::Commuting) => "commuting",
@@ -628,7 +637,9 @@ pub fn view_all(last: Option<&Reading>, link: Option<Unavailable>, write: Option
                 Some(NoiseScene::Adaptive) | None => "adaptive",
             },
         ),
-        None => ("off", "adaptive"),
+        // 0x17 not answered in this read: unknown, never "off" (the N70
+        // reported ANC adaptive while the screen showed Desligado)
+        None => (None, "adaptive"),
     };
     let mut left = serde_json::Map::new();
     let mut right = serde_json::Map::new();
@@ -697,11 +708,12 @@ mod tests {
         let v = current_of(None, None);
         assert_eq!(v["link"]["state"], "none");
         assert_eq!(v["read_only"], false);
-        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction", "prompt_volume"]));
+        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction"]));
         assert_eq!(v["verified"], json!(["game_mode"]));
         assert_eq!(v["write"], Value::Null);
         assert_eq!(v["synced_at"], Value::Null);
         assert_eq!(v["battery"]["left"]["level"], Value::Null);
+        assert_eq!(v["noise_mode"], Value::Null, "0x17 unread is unknown, not off");
     }
 
     fn current_of(r: Option<&Reading>, l: Option<Unavailable>) -> Value {
@@ -755,8 +767,6 @@ mod tests {
             allowed_change(&json!({ "kind": "wind_reduction", "enabled": false })),
             Some((Setting::WindReduction, 0x02))
         );
-        assert_eq!(allowed_change(&json!({ "kind": "prompt_volume", "value": 12 })), Some((Setting::PromptVolume, 12)));
-        assert_eq!(allowed_change(&json!({ "kind": "prompt_volume", "value": 0 })), Some((Setting::PromptVolume, 0)));
         for c in [
             json!({ "kind": "ldac", "enabled": false }),
             json!({ "kind": "multipoint", "enabled": true }),
@@ -769,6 +779,8 @@ mod tests {
             json!({ "kind": "game_mode", "enabled": true, "opcode": 3 }),
             json!({ "kind": "sleep_mode", "value": 1 }),
             json!({ "kind": "prompt_volume", "enabled": true }),
+            json!({ "kind": "prompt_volume", "value": 12 }),
+            json!({ "kind": "prompt_volume", "value": 0 }),
             json!({ "kind": "prompt_volume", "value": 101 }),
             json!({ "kind": "prompt_volume", "value": 256 }),
             json!({ "kind": "prompt_volume", "value": -1 }),
@@ -782,9 +794,32 @@ mod tests {
     }
 
     #[test]
+    fn a_read_without_0x17_keeps_the_last_noise_control() {
+        let mut good = reading();
+        good.state.noise_control =
+            Some(commands::NoiseControlState::create(NoiseMode::NoiseCancellation, NoiseScene::Adaptive));
+        let mut miss = reading();
+        miss.state.noise_control = None;
+        let kept = keep_known(Some(&good), miss.clone());
+        assert_eq!(kept.state.noise_control, good.state.noise_control);
+        assert_eq!(view(Some(&kept), None)["noise_mode"], "anc");
+        // Another headset, or nothing before: unknown (null), never "off"
+        let mut other = miss.clone();
+        other.address = "AA:BB:CC:DD:EE:FF".into();
+        assert_eq!(keep_known(Some(&good), other).state.noise_control, None);
+        let none = keep_known(None, miss);
+        assert_eq!(view(Some(&none), None)["noise_mode"], Value::Null);
+        // A fresh answer wins over the kept one
+        let mut fresh = reading();
+        fresh.state.noise_control =
+            Some(commands::NoiseControlState::create(NoiseMode::Transparency, NoiseScene::Adaptive));
+        assert_eq!(keep_known(Some(&good), fresh.clone()).state.noise_control, fresh.state.noise_control);
+    }
+
+    #[test]
     fn writable_and_verified() {
         let v = view_all(Some(&reading()), None, None);
-        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction", "prompt_volume"]));
+        assert_eq!(v["writable"], json!(["game_mode", "sleep_mode", "wind_reduction"]));
         assert_eq!(v["verified"], json!(["game_mode"]));
     }
 

@@ -131,9 +131,9 @@ pub fn update_install(app: AppHandle, manifest_url: String) -> Result<(), String
 
 // The Fones screen's QCY earbuds (ipc/qcy.ts): state, refresh and reconnect
 // go to the core (qcy.*). qcy_set forwards ONLY { kind: "game_mode" |
-// "sleep_mode" | "wind_reduction", enabled: bool } or { kind:
-// "prompt_volume", value: 0..=100 } (the core and the protocol crate check
-// again); every other change and save_profile are refused here, before the
+// "sleep_mode" | "wind_reduction", enabled: bool } (the core and the
+// protocol crate check again); every other change (the prompt volume too:
+// read-only since fase 2b) and save_profile are refused here, before the
 // core.
 
 fn qcy_read_only() -> ErrorInfo {
@@ -165,10 +165,6 @@ fn qcy_allowed(change: Option<&Value>) -> Option<Value> {
         kind @ ("game_mode" | "sleep_mode" | "wind_reduction") => {
             let enabled = c.get("enabled")?.as_bool()?;
             Some(serde_json::json!({ "kind": kind, "enabled": enabled }))
-        }
-        "prompt_volume" => {
-            let value = c.get("value")?.as_u64().filter(|v| *v <= 100)?;
-            Some(serde_json::json!({ "kind": "prompt_volume", "value": value }))
         }
         _ => None,
     }
@@ -207,6 +203,8 @@ mod qcy_tests {
             json!({ "kind": "reapply_on_connect", "enabled": true }),
             json!({ "kind": "sleep_mode", "value": 1 }),
             json!({ "kind": "prompt_volume", "enabled": true }),
+            json!({ "kind": "prompt_volume", "value": 12 }),
+            json!({ "kind": "prompt_volume", "value": 0 }),
             json!({ "kind": "prompt_volume", "value": 101 }),
             json!({ "kind": "prompt_volume", "value": -3 }),
             json!({ "kind": "prompt_volume", "value": 2.5 }),
@@ -219,7 +217,6 @@ mod qcy_tests {
             json!({ "kind": "game_mode", "enabled": true }),
             json!({ "kind": "sleep_mode", "enabled": false }),
             json!({ "kind": "wind_reduction", "enabled": true }),
-            json!({ "kind": "prompt_volume", "value": 12 }),
         ] {
             assert_eq!(qcy_allowed(Some(&c)), Some(c.clone()), "{c}");
         }

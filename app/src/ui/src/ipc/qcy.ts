@@ -97,7 +97,8 @@ export interface QcyState {
   address: string;
   firmware: string | null;
   battery: { left: Battery; right: Battery; case: Battery };
-  noise_mode: NoiseMode;
+  /** null: the earbuds did not answer 0x17 in the last read */
+  noise_mode: NoiseMode | null;
   noise_scene: NoiseScene;
   game_mode: boolean;
   sleep_mode: boolean;

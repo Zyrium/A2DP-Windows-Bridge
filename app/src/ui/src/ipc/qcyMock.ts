@@ -57,8 +57,9 @@ export function sampleQcyState(): QcyState {
   };
 }
 
-/** The phase-2 allowlist, as in qcy_protocol::write::ALLOWED */
-export const F2_OPCODES = { game_mode: 0x09, sleep_mode: 0x10, wind_reduction: 0x2a, prompt_volume: 0x1d } as const;
+/** The phase-2 allowlist, as in qcy_protocol::write::ALLOWED (the prompt
+ *  volume 0x1D is read-only since fase 2b) */
+export const F2_OPCODES = { game_mode: 0x09, sleep_mode: 0x10, wind_reduction: 0x2a } as const;
 type F2Kind = keyof typeof F2_OPCODES;
 export const F2_WRITABLE = Object.keys(F2_OPCODES) as F2Kind[];
 
@@ -150,30 +151,6 @@ export class MockQcy implements QcyProvider {
     this.requireLink();
     const hex = (n: number) => n.toString(16).toUpperCase().padStart(2, "0");
     const at_ms = Date.now();
-    if (c.kind === "prompt_volume") {
-      const previous = this.s.prompt_volume;
-      const max = this.s.prompt_volume_max;
-      const steps = [{ what: "read_previous", detail: `FF03FE011D -> ${previous}/${max}` }];
-      if (!Number.isInteger(c.value) || c.value < 0 || c.value > max) {
-        steps.push({ what: "refused", detail: `${c.value} > ${max}` });
-        this.s.write = { setting: "prompt_volume", enabled: null, value: c.value, previous, max, status: "failed", failure: "out_of_range", sent: null, read_back: null, steps, at_ms };
-        return this.push();
-      }
-      const sent = `FF031D01${hex(c.value)}`;
-      steps.push({ what: "sent", detail: sent });
-      await this.wait(this.gameOnly === "fail" ? 3000 : 400);
-      if (this.gameOnly === "fail") {
-        steps.push({ what: "no_read_back", detail: "3000 ms" });
-        this.s.write = { setting: "prompt_volume", enabled: null, value: c.value, previous, max, status: "failed", failure: "timeout", sent, read_back: null, steps, at_ms };
-      } else {
-        const read_back = `1D02${hex(c.value)}${hex(max)}`;
-        steps.push({ what: "read_back", detail: read_back });
-        this.s.prompt_volume = c.value;
-        this.s.synced_at = Date.now();
-        this.s.write = { setting: "prompt_volume", enabled: null, value: c.value, previous, max, status: "confirmed", failure: null, sent, read_back, steps, at_ms };
-      }
-      return this.push();
-    }
     if (!("enabled" in c)) throw { code: "qcy.read_only", msg: { key: "fones.error.read_only", args: [] } };
     const kind = c.kind as "game_mode" | "sleep_mode" | "wind_reduction";
     const previous = this.s[kind];
