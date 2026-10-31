@@ -409,6 +409,20 @@ mod tests {
     }
 
     #[test]
+    fn the_n70_probe_reply_is_anc_adaptive_not_off() {
+        // probe2: tx FF03FE0117, rx FF051703010500 (mode 01 = ANC, 05 = adaptive)
+        let cmds = crate::packet::parse(&[0xFF, 0x05, 0x17, 0x03, 0x01, 0x05, 0x00]);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].opcode, opcode::NOISE_CONTROL);
+        let n = NoiseControlState::parse(&cmds[0].parameters).unwrap();
+        assert_eq!(n, NoiseControlState::create(NoiseMode::NoiseCancellation, NoiseScene::Adaptive));
+        assert_eq!(n.to_string(), "010500");
+        // only 02 00 xx is "off" (normal); 03 is transparency
+        assert_eq!(NoiseControlState::parse(&[2, 0, 0]).unwrap().mode, NoiseMode::Normal);
+        assert_eq!(NoiseControlState::parse(&[3, 1, 4]).unwrap().mode, NoiseMode::Transparency);
+    }
+
+    #[test]
     fn noise_state_rejects_garbage() {
         assert_eq!(NoiseControlState::parse(&[1, 3]), None);
         assert_eq!(NoiseControlState::parse(&[9, 0, 0]), None);

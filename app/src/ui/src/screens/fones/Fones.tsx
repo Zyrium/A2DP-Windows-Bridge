@@ -145,8 +145,8 @@ export function Fones(props: { tab?: string }) {
             <div
               class="fones-body"
               classList={{ stale: !live(), readonly: live() && readOnly() }}
-              aria-disabled={!editable() && !(tab() === "main" && partial())}
-              inert={!editable() && !(tab() === "main" && partial()) ? true : undefined}
+              aria-disabled={!editable() && !(tab() !== "eq" && partial())}
+              inert={!editable() && !(tab() !== "eq" && partial()) ? true : undefined}
             >
               <Show when={tab() === "main"}>
                 <MainTab s={s()} send={send} can={can} partial={partial()} busy={busy()} verified={s().verified ?? []} />
@@ -155,7 +155,16 @@ export function Fones(props: { tab?: string }) {
                 <EqTab s={s()} send={send} notify={notify} />
               </Show>
               <Show when={tab() === "settings"}>
-                <SettingsTab s={s()} send={send} onLdacOff={() => setAskLdac(true)} save={() => void act((q) => q.saveProfile())} />
+                <SettingsTab
+                  s={s()}
+                  send={send}
+                  onLdacOff={() => setAskLdac(true)}
+                  save={() => void act((q) => q.saveProfile())}
+                  can={can}
+                  partial={partial()}
+                  busy={busy()}
+                  verified={s().verified ?? []}
+                />
               </Show>
             </div>
           </>
@@ -249,7 +258,6 @@ const SCENES: NoiseScene[] = ["adaptive", "indoor", "commuting", "noisy", "anti_
 /** The result of the last write: confirmed (with "Desfazer") or failed
  *  (with "Tentar de novo" and the Diagnóstico link) */
 function WriteBanner(props: { s: QcyState; busy: boolean; send: (c: QcyChange) => Promise<boolean>; diag: () => void }) {
-  const onOff = (v: boolean) => ft(v ? "write.on" : "write.off");
   const offline = () => props.s.link.state !== "connected";
   return (
     <Show when={props.s.write}>
@@ -259,12 +267,16 @@ function WriteBanner(props: { s: QcyState; busy: boolean; send: (c: QcyChange) =
           fallback={
             <Banner
               kind="error"
-              title={ft("write.fail_title")}
+              title={ft("write.fail_title", settingName(w().setting))}
               actions={
                 <>
-                  <Button kind="strong" busy={props.busy} disabled={props.busy || offline()} onClick={() => void props.send({ kind: "game_mode", enabled: w().enabled })}>
-                    {ft("write.retry")}
-                  </Button>
+                  <Show when={writeChange(w(), "retry")}>
+                    {(c) => (
+                      <Button kind="strong" busy={props.busy} disabled={props.busy || offline()} onClick={() => void props.send(c())}>
+                        {ft("write.retry")}
+                      </Button>
+                    )}
+                  </Show>
                   <Button kind="subtle" onClick={props.diag}>
                     {ft("write.diag")}
                   </Button>
@@ -277,21 +289,81 @@ function WriteBanner(props: { s: QcyState; busy: boolean; send: (c: QcyChange) =
         >
           <Banner
             kind="good"
-            title={ft(w().enabled ? "write.ok_on" : "write.ok_off")}
+            title={writeTitle(w())}
             actions={
-              <Show when={w().previous !== null && w().previous !== w().enabled}>
-                <Button busy={props.busy} disabled={props.busy || offline()} onClick={() => void props.send({ kind: "game_mode", enabled: w().previous === true })}>
-                  {ft("write.undo", onOff(w().previous === true))}
-                </Button>
+              <Show when={writeChange(w(), "undo")}>
+                {(c) => (
+                  <Button busy={props.busy} disabled={props.busy || offline()} onClick={() => void props.send(c())}>
+                    {ft("write.undo", valueText(w(), w().previous))}
+                  </Button>
+                )}
               </Show>
             }
           >
-            <Show when={w().previous !== null}>{ft("write.previous", onOff(w().previous === true))}</Show>
+            <Show when={w().previous !== null}>{ft("write.previous", valueText(w(), w().previous))}</Show>
           </Banner>
         </Show>
       )}
     </Show>
   );
+}
+
+/** The writable settings of this version (phase F2) */
+export const F2_SETTINGS = ["game_mode", "sleep_mode", "wind_reduction"] as const;
+
+/** The name a setting has on screen */
+export function settingName(k: string): string {
+  switch (k) {
+    case "game_mode":
+      return ft("game");
+    case "sleep_mode":
+      return ft("sleep");
+    case "wind_reduction":
+      return ft("wind");
+    case "prompt_volume":
+      return ft("prompt_volume");
+    default:
+      return k;
+  }
+}
+
+const isLevel = (w: QcyWrite) => w.setting === "prompt_volume";
+/** What the write asked for: a boolean, or the prompt volume level */
+const target = (w: QcyWrite): boolean | number | null => (isLevel(w) ? (w.value ?? null) : w.enabled);
+
+/** A value of this write's setting as text ("ligado", "4/15") */
+export function valueText(w: QcyWrite, v: boolean | number | null | undefined): string {
+  if (v === null || v === undefined) return "?";
+  if (typeof v === "number") return w.max ? `${v}/${w.max}` : String(v);
+  return ft(v ? "write.on" : "write.off");
+}
+
+function writeTitle(w: QcyWrite): string {
+  if (isLevel(w)) return ft("write.ok_level", settingName(w.setting), valueText(w, w.value));
+  return ft(w.enabled ? "write.ok_on" : "write.ok_off", settingName(w.setting));
+}
+
+/** The one change "Tentar de novo" (same value) or "Desfazer" (back to the
+ *  value read before) sends; null when there is none. Only F2 settings. */
+export function writeChange(w: QcyWrite, which: "retry" | "undo"): QcyChange | null {
+  const v = which === "retry" ? target(w) : w.previous;
+  if (v === null || v === undefined) return null;
+  if (which === "undo" && v === target(w)) return null;
+  if (isLevel(w)) return typeof v === "number" ? { kind: "prompt_volume", value: v } : null;
+  if (typeof v !== "boolean") return null;
+  if (w.setting === "game_mode" || w.setting === "sleep_mode" || w.setting === "wind_reduction") return { kind: w.setting, enabled: v };
+  return null;
+}
+
+/** Wind reduction only works with noise cancelling on; an unread mode
+ *  (null) does not grey it, the read-back confirms the write */
+export function windAllowed(s: QcyState): boolean {
+  return s.noise_mode === "anc" || s.noise_mode === null;
+}
+
+/** The prompt volume's maximum: what the earbuds reported, else 15 */
+export function promptMax(s: QcyState): number {
+  return s.prompt_volume_max > 0 ? s.prompt_volume_max : 15;
 }
 
 function failureText(f: QcyWrite["failure"]) {
@@ -300,29 +372,33 @@ function failureText(f: QcyWrite["failure"]) {
     case "mismatch":
     case "no_previous":
     case "send_failed":
+    case "out_of_range":
       return ft(`write.fail.${f}`);
     default:
       return ft("write.fail.link");
   }
 }
 
-/** The steps of the last game mode write, under its switch */
+/** The steps of the last write, under its control */
 export function writeStepLines(w: QcyWrite): string[] {
-  const onOff = (v: boolean) => ft(v ? "write.on" : "write.off");
   const line = (st: QcyWrite["steps"][number]): string | null => {
     switch (st.what) {
       case "read_previous":
-        return w.previous === null ? null : ft("write.step.read_previous", onOff(w.previous));
+        return w.previous === null ? null : ft("write.step.read_previous", valueText(w, w.previous));
       case "read_previous_failed":
         return ft("write.step.no_previous");
       case "sent":
-        return ft("write.step.sent", ft(w.enabled ? "write.turn_on" : "write.turn_off"));
+        return isLevel(w)
+          ? ft("write.step.sent_level", settingName(w.setting), valueText(w, w.value))
+          : ft("write.step.sent", ft(w.enabled ? "write.turn_on" : "write.turn_off"), settingName(w.setting));
       case "send_failed":
         return ft("write.step.send_failed");
       case "read_back":
-        return w.status === "confirmed" ? ft("write.step.read_back", onOff(w.enabled)) : ft("write.step.read_back_bad", st.detail);
+        return w.status === "confirmed" ? ft("write.step.read_back", valueText(w, target(w))) : ft("write.step.read_back_bad", st.detail);
       case "no_read_back":
         return ft("write.step.no_read_back");
+      case "refused":
+        return ft("write.step.refused");
       default:
         return null;
     }
@@ -361,7 +437,8 @@ function MainTab(props: {
         {ft(!can(k) ? "tag.unverified" : ok(k) ? "tag.verified" : "tag.testing")}
       </span>
     ) : undefined;
-  const gameWrite = () => (s().write?.setting === "game_mode" ? s().write : null);
+  const writeFor = (k: string) => (props.partial && s().write?.setting === k ? s().write! : null);
+  const off = (k: string) => props.partial === true && (props.busy === true || !can(k));
   return (
     <>
       <section class="card dev">
@@ -429,16 +506,38 @@ function MainTab(props: {
           badge={tag("game_mode")}
           hint={props.busy && props.partial ? ft("write.sending") : ft("game.hint")}
           checked={s().game_mode}
-          disabled={props.partial === true && (props.busy === true || !can("game_mode"))}
+          disabled={off("game_mode")}
           onChange={(enabled) => void props.send({ kind: "game_mode", enabled })}
         />
-        <Show when={props.partial ? gameWrite() : null}>{(w) => <WriteSteps w={w()} />}</Show>
+        <Show when={writeFor("game_mode")}>{(w) => <WriteSteps w={w()} />}</Show>
         <div class="fones-lock" classList={{ locked: locked("sleep_mode") }} inert={locked("sleep_mode") ? true : undefined}>
-          <Toggle label={ft("sleep")} badge={tag("sleep_mode")} hint={ft("sleep.hint")} checked={s().sleep_mode} onChange={(enabled) => void props.send({ kind: "sleep_mode", enabled })} />
+          <Toggle
+            label={ft("sleep")}
+            badge={tag("sleep_mode")}
+            hint={props.busy && props.partial ? ft("write.sending") : props.partial ? ft("sleep.warn") : ft("sleep.hint")}
+            checked={s().sleep_mode}
+            disabled={off("sleep_mode")}
+            onChange={(enabled) => void props.send({ kind: "sleep_mode", enabled })}
+          />
         </div>
-        <div class="fones-lock" classList={{ locked: locked("wind_reduction") }} inert={locked("wind_reduction") ? true : undefined}>
-          <Toggle label={ft("wind")} badge={tag("wind_reduction")} hint={ft("wind.hint")} checked={s().wind_reduction} onChange={(enabled) => void props.send({ kind: "wind_reduction", enabled })} />
+        <Show when={writeFor("sleep_mode")}>{(w) => <WriteSteps w={w()} />}</Show>
+        <div
+          class="fones-lock"
+          classList={{ locked: locked("wind_reduction"), "needs-anc": !windAllowed(s()) }}
+          inert={locked("wind_reduction") ? true : undefined}
+        >
+          <Toggle
+            label={ft("wind")}
+            badge={tag("wind_reduction")}
+            hint={!windAllowed(s()) ? ft("wind.needs_anc") : props.busy && props.partial ? ft("write.sending") : ft("wind.hint")}
+            checked={s().wind_reduction}
+            disabled={off("wind_reduction") || !windAllowed(s())}
+            onChange={(enabled) => {
+              if (windAllowed(s())) void props.send({ kind: "wind_reduction", enabled });
+            }}
+          />
         </div>
+        <Show when={writeFor("wind_reduction")}>{(w) => <WriteSteps w={w()} />}</Show>
       </Section>
     </>
   );
@@ -603,13 +702,25 @@ function GesturesSection(props: { s: QcyState; send: (c: QcyChange) => Promise<b
 
 const AUTO_OFF: AutoOff[] = [null, 5, 15, 30, 60];
 
-function SettingsTab(props: { s: QcyState; send: (c: QcyChange) => Promise<boolean>; onLdacOff: () => void; save: () => void }) {
+function SettingsTab(props: {
+  s: QcyState;
+  send: (c: QcyChange) => Promise<boolean>;
+  onLdacOff: () => void;
+  save: () => void;
+  can?: (kind: string) => boolean;
+  partial?: boolean;
+  busy?: boolean;
+  verified?: string[];
+}) {
   const s = () => props.s;
-  const [vol, setVol] = createSignal(s().prompt_volume);
+  const can = (k: string) => props.can?.(k) ?? true;
+  /** In the partial (write test) mode this tab stays greyed and inert
+   *  (the prompt volume is shown, read-only) */
+  const locked = (k: string) => props.partial === true && !can(k);
+  const lockAll = () => props.partial === true;
   // The switch stays on until the dialog's answer: the click flipped the
   // native checkbox, so it is put back (off -> on makes Solid set it again)
   const [ldacUi, setLdacUi] = createSignal(true);
-  createEffect(() => setVol(s().prompt_volume));
   const savedAt = () => {
     const t = s().profile_saved_at;
     return t === null ? ft("profile.none") : new Date(t).toLocaleString(lang(), { dateStyle: "short", timeStyle: "short" });
@@ -617,6 +728,7 @@ function SettingsTab(props: { s: QcyState; send: (c: QcyChange) => Promise<boole
   return (
     <>
       <Section title={ft("use.title")} actions={<LastValue s={s()} />}>
+        <div class="fones-lock" classList={{ locked: lockAll() }} inert={lockAll() ? true : undefined}>
         <Toggle label={ft("wear")} hint={ft("wear.hint")} checked={s().wear_detection} onChange={(enabled) => void props.send({ kind: "wear_detection", enabled })} />
         <Toggle
           label={ft("ldac")}
@@ -633,26 +745,18 @@ function SettingsTab(props: { s: QcyState; send: (c: QcyChange) => Promise<boole
           }}
         />
         <Toggle label={ft("multipoint")} hint={ft("multipoint.hint")} checked={s().multipoint} onChange={(enabled) => void props.send({ kind: "multipoint", enabled })} />
+        </div>
+        {/* Read-only: the N70 did not take 0x1D writes (fase 2b) */}
         <div class="row">
           <div class="row-text">
             <span class="row-label">{ft("prompt_volume")}</span>
+            <span class="hint">{ft("prompt_volume.readonly")}</span>
           </div>
-          <div class="range">
-            <input
-              type="range"
-              min={0}
-              max={s().prompt_volume_max}
-              step={1}
-              value={vol()}
-              aria-label={ft("prompt_volume")}
-              onInput={(e) => setVol(Number(e.currentTarget.value))}
-              onChange={(e) => void props.send({ kind: "prompt_volume", value: Number(e.currentTarget.value) })}
-            />
-            <span class="num">
-              {vol()}/{s().prompt_volume_max}
-            </span>
-          </div>
+          <span class="num">
+            {Math.max(0, Math.min(promptMax(s()), s().prompt_volume))}/{promptMax(s())}
+          </span>
         </div>
+        <div class="fones-lock" classList={{ locked: lockAll() }} inert={lockAll() ? true : undefined}>
         <div class="row">
           <div class="row-text">
             <span class="row-label">{ft("auto_off")}</span>
@@ -665,9 +769,11 @@ function SettingsTab(props: { s: QcyState; send: (c: QcyChange) => Promise<boole
             onChange={(v) => void props.send({ kind: "auto_off", minutes: (v === "null" ? null : Number(v)) as AutoOff })}
           />
         </div>
+        </div>
       </Section>
 
       <Section title={ft("profile.title")}>
+        <div class="fones-lock" classList={{ locked: locked("reapply_on_connect") }} inert={locked("reapply_on_connect") ? true : undefined}>
         <Toggle label={ft("reapply")} hint={ft("reapply.hint")} checked={s().reapply_on_connect} onChange={(enabled) => void props.send({ kind: "reapply_on_connect", enabled })} />
         <div class="row">
           <div class="row-text">
@@ -676,7 +782,9 @@ function SettingsTab(props: { s: QcyState; send: (c: QcyChange) => Promise<boole
           </div>
           <Button onClick={() => props.save()}>{ft("profile.save")}</Button>
         </div>
+        </div>
       </Section>
     </>
   );
 }
+

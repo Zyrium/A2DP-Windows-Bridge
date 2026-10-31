@@ -1362,8 +1362,16 @@ impl CoreState {
                 }))
                 .await
             }
-            Method::QcySet { kind, enabled } => {
-                let change = serde_json::json!({ "kind": kind, "enabled": enabled });
+            Method::QcySet { kind, enabled, value } => {
+                // Exactly kind + the one value given (allowed_change refuses
+                // a toggle with a level, a level with on/off, or both)
+                let mut change = serde_json::json!({ "kind": kind });
+                if let Some(e) = enabled {
+                    change["enabled"] = serde_json::json!(e);
+                }
+                if let Some(v) = value {
+                    change["value"] = serde_json::json!(v);
+                }
                 if crate::qcy_live::allowed_change(&change).is_none() {
                     return Err(err("qcy.read_only", "fones.error.read_only"));
                 }
