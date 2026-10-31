@@ -94,3 +94,18 @@
 .fones .needs-anc .toggle-row {
   opacity: 0.55;
 }
+
+/* Phase F3b: the 0x2C bytes under the wear detection switch */
+.fones .wear-read {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 24px;
+  margin: 4px 0 8px;
+}
+.fones .wear-read dt,
+.fones .wear-read dd {
+  margin: 0;
+}
+.fones .wear-read code {
+  opacity: 0.7;
+}

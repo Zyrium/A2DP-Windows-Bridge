@@ -1,10 +1,11 @@
 //! Changing a setting of the earbuds: the ONLY place that frames a write.
 //!
-//! Phase F2 (plano_escrita_qcy.md): three settings may change. Everything
+//! Phases F2–F3b (plano_escrita_qcy.md): five settings may change. Everything
 //! else is refused here, whatever the caller asks:
 //!
 //! - [`ALLOWED`]: exactly 0x09 game mode, 0x10 sleep mode and 0x2A wind
-//!   reduction (on/off: one parameter byte, `01` on or `02` off). Any other
+//!   reduction (on/off: one parameter byte, `01` on or `02` off), plus
+//!   0x17 noise control and 0x2C wear detection as below. Any other
 //!   opcode, length or value: [`Refused`].
 //! - 0x1D prompt volume is NOT written (fase 2b): on the N70 every
 //!   `FF 03 1D 01 <v>` read back the old level (04/0F, 2026-10-31), so it
@@ -14,6 +15,13 @@
 //!   `03 01 04`). The read-back must match the three bytes exactly. After a
 //!   confirmed 0x17 write, 0x2A (wind reduction) is READ again (never
 //!   written) so the screen shows its real state.
+//! - Phase F3b: 0x2C wear detection ("Pausar ao tirar o fone"), on `01`
+//!   or off `02`. The write copies the music and ANC action bytes (and the
+//!   tone byte, when the firmware sends one) EXACTLY from the read made
+//!   right before it: `FF 05 2C 03 <01|02> <music> <anc>` or
+//!   `FF 06 2C 04 <01|02> <music> <anc> <tone>`. Confirmed when the
+//!   read-back's state is the one written (off reads back as `00`) and the
+//!   other bytes did not change. Verified on the N70 (Gabriel, 2026-10-31).
 //! - [`BLOCKED`]: opcodes that are never written, even if a later phase
 //!   widens [`ALLOWED`] by mistake (restore defaults, clear pairings,
 //!   factory reset, test modes, standby, rename, fit/EQ tests).
@@ -28,6 +36,7 @@
 //! FF 03 2A 01 01 / 02   wind reduction on / off  read FE 2A -> 2A 01 <01|00|02>
 //! FF 03 1D 01 vv        prompt volume vv         read FE 1D -> 1D 02 <vv> <max>
 //! FF 05 17 03 m s v     noise control (F3)       read FE 17 -> 17 03 <m> <s> <v>
+//! FF 05 2C 03 e m a     wear detection (F3b)     read FE 2C -> 2C 03 <01|00> <m> <a> [t]
 //! ```
 //!
 //! Sources (confidence in plano_escrita_qcy.md):
@@ -60,8 +69,42 @@ use std::time::{Duration, Instant};
 use crate::commands::{self, opcode};
 use crate::packet;
 
-/// The opcodes this build may write (exactly these four)
-pub const ALLOWED: [u8; 4] = [opcode::GAME_MODE, opcode::SLEEP_MODE, opcode::WIND_DETECTION, opcode::NOISE_CONTROL];
+/// The opcodes this build may write (exactly these five)
+pub const ALLOWED: [u8; 5] =
+    [opcode::GAME_MODE, opcode::SLEEP_MODE, opcode::WIND_DETECTION, opcode::NOISE_CONTROL, opcode::WEARING_DETECTION];
+
+/// The highest music / ANC action byte copied into a 0x2C write (the N70
+/// reports `01`; anything above is not a known action and is never
+/// written back)
+pub const WEAR_ACTION_LIMIT: u8 = 0x0F;
+
+/// Whether `p` are the parameters of an acceptable 0x2C write: state 01/02,
+/// music and ANC actions 00..=[`WEAR_ACTION_LIMIT`], optional tone 01/02
+fn wear_parameters_ok(p: &[u8]) -> bool {
+    let actions_ok = |m: u8, a: u8| m <= WEAR_ACTION_LIMIT && a <= WEAR_ACTION_LIMIT;
+    match *p {
+        [0x01 | 0x02, m, a] => actions_ok(m, a),
+        [0x01 | 0x02, m, a, 0x01 | 0x02] => actions_ok(m, a),
+        _ => false,
+    }
+}
+
+/// The 0x2C write that turns wear detection on (`01`) or off (`02`),
+/// copying the music / ANC (/ tone) bytes of `current` (the read's
+/// parameters). Refused when the read is not a 3- or 4-byte 0x2C answer.
+pub fn wear_frame(value: u8, current: &[u8]) -> Result<Vec<u8>, Refused> {
+    let op = opcode::WEARING_DETECTION;
+    if !matches!(value, 0x01 | 0x02) {
+        return Err(Refused::BadParameters(op, vec![value]));
+    }
+    let w = commands::WearingDetection::parse(current).ok_or_else(|| Refused::BadParameters(op, current.to_vec()))?;
+    let mut p = vec![value, w.music_action, w.anc_action];
+    if current.len() == 4 {
+        // The tone byte as the firmware sent it (00 is written back as 02)
+        p.push(if current[3] == 0x01 { 0x01 } else { 0x02 });
+    }
+    build(op, &p)
+}
 
 /// The only 0x17 states ever written, by the code the UI sends (`value` of
 /// `{ kind: "noise_control" }`). Sources: OpenQCY-Desktop
@@ -141,12 +184,14 @@ pub enum Setting {
     PromptVolume,
     /// 0x17 (phase F3): the value is a code of [`NOISE_PRESETS`]
     NoiseControl,
+    /// 0x2C (phase F3b): on/off; the other bytes come from the read
+    WearDetection,
 }
 
 impl Setting {
     /// The writable settings (prompt volume is read-only)
-    pub const ALL: [Setting; 4] =
-        [Setting::GameMode, Setting::SleepMode, Setting::WindReduction, Setting::NoiseControl];
+    pub const ALL: [Setting; 5] =
+        [Setting::GameMode, Setting::SleepMode, Setting::WindReduction, Setting::NoiseControl, Setting::WearDetection];
 
     pub fn opcode(self) -> u8 {
         match self {
@@ -155,6 +200,7 @@ impl Setting {
             Setting::WindReduction => opcode::WIND_DETECTION,
             Setting::PromptVolume => opcode::PROMPT_VOLUME,
             Setting::NoiseControl => opcode::NOISE_CONTROL,
+            Setting::WearDetection => opcode::WEARING_DETECTION,
         }
     }
     pub fn key(self) -> &'static str {
@@ -164,6 +210,7 @@ impl Setting {
             Setting::WindReduction => "wind_reduction",
             Setting::PromptVolume => "prompt_volume",
             Setting::NoiseControl => "noise_control",
+            Setting::WearDetection => "wear_detection",
         }
     }
     /// On/off (01/02) rather than a level
@@ -213,6 +260,7 @@ pub fn build(op: u8, parameters: &[u8]) -> Result<Vec<u8>, Refused> {
             Ok(packet::frame(op, parameters))
         }
         (opcode::NOISE_CONTROL, p) if NOISE_PRESETS.iter().any(|n| n.2 == p) => Ok(packet::frame(op, p)),
+        (opcode::WEARING_DETECTION, p) if wear_parameters_ok(p) => Ok(packet::frame(op, p)),
         _ => Err(Refused::BadParameters(op, parameters.to_vec())),
     }
 }
@@ -225,9 +273,31 @@ pub fn toggle_frame(setting: Setting, enabled: bool) -> Result<Vec<u8>, Refused>
     build(setting.opcode(), &[on_off(enabled)])
 }
 
+/// Whether `value` may be asked for `setting` (the check before any
+/// traffic; for wear detection, `01` or `02` with 0x2C allowed)
+pub fn check_value(setting: Setting, value: u8) -> Result<(), Refused> {
+    if setting == Setting::WearDetection {
+        let op = opcode::WEARING_DETECTION;
+        if BLOCKED.contains(&op) {
+            return Err(Refused::Blocked(op));
+        }
+        if !ALLOWED.contains(&op) {
+            return Err(Refused::NotAllowed(op));
+        }
+        return if matches!(value, 0x01 | 0x02) { Ok(()) } else { Err(Refused::BadParameters(op, vec![value])) };
+    }
+    frame_for(setting, value).map(|_| ())
+}
+
 /// The frame of `setting` with its raw parameter byte (01/02 for a
 /// toggle, the level for the prompt volume)
+///
+/// Wear detection has no frame without the current read: use
+/// [`check_value`] to validate and [`wear_frame`] to frame it.
 pub fn frame_for(setting: Setting, value: u8) -> Result<Vec<u8>, Refused> {
+    if setting == Setting::WearDetection {
+        return Err(Refused::BadParameters(opcode::WEARING_DETECTION, vec![value]));
+    }
     if setting == Setting::NoiseControl {
         let bytes = noise_bytes(value).ok_or_else(|| Refused::BadParameters(opcode::NOISE_CONTROL, vec![value]))?;
         return build(opcode::NOISE_CONTROL, &bytes);
@@ -265,7 +335,9 @@ pub fn confirms(sent: &[u8], got: &[u8]) -> bool {
 /// [`confirms`] for `setting`: a level must read back exactly (00 is a
 /// level, not "off")
 pub fn confirms_for(setting: Setting, sent: &[u8], got: &[u8]) -> bool {
-    if setting.is_toggle() {
+    if setting == Setting::WearDetection {
+        wear_confirms(sent, got)
+    } else if setting.is_toggle() {
         confirms(sent, got)
     } else if setting == Setting::NoiseControl {
         // All three bytes, exactly
@@ -275,11 +347,31 @@ pub fn confirms_for(setting: Setting, sent: &[u8], got: &[u8]) -> bool {
     }
 }
 
+/// A 0x2C read-back confirms a write when its state is the one written
+/// (off reads back as `00` or `02`), the music and ANC bytes are exactly
+/// the ones written (copied from the earlier read), and, when a tone byte
+/// was written, the read reports the same tone on/off
+pub fn wear_confirms(sent: &[u8], got: &[u8]) -> bool {
+    if !(3..=4).contains(&sent.len()) || got.len() < 3 || !confirms(sent, got) || got[1..3] != sent[1..3] {
+        return false;
+    }
+    match (sent.get(3), got.get(3)) {
+        (None, _) => true,
+        (Some(&t), Some(&g)) => read_on(&[t]) == read_on(&[g]),
+        (Some(_), None) => false,
+    }
+}
+
 /// The value of a read as the raw parameter of a write: a toggle's 01 /
 /// 02 (00 reads as 02), a level's first byte
 pub fn read_value(setting: Setting, got: &[u8]) -> Option<u8> {
     match setting {
         Setting::NoiseControl => noise_code(got),
+        // Only a well-formed 0x2C answer (3 or 4 bytes) is a known value
+        Setting::WearDetection => {
+            commands::WearingDetection::parse(got)?;
+            read_on(got).map(on_off)
+        }
         s if s.is_toggle() => read_on(got).map(on_off),
         _ => got.first().copied(),
     }
@@ -412,7 +504,12 @@ pub fn run<T: Transport>(t: &mut T, setting: Setting, value: u8, timeout: Durati
         wind_after: None,
         steps: Vec::new(),
     };
-    let frame = match frame_for(setting, value) {
+    let checked = if setting == Setting::WearDetection {
+        check_value(setting, value).map(|()| Vec::new())
+    } else {
+        frame_for(setting, value)
+    };
+    let mut frame = match checked {
         Ok(f) => f,
         Err(e) => {
             out.steps.push(Step { what: "refused", detail: e.to_string() });
@@ -452,6 +549,22 @@ pub fn run<T: Transport>(t: &mut T, setting: Setting, value: u8, timeout: Durati
         out.steps.push(Step { what: "refused", detail: format!("{value} > {max}") });
         out.failure = Some(Failure::OutOfRange);
         return out;
+    }
+
+    // Wear detection: the frame copies the bytes just read
+    if setting == Setting::WearDetection {
+        match read.as_deref().map(|raw| wear_frame(value, raw)) {
+            Some(Ok(f)) => frame = f,
+            Some(Err(e)) => {
+                out.steps.push(Step { what: "refused", detail: e.to_string() });
+                out.failure = Some(Failure::NoPrevious);
+                return out;
+            }
+            None => {
+                out.failure = Some(Failure::NoPrevious);
+                return out;
+            }
+        }
     }
 
     // 2. Exactly one write
@@ -555,14 +668,14 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_four_settings_are_allowed() {
-        assert_eq!(ALLOWED, [0x09, 0x10, 0x2A, 0x17]);
+    fn exactly_the_five_settings_are_allowed() {
+        assert_eq!(ALLOWED, [0x09, 0x10, 0x2A, 0x17, 0x2C]);
         for op in 0..=u8::MAX {
             for p in [&[0x01u8][..], &[0x02], &[0x00], &[0x0F], &[0x64], &[0x65], &[0xFF], &[0x01, 0x02], &[]] {
                 let r = build(op, p);
                 let ok = match op {
                     0x09 | 0x10 | 0x2A => p == [0x01] || p == [0x02],
-                    // 0x17 takes three bytes: none of these
+                    // 0x17 and 0x2C take three or four bytes: none of these
                     _ => false,
                 };
                 assert_eq!(r.is_ok(), ok, "0x{op:02X} {p:?}");
@@ -575,7 +688,7 @@ mod tests {
         assert!(Setting::from_kind("prompt_volume").is_none());
         assert_eq!(build(0x23, &[0x01]), Err(Refused::NotAllowed(0x23)));
         assert_eq!(build(0x24, &[0x01]), Err(Refused::NotAllowed(0x24)));
-        assert_eq!(build(0x2C, &[0x01]), Err(Refused::NotAllowed(0x2C)));
+        assert_eq!(build(0x2C, &[0x01]), Err(Refused::BadParameters(0x2C, vec![1])));
         assert_eq!(build(0x14, &[0xFF, 0xFF, 0, 0]), Err(Refused::NotAllowed(0x14)));
         assert!(Setting::from_kind("ldac").is_none());
         assert!(Setting::from_kind("multipoint").is_none());
@@ -1003,5 +1116,208 @@ mod tests {
         let o = run(&mut m, Setting::NoiseControl, 9, T);
         assert_eq!(o.failure, Some(Failure::OutOfRange));
         assert!(m.sent.is_empty(), "a bad code sends nothing, not even a read");
+    }
+
+    // ---- Phase F3b: 0x2C wear detection ----
+
+    #[test]
+    fn wear_frames_copy_the_read_bytes() {
+        // The N70 transcript: off reads 00 01 01
+        assert_eq!(wear_frame(0x01, &[0x00, 0x01, 0x01]).unwrap(), hex("FF052C03010101"));
+        assert_eq!(wear_frame(0x02, &[0x01, 0x01, 0x01]).unwrap(), hex("FF052C03020101"));
+        // Other actions are copied as they are
+        assert_eq!(wear_frame(0x01, &[0x02, 0x03, 0x00]).unwrap(), hex("FF052C03010300"));
+        // With a tone byte: FF 06 2C 04
+        assert_eq!(wear_frame(0x01, &[0x00, 0x02, 0x03, 0x01]).unwrap(), hex("FF062C0401020301"));
+        assert_eq!(wear_frame(0x02, &[0x01, 0x02, 0x03, 0x02]).unwrap(), hex("FF062C0402020302"));
+        assert_eq!(wear_frame(0x02, &[0x01, 0x02, 0x03, 0x00]).unwrap(), hex("FF062C0402020302"));
+        // Same bytes as the crate's builder
+        let w = commands::WearingDetection::parse(&[0x00, 0x01, 0x01]).unwrap();
+        assert_eq!(wear_frame(0x01, &[0x00, 0x01, 0x01]).unwrap(), commands::set_wearing_detection(true, &w));
+        // Bad value or bad read: refused
+        for v in [0x00, 0x03, 0xFF] {
+            assert!(wear_frame(v, &[0x01, 0x01, 0x01]).is_err(), "{v}");
+        }
+        assert!(wear_frame(0x01, &[]).is_err());
+        assert!(wear_frame(0x01, &[0x01, 0x01]).is_err());
+        assert!(wear_frame(0x01, &[0x01, 0x01, 0x01, 0x01, 0x01]).is_err());
+        assert!(wear_frame(0x01, &[0x01, 0x10, 0x01]).is_err(), "unknown action byte");
+        assert!(wear_frame(0x01, &[0x01, 0x01, 0xFF]).is_err(), "unknown action byte");
+        // No frame without the read
+        assert!(frame_for(Setting::WearDetection, 0x01).is_err());
+        assert_eq!(check_value(Setting::WearDetection, 0x01), Ok(()));
+        assert_eq!(check_value(Setting::WearDetection, 0x02), Ok(()));
+        assert!(check_value(Setting::WearDetection, 0x00).is_err());
+        assert_eq!(Setting::from_kind("wear_detection"), Some(Setting::WearDetection));
+        assert!(Setting::WearDetection.is_toggle());
+    }
+
+    #[test]
+    fn wear_build_takes_only_well_formed_parameters() {
+        assert!(build(0x2C, &[0x01, 0x01, 0x01]).is_ok());
+        assert!(build(0x2C, &[0x02, 0x01, 0x01, 0x02]).is_ok());
+        assert!(build(0x2C, &[0x00, 0x01, 0x01]).is_err(), "00 is never written");
+        assert!(build(0x2C, &[0x03, 0x01, 0x01]).is_err());
+        assert!(build(0x2C, &[0x01, 0x01, 0x01, 0x00]).is_err());
+        assert!(build(0x2C, &[0x01, 0x01]).is_err());
+        assert!(build(0x2C, &[0x01, 0x01, 0x01, 0x01, 0x01]).is_err());
+        assert!(build(0x2C, &[]).is_err());
+        // The blocklist still wins for every opcode, whatever the parameters
+        for op in [0x01u8, 0x02, 0x03, 0x0D, 0x11, 0x18, 0x1F, 0x45, 0xFE] {
+            assert_eq!(build(op, &[0x01, 0x01, 0x01]), Err(Refused::Blocked(op)));
+        }
+        assert!(check_target(0xFE2C, 0x1001).is_err());
+        assert!(check_target(0x7033, 0x2001).is_err());
+        assert!(check_target(0x7033, 0x2002).is_err());
+    }
+
+    #[test]
+    fn wear_confirmation() {
+        // Off reads back as 00 (or 02): confirmed
+        assert!(wear_confirms(&[0x02, 0x01, 0x01], &[0x00, 0x01, 0x01]));
+        assert!(wear_confirms(&[0x02, 0x01, 0x01], &[0x02, 0x01, 0x01]));
+        assert!(wear_confirms(&[0x01, 0x01, 0x01], &[0x01, 0x01, 0x01]));
+        // Wrong state or changed actions: not confirmed
+        assert!(!wear_confirms(&[0x01, 0x01, 0x01], &[0x00, 0x01, 0x01]));
+        assert!(!wear_confirms(&[0x02, 0x01, 0x01], &[0x01, 0x01, 0x01]));
+        assert!(!wear_confirms(&[0x01, 0x01, 0x01], &[0x01, 0x02, 0x01]));
+        assert!(!wear_confirms(&[0x01, 0x01, 0x01], &[0x01, 0x01]));
+        assert!(!wear_confirms(&[0x01, 0x01, 0x01], &[]));
+        // Tone byte
+        assert!(wear_confirms(&[0x01, 0x02, 0x03, 0x02], &[0x01, 0x02, 0x03, 0x00]));
+        assert!(!wear_confirms(&[0x01, 0x02, 0x03, 0x01], &[0x01, 0x02, 0x03, 0x00]));
+        assert!(!wear_confirms(&[0x01, 0x02, 0x03, 0x01], &[0x01, 0x02, 0x03]));
+        assert!(confirms_for(Setting::WearDetection, &[0x02, 0x01, 0x01], &[0x00, 0x01, 0x01]));
+        assert_eq!(read_value(Setting::WearDetection, &[0x00, 0x01, 0x01]), Some(0x02));
+        assert_eq!(read_value(Setting::WearDetection, &[0x01, 0x01, 0x01, 0x01]), Some(0x01));
+        assert_eq!(read_value(Setting::WearDetection, &[0x01]), None, "a short read is unknown");
+        assert_eq!(read_value(Setting::WearDetection, &[0x07, 0x01, 0x01]), None);
+    }
+
+    /// Earbuds with a 0x2C state
+    struct WearMock {
+        state: Vec<u8>,
+        applies: bool,
+        answers_after: bool,
+        /// Changes the music action on a write (a firmware that rewrites it)
+        mangles: bool,
+        written: bool,
+        sent: Vec<Vec<u8>>,
+        inbox: VecDeque<Vec<u8>>,
+    }
+
+    impl WearMock {
+        fn new(state: &[u8]) -> WearMock {
+            WearMock {
+                state: state.to_vec(),
+                applies: true,
+                answers_after: true,
+                mangles: false,
+                written: false,
+                sent: Vec::new(),
+                inbox: VecDeque::new(),
+            }
+        }
+        fn writes(&self) -> Vec<&Vec<u8>> {
+            self.sent.iter().filter(|f| f[2] != 0xFE).collect()
+        }
+    }
+
+    impl Transport for WearMock {
+        fn send(&mut self, frame: &[u8]) -> Result<(), String> {
+            self.sent.push(frame.to_vec());
+            if frame[2] == 0xFE {
+                if self.written && !self.answers_after {
+                    return Ok(());
+                }
+                if frame[4] == 0x2C {
+                    self.inbox.push_back(packet::frame(0x2C, &self.state));
+                }
+            } else {
+                self.written = true;
+                if self.applies && frame[2] == 0x2C {
+                    let mut p = frame[4..].to_vec();
+                    // The N70 reads "off" back as 00
+                    if p[0] == 0x02 {
+                        p[0] = 0x00;
+                    }
+                    if self.mangles {
+                        p[1] = p[1].wrapping_add(1);
+                    }
+                    self.state = p;
+                }
+            }
+            Ok(())
+        }
+        fn recv(&mut self, wait: Duration) -> Option<Vec<u8>> {
+            let v = self.inbox.pop_front();
+            if v.is_none() && !wait.is_zero() {
+                std::thread::sleep(wait.min(Duration::from_millis(5)));
+            }
+            v
+        }
+    }
+
+    #[test]
+    fn wear_off_is_confirmed_by_a_00_read_back_and_undo_restores() {
+        let mut m = WearMock::new(&[0x01, 0x01, 0x01]);
+        let o = run_toggle(&mut m, Setting::WearDetection, false, T);
+        assert!(o.confirmed(), "{o:?}");
+        assert_eq!(o.previous, Some(0x01));
+        assert_eq!(m.sent[0], hex("FF03FE012C"), "read first");
+        assert_eq!(m.writes(), [&hex("FF052C03020101")], "exactly one write");
+        assert_eq!(o.read_back, Some(vec![0x00, 0x01, 0x01]));
+        assert_eq!(o.steps.iter().map(|s| s.what).collect::<Vec<_>>(), ["read_previous", "sent", "read_back"]);
+        // Desfazer: the saved value, the same flow
+        let undo = run(&mut m, Setting::WearDetection, o.previous.unwrap(), T);
+        assert!(undo.confirmed());
+        assert_eq!(m.writes(), [&hex("FF052C03020101"), &hex("FF052C03010101")]);
+    }
+
+    #[test]
+    fn wear_with_a_tone_byte_keeps_it() {
+        let mut m = WearMock::new(&[0x00, 0x02, 0x03, 0x01]);
+        let o = run_toggle(&mut m, Setting::WearDetection, true, T);
+        assert!(o.confirmed(), "{o:?}");
+        assert_eq!(m.writes(), [&hex("FF062C0401020301")]);
+    }
+
+    #[test]
+    fn a_silent_wear_write_times_out_once() {
+        let mut m = WearMock::new(&[0x01, 0x01, 0x01]);
+        m.answers_after = false;
+        let started = Instant::now();
+        let o = run_toggle(&mut m, Setting::WearDetection, false, T);
+        assert_eq!(o.failure, Some(Failure::Timeout));
+        assert!(started.elapsed() >= T);
+        assert_eq!(m.writes().len(), 1, "never re-sent");
+        assert_eq!(o.previous, Some(0x01));
+    }
+
+    #[test]
+    fn a_wear_read_back_with_other_bytes_fails() {
+        let mut m = WearMock::new(&[0x01, 0x01, 0x01]);
+        m.applies = false;
+        let o = run_toggle(&mut m, Setting::WearDetection, false, T);
+        assert_eq!(o.failure, Some(Failure::Mismatch));
+        let mut m = WearMock::new(&[0x00, 0x01, 0x01]);
+        m.mangles = true;
+        let o = run_toggle(&mut m, Setting::WearDetection, true, T);
+        assert_eq!(o.failure, Some(Failure::Mismatch), "music action changed");
+        assert_eq!(m.writes().len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_wear_state_is_never_overwritten() {
+        for state in [&[0x01u8][..], &[0x07, 0x01, 0x01], &[0x01, 0x20, 0x01], &[0x01, 0x01, 0x01, 0x01, 0x01]] {
+            let mut m = WearMock::new(state);
+            let o = run_toggle(&mut m, Setting::WearDetection, true, T);
+            assert_eq!(o.failure, Some(Failure::NoPrevious), "{state:?}");
+            assert!(m.writes().is_empty(), "{state:?}");
+        }
+        let mut m = WearMock::new(&[0x01, 0x01, 0x01]);
+        let o = run(&mut m, Setting::WearDetection, 0x00, T);
+        assert_eq!(o.failure, Some(Failure::OutOfRange));
+        assert!(m.sent.is_empty(), "a bad value sends nothing, not even a read");
     }
 }

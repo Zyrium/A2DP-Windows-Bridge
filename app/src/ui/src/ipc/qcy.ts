@@ -1,9 +1,9 @@
 // The contract between the "Fones" screen and the QCY headset control
 // (BLE/GATT, crates/qcy-protocol). The Rust side: src-tauri/commands.rs
 // (qcy_*) and the core's qcy.* requests (core/src/qcy_live.rs). This
-// version reads everything and changes four settings, one command per
-// click (`writable`): game mode (verified on the N70), sleep mode, wind
-// reduction and the prompt volume ("Em teste"). Any other qcy_set and qcy_save_profile reject with
+// version reads everything and changes five settings, one command per
+// click (`writable`): game mode, sleep mode, wind reduction, noise control
+// and wear detection, all verified on the N70; the prompt volume is read-only. Any other qcy_set and qcy_save_profile reject with
 // qcy.read_only. In a plain browser, or with ?qcy=mock, the mock provider of
 // qcyMock.ts stands in for it.
 //
@@ -83,12 +83,14 @@ export interface QcyState {
    *  version): the controls stay greyed, "Atualizar" reads again */
   read_only?: boolean;
   /** The only settings that can change (this version: game_mode,
-   *  sleep_mode, wind_reduction, prompt_volume);
+   *  sleep_mode, wind_reduction, noise_control, wear_detection);
    *  absent: every control works (the mock's full mode) */
   writable?: string[];
-  /** Writable settings already checked on real earbuds (game_mode; the
-   *  others carry the "Em teste" tag) */
+  /** Writable settings already checked on real earbuds (all five on the
+   *  N70; any other writable one carries the "Em teste" tag) */
   verified?: string[];
+  /** Writable but experimental (tag "Em teste"); empty since wear detection was verified */
+  experimental?: string[];
   /** The last write, null before the first */
   write?: QcyWrite | null;
   /** The headset's own equalizer preset number, when it reported one */
@@ -104,6 +106,9 @@ export interface QcyState {
   sleep_mode: boolean;
   wind_reduction: boolean;
   wear_detection: boolean;
+  /** Phase F3b: the 0x2C bytes as last read (state, music action, ANC
+   *  action, optional tone); null when 0x2C was not answered */
+  wear_read?: { enabled: boolean; music: number; anc: number; tone: boolean | null } | null;
   ldac: boolean;
   multipoint: boolean;
   prompt_volume: number;
