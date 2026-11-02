@@ -26,5 +26,9 @@ codec = { path = "../codec", default-features = false, features = ["aac"] }
 name = "aac_round_trip"
 required-features = ["decoder"]
 
+[[test]]
+name = "aac_standalone"
+required-features = ["decoder"]
+
 [lints]
 workspace = true

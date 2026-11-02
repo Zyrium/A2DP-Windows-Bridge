@@ -94,8 +94,13 @@ impl Packetizer {
         }
         // libldac sizes each output for one packet (frames per 2-DH5 / 3-DH5):
         // send it as is, as Android does, rather than merging outputs. Opus:
-        // one frame per packet (Android; PipeWire's decoder takes no other)
-        if matches!(self.kind, CodecKind::Ldac | CodecKind::Opus | CodecKind::Opus05) {
+        // one frame per packet (Android; PipeWire's decoder takes no other).
+        // AAC: a packet is one LATM AudioMuxElement (RFC 3016), i.e. one
+        // access unit; two elements back to back are not a valid payload, a
+        // sink decodes the first and drops the rest (Android sends one per
+        // packet). With a large media MTU and a low bit rate several 128 /
+        // 192 kbps frames would otherwise fit one packet.
+        if matches!(self.kind, CodecKind::Ldac | CodecKind::Opus | CodecKind::Opus05 | CodecKind::Aac) {
             sent += self.flush(send);
         }
         sent
@@ -230,6 +235,20 @@ mod tests {
             assert_eq!(out, vec![(vec![1, 0xFC, 1, 2], 0), (vec![1, 0xFC, 3], 960)], "{kind}");
             assert_eq!(max_raw(kind, 1011, 48000), 1010);
         }
+    }
+
+    #[test]
+    fn aac_one_access_unit_per_packet() {
+        // 128 kbps frames (~340 bytes) in a 1000-byte payload: three would
+        // fit, but a packet carries one LATM AudioMuxElement. No media
+        // payload header, with RTP, timestamps follow the frames.
+        let mut p = Packetizer::new(CodecKind::Aac, 1000, 48000);
+        let mut out = Vec::new();
+        for i in 0..4u32 {
+            p.push(&[0x20u8; 340], 1, i * 1024, &mut |pk| out.push((pk.payload().len(), pk.timestamp, pk.rtp)));
+        }
+        p.flush(&mut |pk| out.push((pk.payload().len(), pk.timestamp, pk.rtp)));
+        assert_eq!(out, vec![(340, 0, true), (340, 1024, true), (340, 2048, true), (340, 3072, true)]);
     }
 
     #[test]
