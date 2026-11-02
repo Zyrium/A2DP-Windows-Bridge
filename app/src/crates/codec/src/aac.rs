@@ -2,8 +2,8 @@
 //!
 //! A2DP's AAC is MPEG-2/4 AAC-LC; each media packet carries one access unit
 //! as a LATM AudioMuxElement with the StreamMuxConfig in band
-//! (muxConfigPresent = 1, no LOAS sync layer) and no media payload header,
-//! as Android and PipeWire send it. The encoder is fdk-aac, under the
+//! (muxConfigPresent = 1, repeated in every access unit, no LOAS sync layer)
+//! and no media payload header, as Android and PipeWire send it. The encoder is fdk-aac, under the
 //! Fraunhofer FDK AAC licence (free redistribution with the licence text, but
 //! no patent licence: AAC is patent-encumbered and licensing it is the
 //! distributor's matter); it is built in the separate `fdkaac-sys` crate
@@ -70,17 +70,24 @@ impl AacEncoder {
             |what: &str, e: fdkaac_sys::EncError| EncoderError::Init { codec: CODEC, what: format!("{what}: {e}") };
         let mut enc = FdkEncoder::open(0, config.channels).map_err(|e| init_err("aacEncOpen", e))?;
         let channel_mode = if config.channels == 1 { ffi::MODE_1 } else { ffi::MODE_2 };
-        // As v1: AAC-LC (what A2DP requires), CBR (the default bit rate mode;
-        // the codec configuration says VBR off), LATM with in-band
-        // StreamMuxConfig and fdk-aac's defaults for it (AudioMuxVersion 0,
-        // StreamMuxConfig every 10th frame), afterburner for quality
-        let params: [(ffi::AACENC_PARAM, &str, u32); 7] = [
+        // AAC-LC (what A2DP requires), CBR (the default bit rate mode; the
+        // codec configuration says VBR off), LATM with in-band
+        // StreamMuxConfig (AudioMuxVersion 0), afterburner for quality.
+        //
+        // AACENC_HEADER_PERIOD = 1 puts the StreamMuxConfig in every access
+        // unit, as Android (a2dp_aac_encoder.cc) and BlueZ do. fdk-aac's
+        // default repeats it only every 10th frame and sends the frames in
+        // between with useSameStreamMux = 1, which a sink that decodes each
+        // packet on its own (or that joined the stream after frame 0) cannot
+        // decode: the link is up and nothing plays, or only every 10th frame.
+        let params: [(ffi::AACENC_PARAM, &str, u32); 8] = [
             (ffi::AACENC_AOT, "AACENC_AOT", ffi::AOT_AAC_LC as u32),
             (ffi::AACENC_SAMPLERATE, "AACENC_SAMPLERATE", config.sample_rate),
             (ffi::AACENC_CHANNELMODE, "AACENC_CHANNELMODE", channel_mode as u32),
             (ffi::AACENC_BITRATE, "AACENC_BITRATE", bitrate),
             (ffi::AACENC_PEAK_BITRATE, "AACENC_PEAK_BITRATE", max_bitrate),
             (ffi::AACENC_TRANSMUX, "AACENC_TRANSMUX", ffi::TT_MP4_LATM_MCP1 as u32),
+            (ffi::AACENC_HEADER_PERIOD, "AACENC_HEADER_PERIOD", 1),
             (ffi::AACENC_AFTERBURNER, "AACENC_AFTERBURNER", 1),
         ];
         for (param, name, value) in params {
