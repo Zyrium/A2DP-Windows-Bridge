@@ -881,7 +881,10 @@ impl HostApp {
             Some(A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_MPEG_AAC_CAPABILITY) => {
                 let seid = u8_at(p, 5).unwrap_or(0);
                 self.caps.add_aac(seid);
-                tracing::info!("remote supports AAC (SEID {seid})");
+                // Logging only: the raw BTstack AAC capability fields after the SEID
+                // (object type, sampling frequency, channels, VBR, bit rate)
+                let raw: Vec<String> = p.get(6..).unwrap_or(&[]).iter().map(|b| format!("{b:02X}")).collect();
+                tracing::info!("remote supports AAC (SEID {seid}, capability event bytes [{}])", raw.join(" "));
             }
             Some(A2DP_SUBEVENT_SIGNALING_CAPABILITIES_COMPLETE) => {
                 let c = &self.caps;
