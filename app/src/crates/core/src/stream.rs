@@ -363,6 +363,7 @@ fn peer_params(remote: &RemoteCaps, kind: CodecKind, channels: u32) -> PeerParam
         opus_frame_ms,
         opus_channels,
         opus_max_bitrate,
+        aac_max_bitrate: if kind == CodecKind::Aac { remote.aac_max_bitrate() } else { 0 },
     }
 }
 

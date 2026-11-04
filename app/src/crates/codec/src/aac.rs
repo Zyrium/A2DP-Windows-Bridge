@@ -61,6 +61,13 @@ impl AacEncoder {
         let max_bitrate =
             u32::try_from(u64::from(config.mtu) * 8 * u64::from(config.sample_rate) / 1024).unwrap_or(u32::MAX);
         let mut bitrate = quality_bitrate(config.quality);
+        // Never above the sink's peak bit rate (what the configuration says)
+        let peak = config.peer.aac_max_bitrate;
+        if peak > 0 && bitrate > peak {
+            tracing::info!("AAC: bit rate limited to {peak} bps by the sink's peak bit rate");
+            bitrate = peak;
+        }
+        let max_bitrate = if peak > 0 { max_bitrate.min(peak) } else { max_bitrate };
         if bitrate > max_bitrate {
             tracing::info!("AAC: bit rate limited to {max_bitrate} bps by the {}-byte media payload", config.mtu);
             bitrate = max_bitrate;

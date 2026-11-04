@@ -321,6 +321,52 @@ pub fn local_endpoints() -> Vec<LocalEndpoint> {
     eps
 }
 
+/// AAC capabilities as BTstack reports them (bitmaps shifted as in its
+/// MPEG_AAC_CAPABILITY event)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AacCapabilities {
+    /// 0x40 MPEG-2 AAC LC, 0x20 MPEG-4 AAC LC, 0x10 LTP, 0x08 scalable, ...
+    pub object_types: u8,
+    /// 12 bits: 0x800 8 kHz ... 0x010 44.1 kHz, 0x008 48 kHz, ... 0x001 96 kHz
+    pub frequencies: u16,
+    /// 0x08 mono, 0x04 stereo (0x02 5.1, 0x01 7.1)
+    pub channels: u8,
+    /// Peak bit rate in bps (0 = not specified)
+    pub bit_rate: u32,
+    pub vbr: bool,
+}
+
+impl AacCapabilities {
+    pub const FREQ_44100: u16 = 0x010;
+    pub const FREQ_48000: u16 = 0x008;
+    pub const CHANNELS_1: u8 = 0x08;
+    pub const CHANNELS_2: u8 = 0x04;
+
+    /// Whether the sink takes `rate` (unknown bitmap: assume yes)
+    pub fn supports_rate(&self, rate: u32) -> bool {
+        let bit = match rate {
+            44100 => Self::FREQ_44100,
+            48000 => Self::FREQ_48000,
+            _ => return false,
+        };
+        self.frequencies == 0 || self.frequencies & bit != 0
+    }
+
+    /// Whether the sink takes `channels` (unknown bitmap: assume yes)
+    pub fn supports_channels(&self, channels: u32) -> bool {
+        let bit = if channels == 1 { Self::CHANNELS_1 } else { Self::CHANNELS_2 };
+        self.channels == 0 || self.channels & bit != 0
+    }
+}
+
+/// The AAC bit rate configured and encoded at most
+pub const AAC_MAX_BITRATE: u32 = 256_000;
+
+/// 256 kbps, at most the sink's peak bit rate when it gives one
+pub fn aac_bitrate(peak: u32) -> u32 {
+    if peak == 0 { AAC_MAX_BITRATE } else { AAC_MAX_BITRATE.min(peak) }
+}
+
 /// A codec the remote offers on one of its SEPs
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RemoteSep {
@@ -334,6 +380,8 @@ pub struct RemoteCaps {
     /// The SBC SEP's capabilities, when reported (SBC XQ needs them)
     pub sbc_caps: Option<SbcCapabilities>,
     pub aac: Option<RemoteSep>,
+    /// The AAC SEP's capabilities, when reported
+    pub aac_caps: Option<AacCapabilities>,
     pub ldac: Option<RemoteSep>,
     pub aptx: Option<RemoteSep>,
     pub aptx_hd: Option<RemoteSep>,
@@ -443,6 +491,17 @@ impl RemoteCaps {
 
     pub fn add_aac(&mut self, seid: u8) {
         self.aac = Some(RemoteSep { seid });
+    }
+
+    /// AAC SEP `seid` with its capabilities
+    pub fn add_aac_caps(&mut self, seid: u8, caps: AacCapabilities) {
+        self.aac = Some(RemoteSep { seid });
+        self.aac_caps = Some(caps);
+    }
+
+    /// The sink's AAC peak bit rate in bps (0 = not known)
+    pub fn aac_max_bitrate(&self) -> u32 {
+        self.aac_caps.map(|c| c.bit_rate).unwrap_or(0)
     }
 
     /// A vendor codec capability (media codec information) of SEP `seid`
@@ -720,7 +779,19 @@ impl RemoteCaps {
                 }
             }
             CodecKind::Aac => {
-                ConfigRequest::Aac { sampling_frequency: sample_rate, channels: channels as u8, bit_rate: 256_000 }
+                // Within what the sink announced: the rate (the capture is
+                // 44.1 or 48 kHz), the channels and the peak bit rate (the
+                // QCY MeloBuds N70 caps it at 196608 bps; 256 kbps over it
+                // played silence)
+                let caps = self.aac_caps.unwrap_or_default();
+                if !caps.supports_rate(sample_rate) {
+                    return Err(ConfigError::SampleRate(kind, sample_rate));
+                }
+                ConfigRequest::Aac {
+                    sampling_frequency: sample_rate,
+                    channels: channels as u8,
+                    bit_rate: aac_bitrate(caps.bit_rate),
+                }
             }
             CodecKind::Ldac => {
                 let freq = match sample_rate {
@@ -1368,5 +1439,50 @@ mod tests {
         assert_eq!(caps.pick_aptx_sample_rate(CodecKind::Aptx, 48000), 44100);
         assert_eq!(caps.pick_aptx_sample_rate(CodecKind::Aptx, 96000), 44100);
         assert!(caps.configuration(CodecKind::Aptx, 48000, 2, 16).is_err());
+    }
+
+    // QCY MeloBuds N70: MPEG-2 AAC LC, 44.1/48 kHz, mono/stereo, peak 196608 bps
+    const N70_AAC: AacCapabilities =
+        AacCapabilities { object_types: 0x40, frequencies: 0x018, channels: 0x0C, bit_rate: 196_608, vbr: true };
+
+    #[test]
+    fn aac_bitrate_stays_within_the_sink_peak() {
+        assert_eq!(aac_bitrate(0), 256_000);
+        assert_eq!(aac_bitrate(196_608), 196_608);
+        assert_eq!(aac_bitrate(320_000), 256_000);
+    }
+
+    #[test]
+    fn aac_configuration_uses_the_sink_capabilities() {
+        if !CodecKind::Aac.available() {
+            return;
+        }
+        let mut caps = RemoteCaps::default();
+        caps.add_sbc(1);
+        caps.add_aac_caps(2, N70_AAC);
+        assert_eq!(caps.aac_max_bitrate(), 196_608);
+        for rate in [44100, 48000] {
+            let c = caps.configuration(CodecKind::Aac, rate, 2, 16).unwrap();
+            assert_eq!(c.request, ConfigRequest::Aac { sampling_frequency: rate, channels: 2, bit_rate: 196_608 });
+        }
+        // Without capabilities: 256 kbps, as before
+        let mut plain = RemoteCaps::default();
+        plain.add_aac(2);
+        assert_eq!(plain.aac_max_bitrate(), 0);
+        let c = plain.configuration(CodecKind::Aac, 48000, 2, 16).unwrap();
+        assert_eq!(c.request, ConfigRequest::Aac { sampling_frequency: 48000, channels: 2, bit_rate: 256_000 });
+        // A rate the sink does not take
+        let only_44 = AacCapabilities { frequencies: AacCapabilities::FREQ_44100, ..N70_AAC };
+        caps.add_aac_caps(2, only_44);
+        assert!(caps.configuration(CodecKind::Aac, 48000, 2, 16).is_err());
+    }
+
+    #[test]
+    fn aac_capability_bitmaps() {
+        assert!(N70_AAC.supports_rate(44100) && N70_AAC.supports_rate(48000));
+        assert!(!N70_AAC.supports_rate(96000));
+        assert!(N70_AAC.supports_channels(1) && N70_AAC.supports_channels(2));
+        let unknown = AacCapabilities::default();
+        assert!(unknown.supports_rate(48000) && unknown.supports_channels(2));
     }
 }
