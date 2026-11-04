@@ -880,8 +880,29 @@ impl HostApp {
             }
             Some(A2DP_SUBEVENT_SIGNALING_MEDIA_CODEC_MPEG_AAC_CAPABILITY) => {
                 let seid = u8_at(p, 5).unwrap_or(0);
-                self.caps.add_aac(seid);
-                tracing::info!("remote supports AAC (SEID {seid})");
+                // BTstack event: media type 6, object types 7, frequencies 8-9
+                // (LE), channels 10, peak bit rate 11-13 (LE), VBR 14
+                let at = |i| u8_at(p, i).unwrap_or(0);
+                let aac = codec::caps::AacCapabilities {
+                    object_types: at(7),
+                    frequencies: u16::from(at(8)) | (u16::from(at(9)) << 8),
+                    channels: at(10),
+                    bit_rate: u32::from(at(11)) | (u32::from(at(12)) << 8) | (u32::from(at(13)) << 16),
+                    vbr: at(14) != 0,
+                };
+                self.caps.add_aac_caps(seid, aac);
+                tracing::info!(
+                    "remote AAC caps: object types 0x{:02X}, frequencies 0x{:03X}, channels 0x{:X}, peak {} bps, VBR {}",
+                    aac.object_types,
+                    aac.frequencies,
+                    aac.channels,
+                    aac.bit_rate,
+                    aac.vbr
+                );
+                // Logging only: the raw BTstack AAC capability fields after the SEID
+                // (object type, sampling frequency, channels, VBR, bit rate)
+                let raw: Vec<String> = p.get(6..).unwrap_or(&[]).iter().map(|b| format!("{b:02X}")).collect();
+                tracing::info!("remote supports AAC (SEID {seid}, capability event bytes [{}])", raw.join(" "));
             }
             Some(A2DP_SUBEVENT_SIGNALING_CAPABILITIES_COMPLETE) => {
                 let c = &self.caps;

@@ -1,9 +1,10 @@
 // The contract between the "Fones" screen and the QCY headset control
 // (BLE/GATT, crates/qcy-protocol). The Rust side: src-tauri/commands.rs
 // (qcy_*) and the core's qcy.* requests (core/src/qcy_live.rs). This
-// version reads everything and changes five settings, one command per
+// version reads everything and changes six settings, one command per
 // click (`writable`): game mode, sleep mode, wind reduction, noise control
-// and wear detection, all verified on the N70; the prompt volume is read-only. Any other qcy_set and qcy_save_profile reject with
+// and wear detection, all verified on the N70, plus the ten-band equalizer
+// (phase F4, 0x22, "Em teste"); the prompt volume is read-only. Any other qcy_set and qcy_save_profile reject with
 // qcy.read_only. In a plain browser, or with ?qcy=mock, the mock provider of
 // qcyMock.ts stands in for it.
 //
@@ -63,6 +64,26 @@ export const EQ_BANDS_HZ = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000
 export const EQ_GAIN_MIN = -8;
 export const EQ_GAIN_MAX = 8;
 
+/** Whether ten gains can be written (±8 dB, whole hundredths), as the
+ *  core's qcy_protocol::write::eq_curve_from_db */
+export function eqWritable(gains: readonly number[]): boolean {
+  return (
+    gains.length === EQ_BANDS_HZ.length &&
+    gains.every((g) => Number.isFinite(g) && Math.abs(g * 100 - Math.round(g * 100)) < 1e-6 && Math.abs(Math.round(g * 100)) <= 800)
+  );
+}
+
+/** The 0x22 frame of ten gains, hex, as qcy_protocol::write::eq_frame:
+ *  FF 4B 22 49 08 0000 {freq u16 LE, gain i16 LE 1/100 dB, Q 0064, type 00} × 10 */
+export function eqFrameHex(gains: readonly number[]): string {
+  const le16 = (n: number) => {
+    const v = n & 0xffff;
+    return [v & 0xff, v >> 8].map((b) => b.toString(16).toUpperCase().padStart(2, "0")).join("");
+  };
+  const bands = EQ_BANDS_HZ.map((hz, i) => `${le16(hz)}${le16(Math.round(gains[i] * 100))}640000`).join("");
+  return `FF4B2249080000${bands}`;
+}
+
 export interface Equalizer {
   /** A preset id of eqPresets.ts, or "custom" */
   preset: string;
@@ -95,6 +116,12 @@ export interface QcyState {
   write?: QcyWrite | null;
   /** The headset's own equalizer preset number, when it reported one */
   eq_preset_index?: number | null;
+  /** Phase F4: the curve was read and parsed (ten bands at the fixed
+   *  frequencies); false: eq.gains are placeholders and nothing is written */
+  eq_known?: boolean;
+  /** Phase F4: the curve read before the first equalizer write ("Restaurar
+   *  curva original"), kept in qcy-cache.json; null before the first */
+  eq_original?: { preset: number; gains: number[]; saved_at: number } | null;
   device_name: string;
   address: string;
   firmware: string | null;
@@ -155,6 +182,11 @@ export interface QcyWrite {
   read_back: string | null;
   steps: QcyWriteStep[];
   at_ms: number;
+  /** Phase F4 (equalizer): the ten gains asked for and those read before
+   *  (dB), and the earbuds' preset number read before */
+  gains?: number[] | null;
+  previous_gains?: number[] | null;
+  previous_preset_index?: number | null;
 }
 
 /** The codes of { kind: "noise_control" } (qcy_protocol::write::NOISE_PRESETS):
@@ -186,6 +218,9 @@ export type QcyChange =
   | { kind: "noise_control"; value: number }
   | { kind: "auto_off"; minutes: AutoOff }
   | { kind: "eq"; eq: Equalizer }
+  /** Phase F4: ten gains in dB (EQ_BANDS_HZ order, ±8, 0.01 steps); the
+   *  core writes preset 8, master gain 0, Q 1.00, type 0 */
+  | { kind: "equalizer"; gains: number[] }
   | { kind: "gesture"; side: Side; gesture: GestureKind; action: TouchAction };
 
 export const QCY_COMMANDS = {
