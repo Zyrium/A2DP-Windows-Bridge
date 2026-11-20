@@ -537,6 +537,9 @@ impl GattClient {
                 match op {
                     Op::Read { handle, .. } => format!("read 0x{handle:04X}"),
                     Op::Write { handle, value, .. } => format!("write 0x{handle:04X} {value:02X?}"),
+                    Op::WriteNoResponse { handle, value, .. } => {
+                        format!("write-no-resp 0x{handle:04X} {value:02X?}")
+                    }
                     Op::Subscribe { chr, config, .. } => format!("CCC 0x{config:04X} of 0x{:04X}", chr.value_handle),
                     Op::Discover { .. } => "discovery".to_string(),
                     Op::Barrier { .. } => "barrier".to_string(),
