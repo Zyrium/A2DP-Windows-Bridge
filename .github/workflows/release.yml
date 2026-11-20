@@ -51,20 +51,20 @@ jobs:
         working-directory: app/src/ui
         run: pnpm install --frozen-lockfile
 
-      - name: Install Inno Setup 7
+      - name: Install Inno Setup 7.1.0
         shell: pwsh
         run: |
-          $iscc = @(
-            (Get-Command ISCC.exe -ErrorAction SilentlyContinue)?.Source
-            foreach ($base in $env:LOCALAPPDATA, ${env:ProgramFiles(x86)}, $env:ProgramFiles) {
-              if ($base) { Join-Path $base 'Programs/Inno Setup 7/ISCC.exe'; Join-Path $base 'Inno Setup 7/ISCC.exe' }
-            }
-          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
-          if (-not $iscc) {
+          $dir = 'C:\InnoSetup7'
+          $iscc = Join-Path $dir 'ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc -PathType Leaf)) {
             $exe = Join-Path $env:TEMP 'innosetup-7.1.0.exe'
             Invoke-WebRequest -Uri 'https://files.jrsoftware.org/is/7/innosetup-7.1.0.exe' -OutFile $exe
-            Start-Process -FilePath $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-' -Wait
+            Start-Process -FilePath $exe -ArgumentList "/DIR=$dir",'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-' -Wait
           }
+          if (-not (Test-Path -LiteralPath $iscc -PathType Leaf)) {
+            throw "ISCC.exe not found at $iscc after install"
+          }
+          "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build release packages (x64)
         shell: pwsh
