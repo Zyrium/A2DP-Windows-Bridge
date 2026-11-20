@@ -1,0 +1,100 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v3.0.2)"
+        required: true
+        default: "v3.0.2"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    name: Build & Release (win64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Tags of extern/opus
+        run: git -C extern/opus fetch --depth 1 --tags origin
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@cargo-about
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: app/src/ui/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/src/ui/pnpm-lock.yaml
+
+      - name: Install UI dependencies
+        working-directory: app/src/ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Inno Setup 7
+        shell: pwsh
+        run: |
+          $iscc = @(
+            (Get-Command ISCC.exe -ErrorAction SilentlyContinue)?.Source
+            foreach ($base in $env:LOCALAPPDATA, ${env:ProgramFiles(x86)}, $env:ProgramFiles) {
+              if ($base) { Join-Path $base 'Programs/Inno Setup 7/ISCC.exe'; Join-Path $base 'Inno Setup 7/ISCC.exe' }
+            }
+          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+          if (-not $iscc) {
+            $exe = Join-Path $env:TEMP 'innosetup-7.1.0.exe'
+            Invoke-WebRequest -Uri 'https://files.jrsoftware.org/is/7/innosetup-7.1.0.exe' -OutFile $exe
+            Start-Process -FilePath $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-' -Wait
+          }
+
+      - name: Build release packages (x64)
+        shell: pwsh
+        run: pwsh installer/build-release.ps1 -Arch x64
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
+          $assets = Get-ChildItem -Path target/dist -File | Where-Object { $_.Name -like 'BlueCaster-*' } | ForEach-Object { $_.FullName }
+          if (-not $assets) { throw "No release assets found in target/dist" }
+
+          $notes = @"
+          Baseado no **BlueCaster $tag** com customizações locais preservadas:
+
+          - **Suporte QCY MeloBuds N70**: tela **Fones**, controle de ruído (ANC/Transparência), Modo Jogo, Modo Sono, Redução de Vento e Detecção de Uso.
+          - **Português do Brasil (\`pt-BR\`)**: tradução completa atualizada para a $tag.
+
+          ### Arquivos
+          - \`BlueCaster-*-win64-setup.exe\`: instalador Windows (x64)
+          - \`BlueCaster-*-win64-portable.zip\`: versão portátil (x64)
+          - \`BlueCaster-*-win64-symbols.zip\`: símbolos de depuração (.pdb)
+          "@
+
+          $exists = $true
+          try { gh release view $tag | Out-Null } catch { $exists = $false }
+          if ($exists) {
+            gh release upload $tag @assets --clobber
+          } else {
+            gh release create $tag @assets --title "BlueCaster $tag (QCY + pt-BR)" --notes $notes
+          }
