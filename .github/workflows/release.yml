@@ -79,22 +79,25 @@ jobs:
           $assets = Get-ChildItem -Path target/dist -File | Where-Object { $_.Name -like 'BlueCaster-*' } | ForEach-Object { $_.FullName }
           if (-not $assets) { throw "No release assets found in target/dist" }
 
-          $notes = @"
-          Baseado no **BlueCaster $tag** com customizações locais preservadas:
+          $notes = @'
+          Baseado no **BlueCaster __TAG__** com customizações locais preservadas:
 
           - **Suporte QCY MeloBuds N70**: tela **Fones**, controle de ruído (ANC/Transparência), Modo Jogo, Modo Sono, Redução de Vento e Detecção de Uso.
-          - **Português do Brasil (\`pt-BR\`)**: tradução completa atualizada para a $tag.
+          - **Português do Brasil (`pt-BR`)**: tradução completa atualizada para a __TAG__.
 
           ### Arquivos
-          - \`BlueCaster-*-win64-setup.exe\`: instalador Windows (x64)
-          - \`BlueCaster-*-win64-portable.zip\`: versão portátil (x64)
-          - \`BlueCaster-*-win64-symbols.zip\`: símbolos de depuração (.pdb)
-          "@
+          - `BlueCaster-*-win64-setup.exe`: instalador Windows (x64)
+          - `BlueCaster-*-win64-portable.zip`: versão portátil (x64)
+          - `BlueCaster-*-win64-symbols.zip`: símbolos de depuração (.pdb)
+          '@.Replace('__TAG__', $tag)
 
-          $exists = $true
-          try { gh release view $tag | Out-Null } catch { $exists = $false }
+          $ErrorActionPreference = 'Continue'
+          gh release view $tag 2>$null | Out-Null
+          $exists = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = 'Stop'
           if ($exists) {
             gh release upload $tag @assets --clobber
           } else {
             gh release create $tag @assets --title "BlueCaster $tag (QCY + pt-BR)" --notes $notes
           }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
