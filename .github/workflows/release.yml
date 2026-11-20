@@ -57,8 +57,8 @@ jobs:
           $dir = 'C:\InnoSetup7'
           $iscc = Join-Path $dir 'ISCC.exe'
           if (-not (Test-Path -LiteralPath $iscc -PathType Leaf)) {
-            $exe = Join-Path $env:TEMP 'innosetup-7.1.0.exe'
-            Invoke-WebRequest -Uri 'https://files.jrsoftware.org/is/7/innosetup-7.1.0.exe' -OutFile $exe
+            $exe = Join-Path $env:TEMP 'innosetup-7.1.0-x64.exe'
+            Invoke-WebRequest -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe' -OutFile $exe
             Start-Process -FilePath $exe -ArgumentList "/DIR=$dir",'/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-' -Wait
           }
           if (-not (Test-Path -LiteralPath $iscc -PathType Leaf)) {
