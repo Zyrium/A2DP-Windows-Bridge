@@ -505,7 +505,6 @@ function MainTab(props: {
 }) {
   const s = () => props.s;
   const can = (k: string) => props.can?.(k) ?? true;
-  const ok = (k: string) => props.verified?.includes(k) === true;
   const locked = (k: string) => props.partial === true && !can(k);
   /** The tag of a control in the partial (write test) mode */
   const tag = (_k: string) => undefined;
@@ -800,7 +799,6 @@ function SettingsTab(props: {
   const lockAll = () => props.partial === true;
   /** Phase F3b: wear detection is writable (verified on the N70, 2026-10-31) */
   const wearWritable = () => props.partial === true && can("wear_detection");
-  const wearOk = () => props.verified?.includes("wear_detection") === true;
   // The switch stays on until the dialog's answer: the click flipped the
   // native checkbox, so it is put back (off -> on makes Solid set it again)
   const [ldacUi, setLdacUi] = createSignal(true);
