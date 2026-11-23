@@ -2536,7 +2536,14 @@ impl CoreState {
                     stream.profile = self.starting_profile.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 }
                 if state == CoreStreamState::Streaming && stream.state != StreamState::Streaming {
-                    let (addr, name) = streamed_device(&s).unwrap_or(("", ""));
+                    let name = streamed_device(&s).unwrap_or("");
+                    let addr = s
+                        .stream
+                        .profile
+                        .as_ref()
+                        .and_then(|n| s.profiles.iter().find(|p| &p.name == n))
+                        .map(|p| p.device_address.as_str())
+                        .unwrap_or("");
                     if crate::qcy_live::should_auto_refresh(&self.config_dir(), addr, name) {
                         let me = self.clone();
                         std::thread::spawn(move || {
