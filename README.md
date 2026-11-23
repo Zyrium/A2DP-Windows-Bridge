@@ -1,4 +1,18 @@
-# BlueCaster (formerly A2DP-Windows-Bridge)
+# BlueCaster (QCY + pt-BR Fork — formerly A2DP-Windows-Bridge)
+
+Fork of **[SeiyaFunaokaJP/BlueCaster](https://github.com/SeiyaFunaokaJP/BlueCaster)** (currently synced with **v3.0.4**), adding native **QCY MeloBuds N70** control and full **Brazilian Portuguese (`pt-BR`)** localization.
+
+## Fork Additions
+
+- **QCY MeloBuds N70 control (`Fones` / `Earbuds` screen)** via the [`qcy-protocol`](app/src/crates/qcy-protocol) crate and plain BLE GATT links (no pairing required, without interrupting A2DP/LDAC playback):
+  - Live battery levels (left, right, case, charging state) and firmware version
+  - Noise control: Off, Noise Cancelling (ANC with Adaptive, Indoor, Commuting, Noisy, and Anti-wind scenes), and Transparency
+  - Modes: Game mode, Sleep mode, and Wind reduction
+  - Wear detection (with read-back confirmation) and Prompt volume (read-only)
+- **Brazilian Portuguese (`pt-BR`)**: complete UI translation ([`app/lang/pt-BR.json`](app/lang/pt-BR.json)) updated for **v3.0.4**.
+- **Automated Windows x64 releases**: GitHub Actions workflow ([`.github/workflows/release.yml`](.github/workflows/release.yml)) building `-win64-setup.exe`, `-win64-portable.zip`, and `-win64-symbols.zip`.
+
+---
 
 **Hi-Fi Bluetooth audio for Windows.** BlueCaster turns your Bluetooth adapter into a Hi-Fi audio transmitter. It streams Hi-Fi codecs like **LDAC@96 kHz**, **LHDC V5@192 kHz** and **aptX Adaptive** to your headphones and earbuds. Windows doesn't support any of these codecs on its own.
 
@@ -8,7 +22,7 @@
 
 ![BlueCaster's Codecs screen, streaming LDAC 990 kbps / 96 kHz to Sony WH-1000XM4, with its card above Windows Quick Settings](docs/images/app_sample.png)
 
-**[Download](https://github.com/SeiyaFunaokaJP/BlueCaster/releases)** (installer `-setup.exe` or `-portable.zip`) | **[Documentation](https://seiyafunaokajp.github.io/BlueCaster/)**
+**[Download (Fork Releases)](https://github.com/Zyrium/A2DP-Windows-Bridge/releases)** (installer `-win64-setup.exe` or `-win64-portable.zip`) | **[Upstream](https://github.com/SeiyaFunaokaJP/BlueCaster)** | **[Documentation](https://seiyafunaokajp.github.io/BlueCaster/)**
 
 ## Codecs
 
@@ -58,7 +72,7 @@ See the [Setup guide](https://seiyafunaokajp.github.io/BlueCaster/setup) and the
 - **Diagnostics**: link quality, AFH (avoids your Wi-Fi channels), connection flow, log, HCI capture
 - **Command line**: `bluecaster-core.exe --cli` ([CLI Mode](https://seiyafunaokajp.github.io/BlueCaster/usage#cli-mode))
 - **Updates**: checks daily and installs updates automatically
-- **10 languages**: English, Japanese, Chinese (Simplified / Traditional), Korean, German, French, Spanish, Ukrainian, Russian
+- **11 languages**: English, Portuguese (Brazil), Japanese, Chinese (Simplified / Traditional), Korean, German, French, Spanish, Ukrainian, Russian
 - **Headset microphone**: use your headphones' microphone in Windows apps through a virtual audio cable such as VB-CABLE, with gain, noise suppression and a noise gate. In **Auto** mode, the microphone turns on only while an app is recording. While the microphone is on, classic Bluetooth headphones drop to call quality, but LE Audio headphones keep full quality ([details](https://seiyafunaokajp.github.io/BlueCaster/usage#codecs))
 - **Works with** third-party apps such as earbud control apps: [Works With](https://seiyafunaokajp.github.io/BlueCaster/works-with) (not supported by this project)
 
@@ -67,8 +81,8 @@ See the [Setup guide](https://seiyafunaokajp.github.io/BlueCaster/setup) and the
 Requirements: **Rust** 1.90+, **Visual Studio 2022+** with the C++ desktop workload, **Node.js 22** with **pnpm** (`corepack enable`), **Git**, **PowerShell 7**.
 
 ```powershell
-git clone --recursive https://github.com/SeiyaFunaokaJP/BlueCaster.git
-cd BlueCaster
+git clone --recursive https://github.com/Zyrium/A2DP-Windows-Bridge.git
+cd A2DP-Windows-Bridge
 pwsh ./build.ps1                      # bluecaster.exe, bluecaster-core.exe, bluecaster-driver.exe in target/release/
 pwsh ./build.ps1 -Release -Arch x64   # installer and portable zip (-Arch arm64 for ARM64)
 ```
