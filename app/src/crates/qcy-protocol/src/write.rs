@@ -69,9 +69,19 @@ use std::time::{Duration, Instant};
 use crate::commands::{self, opcode};
 use crate::packet;
 
-/// The opcodes this build may write (exactly these five)
-pub const ALLOWED: [u8; 5] =
-    [opcode::GAME_MODE, opcode::SLEEP_MODE, opcode::WIND_DETECTION, opcode::NOISE_CONTROL, opcode::WEARING_DETECTION];
+/// The opcodes this build may write
+pub const ALLOWED: [u8; 10] = [
+    opcode::GAME_MODE,
+    opcode::SLEEP_MODE,
+    opcode::WIND_DETECTION,
+    opcode::NOISE_CONTROL,
+    opcode::WEARING_DETECTION,
+    opcode::LDAC,
+    opcode::MULTIPOINT,
+    opcode::AUTO_POWER_OFF,
+    opcode::EQUALIZER,
+    opcode::KEY_FUNCTIONS,
+];
 
 /// The highest music / ANC action byte copied into a 0x2C write (the N70
 /// reports `01`; anything above is not a known action and is never
@@ -186,12 +196,27 @@ pub enum Setting {
     NoiseControl,
     /// 0x2C (phase F3b): on/off; the other bytes come from the read
     WearDetection,
+    Ldac,
+    Multipoint,
+    AutoPowerOff,
+    Equalizer,
+    KeyFunctions,
 }
 
 impl Setting {
     /// The writable settings (prompt volume is read-only)
-    pub const ALL: [Setting; 5] =
-        [Setting::GameMode, Setting::SleepMode, Setting::WindReduction, Setting::NoiseControl, Setting::WearDetection];
+    pub const ALL: [Setting; 10] = [
+        Setting::GameMode,
+        Setting::SleepMode,
+        Setting::WindReduction,
+        Setting::NoiseControl,
+        Setting::WearDetection,
+        Setting::Ldac,
+        Setting::Multipoint,
+        Setting::AutoPowerOff,
+        Setting::Equalizer,
+        Setting::KeyFunctions,
+    ];
 
     pub fn opcode(self) -> u8 {
         match self {
@@ -201,6 +226,11 @@ impl Setting {
             Setting::PromptVolume => opcode::PROMPT_VOLUME,
             Setting::NoiseControl => opcode::NOISE_CONTROL,
             Setting::WearDetection => opcode::WEARING_DETECTION,
+            Setting::Ldac => opcode::LDAC,
+            Setting::Multipoint => opcode::MULTIPOINT,
+            Setting::AutoPowerOff => opcode::AUTO_POWER_OFF,
+            Setting::Equalizer => opcode::EQUALIZER,
+            Setting::KeyFunctions => opcode::KEY_FUNCTIONS,
         }
     }
     pub fn key(self) -> &'static str {
@@ -211,11 +241,24 @@ impl Setting {
             Setting::PromptVolume => "prompt_volume",
             Setting::NoiseControl => "noise_control",
             Setting::WearDetection => "wear_detection",
+            Setting::Ldac => "ldac",
+            Setting::Multipoint => "multipoint",
+            Setting::AutoPowerOff => "auto_off",
+            Setting::Equalizer => "eq",
+            Setting::KeyFunctions => "gesture",
         }
     }
     /// On/off (01/02) rather than a level
     pub fn is_toggle(self) -> bool {
-        !matches!(self, Setting::PromptVolume | Setting::NoiseControl)
+        matches!(
+            self,
+            Setting::GameMode
+                | Setting::SleepMode
+                | Setting::WindReduction
+                | Setting::WearDetection
+                | Setting::Ldac
+                | Setting::Multipoint
+        )
     }
     /// The UI's change kind -> the setting; None for everything not allowed
     pub fn from_kind(kind: &str) -> Option<Setting> {
@@ -256,11 +299,30 @@ pub fn build(op: u8, parameters: &[u8]) -> Result<Vec<u8>, Refused> {
         return Err(Refused::NotAllowed(op));
     }
     match (op, parameters) {
-        (opcode::GAME_MODE | opcode::SLEEP_MODE | opcode::WIND_DETECTION, [0x01] | [0x02]) => {
-            Ok(packet::frame(op, parameters))
-        }
+        (
+            opcode::GAME_MODE
+            | opcode::SLEEP_MODE
+            | opcode::WIND_DETECTION
+            | opcode::LDAC
+            | opcode::MULTIPOINT,
+            [0x01] | [0x02],
+        ) => Ok(packet::frame(op, parameters)),
         (opcode::NOISE_CONTROL, p) if NOISE_PRESETS.iter().any(|n| n.2 == p) => Ok(packet::frame(op, p)),
         (opcode::WEARING_DETECTION, p) if wear_parameters_ok(p) => Ok(packet::frame(op, p)),
+        (opcode::AUTO_POWER_OFF, [m0, m1, 0x00, 0x00]) => {
+            let mins = u16::from_le_bytes([*m0, *m1]);
+            if mins == 0xFFFF || matches!(mins, 5 | 15 | 30 | 60) {
+                Ok(packet::frame(op, parameters))
+            } else {
+                Err(Refused::BadParameters(op, parameters.to_vec()))
+            }
+        }
+        (opcode::EQUALIZER, p)
+            if commands::EqualizerState::parse_v2(p).is_some_and(|e| e.bands.len() == commands::EQUALIZER_FREQUENCIES.len()) =>
+        {
+            Ok(packet::frame(op, p))
+        }
+        (opcode::KEY_FUNCTIONS, p) if p.len() >= 2 && p.len().is_multiple_of(2) => Ok(packet::frame(op, p)),
         _ => Err(Refused::BadParameters(op, parameters.to_vec())),
     }
 }
@@ -342,6 +404,14 @@ pub fn confirms_for(setting: Setting, sent: &[u8], got: &[u8]) -> bool {
     } else if setting == Setting::NoiseControl {
         // All three bytes, exactly
         sent.len() == 3 && got.get(..3) == Some(sent)
+    } else if setting == Setting::AutoPowerOff {
+        sent.len() >= 2 && got.get(..2) == sent.get(..2)
+    } else if setting == Setting::Equalizer {
+        commands::EqualizerState::parse_v2(got).is_some()
+    } else if setting == Setting::KeyFunctions {
+        let want = commands::parse_key_functions(sent);
+        let got_map = commands::parse_key_functions(got);
+        !want.is_empty() && want.iter().all(|(k, v)| got_map.get(k) == Some(v))
     } else {
         matches!((sent.first(), got.first()), (Some(s), Some(g)) if s == g)
     }
@@ -623,6 +693,68 @@ pub fn run<T: Transport>(t: &mut T, setting: Setting, value: u8, timeout: Durati
     out
 }
 
+/// [`run`] for a pre-framed setting (`AutoPowerOff`, `Equalizer`, `KeyFunctions`):
+/// validates the frame with [`build`], sends it once, and confirms with a read-back.
+pub fn run_frame<T: Transport>(t: &mut T, setting: Setting, frame: Vec<u8>, timeout: Duration) -> Outcome {
+    let op = setting.opcode();
+    let mut out = Outcome {
+        setting,
+        value: 0,
+        previous: None,
+        max: None,
+        sent: None,
+        read_back: None,
+        failure: None,
+        wind_after: None,
+        steps: Vec::new(),
+    };
+    let valid = frame.len() >= 4 && frame[0] == 0xFF && frame[2] == op && build(op, &frame[4..]).is_ok();
+    if !valid {
+        out.steps.push(Step { what: "refused", detail: packet::to_hex(&frame) });
+        out.failure = Some(Failure::OutOfRange);
+        return out;
+    }
+
+    drain(t);
+    let request = commands::request(op);
+    if let Err(e) = t.send(&frame) {
+        out.steps.push(Step { what: "send_failed", detail: format!("{}: {e}", packet::to_hex(&frame)) });
+        out.failure = Some(Failure::SendFailed);
+        return out;
+    }
+    let written = Instant::now();
+    out.sent = Some(frame.clone());
+    out.steps.push(Step { what: "sent", detail: packet::to_hex(&frame) });
+
+    let listen_until = written + NOTIFY_WINDOW.min(timeout / 2);
+    while let Some(left) = listen_until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
+        if let Some(v) = t.recv(left) {
+            out.steps.push(Step { what: "notify", detail: packet::to_hex(&v) });
+        }
+    }
+    while let Some(v) = t.recv(Duration::ZERO) {
+        out.steps.push(Step { what: "notify", detail: packet::to_hex(&v) });
+    }
+
+    let deadline = written + timeout;
+    let got = t.send(&request).ok().and_then(|()| wait_for(t, op, deadline));
+    let sent_params = &frame[4..];
+    match got {
+        None => {
+            out.steps.push(Step { what: "no_read_back", detail: format!("{} ms", timeout.as_millis()) });
+            out.failure = Some(Failure::Timeout);
+        }
+        Some(p) => {
+            out.steps.push(Step { what: "read_back", detail: packet::to_hex(&p) });
+            if !confirms_for(setting, sent_params, &p) {
+                out.failure = Some(Failure::Mismatch);
+            }
+            out.read_back = Some(p);
+        }
+    }
+    out
+}
+
 fn value_text(setting: Setting, v: u8, max: Option<u8>) -> String {
     if setting == Setting::NoiseControl {
         noise_name(v).to_string()
@@ -668,14 +800,17 @@ mod tests {
     }
 
     #[test]
-    fn exactly_the_five_settings_are_allowed() {
-        assert_eq!(ALLOWED, [0x09, 0x10, 0x2A, 0x17, 0x2C]);
+    fn exactly_the_allowed_settings_are_allowed() {
+        assert_eq!(
+            ALLOWED,
+            [0x09, 0x10, 0x2A, 0x17, 0x2C, 0x23, 0x24, 0x14, 0x22, 0x2B]
+        );
         for op in 0..=u8::MAX {
             for p in [&[0x01u8][..], &[0x02], &[0x00], &[0x0F], &[0x64], &[0x65], &[0xFF], &[0x01, 0x02], &[]] {
                 let r = build(op, p);
                 let ok = match op {
-                    0x09 | 0x10 | 0x2A => p == [0x01] || p == [0x02],
-                    // 0x17 and 0x2C take three or four bytes: none of these
+                    0x09 | 0x10 | 0x2A | 0x23 | 0x24 => p == [0x01] || p == [0x02],
+                    0x2B => p == [0x01, 0x02],
                     _ => false,
                 };
                 assert_eq!(r.is_ok(), ok, "0x{op:02X} {p:?}");
@@ -686,12 +821,16 @@ mod tests {
         assert_eq!(build(0x2A, &[]), Err(Refused::BadParameters(0x2A, vec![])));
         assert_eq!(build(0x1D, &[0x04]), Err(Refused::NotAllowed(0x1D)));
         assert!(Setting::from_kind("prompt_volume").is_none());
-        assert_eq!(build(0x23, &[0x01]), Err(Refused::NotAllowed(0x23)));
-        assert_eq!(build(0x24, &[0x01]), Err(Refused::NotAllowed(0x24)));
+        assert!(build(0x23, &[0x01]).is_ok());
+        assert!(build(0x24, &[0x01]).is_ok());
         assert_eq!(build(0x2C, &[0x01]), Err(Refused::BadParameters(0x2C, vec![1])));
-        assert_eq!(build(0x14, &[0xFF, 0xFF, 0, 0]), Err(Refused::NotAllowed(0x14)));
-        assert!(Setting::from_kind("ldac").is_none());
-        assert!(Setting::from_kind("multipoint").is_none());
+        assert!(build(0x14, &[0xFF, 0xFF, 0, 0]).is_ok());
+        assert_eq!(build(0x14, &[0x01, 0x00, 0, 0]), Err(Refused::BadParameters(0x14, vec![1, 0, 0, 0])));
+        assert!(Setting::from_kind("ldac").is_some());
+        assert!(Setting::from_kind("multipoint").is_some());
+        assert!(Setting::from_kind("auto_off").is_some());
+        assert!(Setting::from_kind("eq").is_some());
+        assert!(Setting::from_kind("gesture").is_some());
         assert!(Setting::from_kind("reapply_on_connect").is_none());
         for s in Setting::ALL {
             assert_eq!(Setting::from_kind(s.key()), Some(s));

@@ -209,41 +209,126 @@ fn keep_known(previous: Option<&Reading>, mut r: Reading) -> Reading {
 /// volume is read-only). Since phase F3b, `{ "kind": "wear_detection",
 /// "enabled": bool }` too (the music / ANC bytes are copied from the read
 /// made right before the write, never from the UI).
-pub fn allowed_change(change: &Value) -> Option<(Setting, u8)> {
-    let setting = Setting::from_kind(change.get("kind")?.as_str()?)?;
-    // Exactly kind + one value: no extra parameters ride along
-    if change.as_object()?.len() != 2 {
-        return None;
+#[derive(Debug, Clone, PartialEq)]
+pub enum QcyAction {
+    Byte(Setting, u8),
+    AutoOff(u16),
+    Eq { preset_index: u8, gains: Vec<f64> },
+    Gesture { key: u8, action: u8 },
+}
+
+pub fn parse_action(change: &Value) -> Option<QcyAction> {
+    let kind = change.get("kind")?.as_str()?;
+    match kind {
+        "auto_off" => {
+            let mins = match change.get("minutes") {
+                Some(Value::Null) | None => 0xFFFF,
+                Some(v) => u16::try_from(v.as_u64()?).ok().filter(|m| matches!(m, 5 | 15 | 30 | 60))?,
+            };
+            Some(QcyAction::AutoOff(mins))
+        }
+        "eq" => {
+            let eq = change.get("eq")?.as_object()?;
+            let preset_id = eq.get("preset")?.as_str()?;
+            let preset_index = EQ_PRESET_IDS
+                .iter()
+                .position(|&p| p == preset_id)
+                .map_or(commands::CUSTOM_EQUALIZER_PRESET, |i| i as u8);
+            let gains: Vec<f64> = eq
+                .get("gains")?
+                .as_array()?
+                .iter()
+                .map(|g| g.as_f64())
+                .collect::<Option<Vec<_>>>()?;
+            if gains.len() != commands::EQUALIZER_FREQUENCIES.len() {
+                return None;
+            }
+            Some(QcyAction::Eq { preset_index, gains })
+        }
+        "gesture" => {
+            let side = change.get("side")?.as_str()?;
+            let gesture = change.get("gesture")?.as_str()?;
+            let action_str = change.get("action")?.as_str()?;
+            let key = GESTURE_KEYS
+                .iter()
+                .find(|(_, s, g)| *s == side && *g == gesture)
+                .map(|(k, _, _)| *k)?;
+            let action = TOUCH_ACTIONS.iter().position(|&a| a == action_str)? as u8;
+            Some(QcyAction::Gesture { key, action })
+        }
+        _ => {
+            let setting = Setting::from_kind(kind)?;
+            if change.as_object()?.len() != 2 {
+                return None;
+            }
+            let value = match setting {
+                s if s.is_toggle() => write::on_off(change.get("enabled")?.as_bool()?),
+                Setting::NoiseControl => u8::try_from(change.get("value")?.as_u64()?).ok()?,
+                _ => return None,
+            };
+            write::check_value(setting, value).ok()?;
+            Some(QcyAction::Byte(setting, value))
+        }
     }
-    let value = match setting {
-        s if s.is_toggle() => write::on_off(change.get("enabled")?.as_bool()?),
-        Setting::NoiseControl => u8::try_from(change.get("value")?.as_u64()?).ok()?,
-        _ => return None,
-    };
-    // The same check the frame builder makes
-    write::check_value(setting, value).ok()?;
-    Some((setting, value))
+}
+
+pub fn allowed_change(change: &Value) -> Option<(Setting, u8)> {
+    match parse_action(change)? {
+        QcyAction::Byte(s, v) => Some((s, v)),
+        _ => None,
+    }
 }
 
 /// Changes one allowed setting (blocking: run off the async runtime). Err
 /// only when the change is refused (nothing sent); a write that is not
 /// confirmed is Ok with `write.status = "failed"` in the state.
 pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
-    let Some((setting, value)) = allowed_change(change) else {
+    let Some(action) = parse_action(change) else {
         tracing::warn!("QCY write: refused (not allowed in this version): {change}");
         return Err(());
     };
     let _one = READING.lock().unwrap_or_else(|e| e.into_inner());
-    tracing::info!(
-        "QCY write: {} -> {} (one command, confirmed by a read-back)",
-        setting.key(),
-        match setting {
-            Setting::NoiseControl => write::noise_name(value).to_string(),
-            s if s.is_toggle() => (if value == 0x01 { "on" } else { "off" }).to_string(),
-            _ => value.to_string(),
+    let (setting, value_for_log, outcome) = match action {
+        QcyAction::Byte(setting, value) => {
+            tracing::info!(
+                "QCY write: {} -> {} (one command, confirmed by a read-back)",
+                setting.key(),
+                match setting {
+                    Setting::NoiseControl => write::noise_name(value).to_string(),
+                    s if s.is_toggle() => (if value == 0x01 { "on" } else { "off" }).to_string(),
+                    _ => value.to_string(),
+                }
+            );
+            let o = host_for_read(service).and_then(|h| write_at(&h, service.config_dir(), setting, value));
+            (setting, value, o)
         }
-    );
-    let outcome = host_for_read(service).and_then(|h| write_at(&h, service.config_dir(), setting, value));
+        QcyAction::AutoOff(mins) => {
+            tracing::info!("QCY write: auto_off -> {mins}");
+            let frame = commands::set_auto_power_off(mins);
+            let o = host_for_read(service).and_then(|h| write_frame_at(&h, service.config_dir(), Setting::AutoPowerOff, frame));
+            (Setting::AutoPowerOff, 0, o)
+        }
+        QcyAction::Eq { preset_index, gains } => {
+            tracing::info!("QCY write: eq -> preset {preset_index}");
+            let frame = commands::build_custom_equalizer(&gains, preset_index).map_err(|_| ())?;
+            let o = host_for_read(service).and_then(|h| write_frame_at(&h, service.config_dir(), Setting::Equalizer, frame));
+            (Setting::Equalizer, preset_index, o)
+        }
+        QcyAction::Gesture { key, action } => {
+            tracing::info!("QCY write: gesture 0x{key:02X} -> {action}");
+            let mut map = CACHE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last
+                .as_ref()
+                .map(|r| r.state.key_functions.clone())
+                .unwrap_or_default();
+            map.insert(key, action);
+            let frame = packet::frame(commands::opcode::KEY_FUNCTIONS, &commands::set_key_functions(&map));
+            let o = host_for_read(service).and_then(|h| write_frame_at(&h, service.config_dir(), Setting::KeyFunctions, frame));
+            (Setting::KeyFunctions, action, o)
+        }
+    };
     let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let w = match outcome {
         Ok(o) => {
@@ -253,6 +338,20 @@ pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
                     Setting::GameMode => r.state.game_mode = on.or(r.state.game_mode),
                     Setting::SleepMode => r.state.sleep_mode = on.or(r.state.sleep_mode),
                     Setting::WindReduction => r.state.wind_detection = on.or(r.state.wind_detection),
+                    Setting::Ldac => r.state.ldac = on.or(r.state.ldac),
+                    Setting::Multipoint => r.state.multipoint = on.or(r.state.multipoint),
+                    Setting::AutoPowerOff if p.len() >= 2 => {
+                        r.state.auto_power_off_minutes = Some(u16::from_le_bytes([p[0], p[1]]));
+                    }
+                    Setting::Equalizer => {
+                        if let Some(eq) = commands::EqualizerState::parse_v2(p) {
+                            r.state.equalizer_preset = Some(eq.preset_index);
+                            r.state.equalizer_gains = eq.bands.iter().map(|b| b.gain).collect();
+                        }
+                    }
+                    Setting::KeyFunctions if p.len() >= 2 => {
+                        r.state.key_functions = commands::parse_key_functions(p);
+                    }
                     Setting::NoiseControl => {
                         r.state.noise_control =
                             qcy_protocol::commands::NoiseControlState::parse(p).or(r.state.noise_control);
@@ -263,6 +362,7 @@ pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
                             r.state.wear_detection_enabled = Some(w.enabled);
                         }
                     }
+                    Setting::Ldac | Setting::Multipoint | Setting::AutoPowerOff | Setting::Equalizer | Setting::KeyFunctions => {}
                     Setting::PromptVolume => {
                         if let Some(v) = p.first() {
                             r.state.prompt_volume = Some(*v);
@@ -286,7 +386,7 @@ pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
             LastWrite {
                 setting: setting.key(),
                 toggle: setting.is_toggle(),
-                value,
+                value: value_for_log,
                 previous: None,
                 max: None,
                 sent: None,
@@ -389,6 +489,37 @@ fn write_on(
     Ok(write::run(&mut link, setting, value, WRITE_TIMEOUT))
 }
 
+fn write_frame_at(host: &BtHost, dir: &Path, setting: Setting, frame: Vec<u8>) -> Result<write::Outcome, Unavailable> {
+    load_known(dir);
+    let Some(k) = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+        return Err(Unavailable::NotFound);
+    };
+    let started = Instant::now();
+    let id =
+        host.le_connect_plain_cached(k.addr, &k.name, DIRECT_CONNECT_TIMEOUT, k.services.clone()).map_err(|e| {
+            tracing::warn!("QCY write: connection failed: {e}");
+            Unavailable::Timeout
+        })?;
+    let services = host.le_gatt_services(id);
+    let r = (|| {
+        let command = find_char(&services, uuids::MAIN_SERVICE, uuids::COMMAND).ok_or(Unavailable::GattFailed)?;
+        let notification =
+            find_char(&services, uuids::MAIN_SERVICE, uuids::NOTIFICATION).ok_or(Unavailable::GattFailed)?;
+        write::check_target(uuids::MAIN_SERVICE, uuids::COMMAND).map_err(|_| Unavailable::Other)?;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        host.le_gatt_subscribe(id, notification, tx, GATT_TIMEOUT).map_err(|_| Unavailable::GattFailed)?;
+        let mut link = GattLink { host, id, command, rx };
+        Ok(write::run_frame(&mut link, setting, frame, WRITE_TIMEOUT))
+    })();
+    host.le_disconnect(id);
+    tracing::info!("QCY write: link up {} ms in total", started.elapsed().as_millis());
+    let o = r?;
+    for s in &o.steps {
+        tracing::info!("QCY write step: {} {}", s.what, s.detail);
+    }
+    Ok(o)
+}
+
 /// The stack to read with, never restarting one that streams
 fn host_for_read(service: &Service) -> Result<std::sync::Arc<BtHost>, Unavailable> {
     if service.is_scanning() {
@@ -405,6 +536,20 @@ fn host_for_read(service: &Service) -> Result<std::sync::Arc<BtHost>, Unavailabl
         std::thread::sleep(Duration::from_millis(100));
     }
     if host.le_core_ready() { Ok(host) } else { Err(Unavailable::LeOff) }
+}
+
+/// Equalizer preset IDs in protocol index order (eqPresets.ts)
+const EQ_PRESET_IDS: [&str; 8] =
+    ["default", "spatial", "soft_stage", "pop", "bass", "rock", "mellow", "classical"];
+
+/// Returns true when the connected audio device is a known QCY headset
+pub fn should_auto_refresh(dir: &Path, address: &str, name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("qcy") || lower.contains("melon") || lower.contains("melobuds") {
+        return true;
+    }
+    let cache = crate::qcy_cache::load(dir);
+    crate::qcy_cache::latest(&cache).is_some_and(|(a, ..)| a.eq_ignore_ascii_case(address))
 }
 
 /// Fills KNOWN from qcy-cache.json the first time (no Bluetooth traffic)

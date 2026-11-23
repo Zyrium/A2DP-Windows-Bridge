@@ -261,20 +261,48 @@ pub async fn qcy_reconnect(window: WebviewWindow, ipc: State<'_, Arc<Ipc>>) -> R
 /// The only changes this version sends to the core (phase F2)
 fn qcy_allowed(change: Option<&Value>) -> Option<Value> {
     let c = change?.as_object()?;
-    if c.len() != 2 {
-        return None;
-    }
     match c.get("kind")?.as_str()? {
-        // Phase F3b: wear_detection (0x2C) as on/off only; the core copies the
-        // music / ANC bytes from a fresh read
-        kind @ ("game_mode" | "sleep_mode" | "wind_reduction" | "wear_detection") => {
+        kind @ ("game_mode" | "sleep_mode" | "wind_reduction" | "wear_detection" | "ldac" | "multipoint") => {
+            if c.len() != 2 {
+                return None;
+            }
             let enabled = c.get("enabled")?.as_bool()?;
             Some(serde_json::json!({ "kind": kind, "enabled": enabled }))
         }
-        // Phase F3: a code of qcy_protocol::write::NOISE_PRESETS, nothing else
         "noise_control" => {
+            if c.len() != 2 {
+                return None;
+            }
             let value = c.get("value")?.as_u64().filter(|v| *v <= 6)?;
             Some(serde_json::json!({ "kind": "noise_control", "value": value }))
+        }
+        "auto_off" => {
+            if c.len() != 2 {
+                return None;
+            }
+            let minutes = match c.get("minutes")? {
+                Value::Null => Value::Null,
+                v => {
+                    let m = v.as_u64().filter(|m| matches!(m, 5 | 15 | 30 | 60))?;
+                    serde_json::json!(m)
+                }
+            };
+            Some(serde_json::json!({ "kind": "auto_off", "minutes": minutes }))
+        }
+        "eq" => {
+            let eq = c.get("eq")?.as_object()?;
+            let _preset = eq.get("preset")?.as_str()?;
+            let gains = eq.get("gains")?.as_array()?;
+            if gains.len() != 10 || !gains.iter().all(|g| g.as_f64().is_some()) {
+                return None;
+            }
+            Some(serde_json::json!({ "kind": "eq", "eq": Value::Object(eq.clone()) }))
+        }
+        "gesture" => {
+            let side = c.get("side")?.as_str()?;
+            let gesture = c.get("gesture")?.as_str()?;
+            let action = c.get("action")?.as_str()?;
+            Some(serde_json::json!({ "kind": "gesture", "side": side, "gesture": gesture, "action": action }))
         }
         _ => None,
     }
@@ -303,8 +331,6 @@ mod qcy_tests {
     fn writes_to_the_earbuds_are_refused() {
         use serde_json::json;
         for c in [
-            json!({ "kind": "ldac", "enabled": false }),
-            json!({ "kind": "multipoint", "enabled": true }),
             json!({ "kind": "noise", "mode": "anc" }),
             json!({ "kind": "game_mode" }),
             json!({ "kind": "game_mode", "enabled": "yes" }),

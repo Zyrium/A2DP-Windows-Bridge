@@ -8,6 +8,7 @@ import type { MediaEq } from "./MediaEq";
 import type { Method } from "./Method";
 import type { Profile } from "./Profile";
 import type { Settings } from "./Settings";
+import type { JsonValue } from "./serde_json/JsonValue";
 
 export type ClientMessage = { "type": "hello", protocol: number, 
 /**
@@ -26,4 +27,4 @@ rear_quality?: string | null, mono?: boolean | null, split?: boolean | null, lay
  * A Bluetooth LE device: its address type (Device.hid_le); None
  * for a classic one
  */
-le: number | null, } } | { "method": "hid.connect", "params": { address: string, } } | { "method": "hid.remove", "params": { address: string, } } | { "method": "hid.check_cancel", "params": { address: string, } } | { "method": "hid.check_dismiss" } | { "method": "app.check_update" } | { "method": "qcy.state" } | { "method": "qcy.refresh" } | { "method": "qcy.reconnect" } | { "method": "qcy.set", "params": { kind: string, enabled?: boolean | null, value?: number | null, } } | { "method": "app.hidden_to_tray" } | { "method": "app.quit" } | { "method": "app.quit_for_update" } | { "method": "app.close" } | { "method": "app.run_as_admin", "params": { call: Method, } });
+le: number | null, } } | { "method": "hid.connect", "params": { address: string, } } | { "method": "hid.remove", "params": { address: string, } } | { "method": "hid.check_cancel", "params": { address: string, } } | { "method": "hid.check_dismiss" } | { "method": "app.check_update" } | { "method": "qcy.state" } | { "method": "qcy.refresh" } | { "method": "qcy.reconnect" } | { "method": "qcy.set", "params": { kind: string, enabled?: boolean | null, value?: number | null, minutes?: number | null, eq?: JsonValue | null, side?: string | null, gesture?: string | null, action?: string | null, } } | { "method": "app.hidden_to_tray" } | { "method": "app.quit" } | { "method": "app.quit_for_update" } | { "method": "app.close" } | { "method": "app.run_as_admin", "params": { call: Method, } });

@@ -2535,6 +2535,19 @@ impl CoreState {
                 if state == CoreStreamState::Connecting {
                     stream.profile = self.starting_profile.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 }
+                if state == CoreStreamState::Streaming && stream.state != StreamState::Streaming {
+                    let dev = streamed_device(&s);
+                    let addr = dev.as_ref().map(|d| d.address.as_str()).unwrap_or("");
+                    let name = dev.as_ref().map(|d| d.name.as_str()).unwrap_or("");
+                    if crate::qcy_live::should_auto_refresh(&self.config_dir(), addr, name) {
+                        let me = self.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(800));
+                            let v = crate::qcy_live::refresh(&me.service);
+                            me.publish(Event::Qcy(v));
+                        });
+                    }
+                }
                 // The stack runs once anything connected
                 let adapter_status = match state {
                     CoreStreamState::Error if m.key.starts_with("error.btstack") => Some(AdapterStatus::Error),
@@ -4607,9 +4620,7 @@ impl CoreState {
                 }))
                 .await
             }
-            Method::QcySet { kind, enabled, value } => {
-                // Exactly kind + the one value given (allowed_change refuses
-                // a toggle with a level, a level with on/off, or both)
+            Method::QcySet { kind, enabled, value, minutes, eq, side, gesture, action } => {
                 let mut change = serde_json::json!({ "kind": kind });
                 if let Some(e) = enabled {
                     change["enabled"] = serde_json::json!(e);
@@ -4617,7 +4628,22 @@ impl CoreState {
                 if let Some(v) = value {
                     change["value"] = serde_json::json!(v);
                 }
-                if crate::qcy_live::allowed_change(&change).is_none() {
+                if kind == "auto_off" {
+                    change["minutes"] = minutes.map_or(Value::Null, |m| serde_json::json!(m));
+                }
+                if let Some(e) = eq {
+                    change["eq"] = e;
+                }
+                if let Some(s) = side {
+                    change["side"] = serde_json::json!(s);
+                }
+                if let Some(g) = gesture {
+                    change["gesture"] = serde_json::json!(g);
+                }
+                if let Some(a) = action {
+                    change["action"] = serde_json::json!(a);
+                }
+                if crate::qcy_live::parse_action(&change).is_none() {
                     return Err(err("qcy.read_only", "fones.error.read_only"));
                 }
                 blocking(Box::new(move |me| {

@@ -138,17 +138,12 @@ export function Fones(props: { tab?: string }) {
                 {s().link.state === "none" ? `${ft("read_only.text")} ${ft("read_only.first")}` : ft("read_only.text")}
               </Banner>
             </Show>
-            <Show when={s().writable !== undefined && !s().read_only && (s().writable?.length ?? 0) > 0}>
-              <Banner kind="info" title={ft("write_test.title")}>
-                {ft("write_test.text")}
-              </Banner>
-            </Show>
             <WriteBanner s={s()} busy={busy()} send={send} diag={() => navigate({ name: "diagnostics" })} />
             <div
               class="fones-body"
               classList={{ stale: !live(), readonly: live() && readOnly() }}
-              aria-disabled={!editable() && !(tab() !== "eq" && partial())}
-              inert={!editable() && !(tab() !== "eq" && partial()) ? true : undefined}
+              aria-disabled={!editable()}
+              inert={!editable() ? true : undefined}
             >
               <Show when={tab() === "main"}>
                 <MainTab
@@ -513,15 +508,7 @@ function MainTab(props: {
   const ok = (k: string) => props.verified?.includes(k) === true;
   const locked = (k: string) => props.partial === true && !can(k);
   /** The tag of a control in the partial (write test) mode */
-  const tag = (k: string) =>
-    props.partial ? (
-      <span
-        class="codec-badge fones-tag"
-        classList={{ "tag-verified": can(k) && ok(k), "tag-testing": can(k) && !ok(k), "tag-unverified": !can(k) }}
-      >
-        {ft(!can(k) ? "tag.unverified" : ok(k) ? "tag.verified" : "tag.testing")}
-      </span>
-    ) : undefined;
+  const tag = (_k: string) => undefined;
   const writeFor = (k: string) => (props.partial && s().write?.setting === k ? s().write! : null);
   const off = (k: string) => props.partial === true && (props.busy === true || !can(k));
   const pickNoise = (mode: NoiseMode, scene?: NoiseScene) => {
@@ -835,11 +822,6 @@ function SettingsTab(props: {
           {/* Phase F3b: 0x2C, one command per click, confirmed by a read-back */}
           <Toggle
             label={ft("wear")}
-            badge={
-              <span class="codec-badge fones-tag" classList={{ "tag-verified": wearOk(), "tag-testing": !wearOk() }}>
-                {ft(wearOk() ? "tag.verified" : "tag.testing")}
-              </span>
-            }
             hint={props.busy ? ft("write.sending") : ft("wear.hint_write")}
             checked={s().wear_detection}
             disabled={props.busy === true || !s().wear_read}
@@ -865,7 +847,6 @@ function SettingsTab(props: {
           </Show>
           <Show when={s().write?.setting === "wear_detection" ? s().write : null}>{(w) => <WriteSteps w={w()} />}</Show>
         </Show>
-        <div class="fones-lock" classList={{ locked: lockAll() }} inert={lockAll() ? true : undefined}>
         <Toggle
           label={ft("ldac")}
           badge={<span class="tag warn">{ft("ldac.tag")}</span>}
@@ -881,7 +862,6 @@ function SettingsTab(props: {
           }}
         />
         <Toggle label={ft("multipoint")} hint={ft("multipoint.hint")} checked={s().multipoint} onChange={(enabled) => void props.send({ kind: "multipoint", enabled })} />
-        </div>
         {/* Read-only: the N70 did not take 0x1D writes (fase 2b) */}
         <div class="row">
           <div class="row-text">
@@ -892,7 +872,6 @@ function SettingsTab(props: {
             {Math.max(0, Math.min(promptMax(s()), s().prompt_volume))}/{promptMax(s())}
           </span>
         </div>
-        <div class="fones-lock" classList={{ locked: lockAll() }} inert={lockAll() ? true : undefined}>
         <div class="row">
           <div class="row-text">
             <span class="row-label">{ft("auto_off")}</span>
@@ -904,7 +883,6 @@ function SettingsTab(props: {
             options={AUTO_OFF.map((m) => ({ value: String(m), label: m === null ? ft("auto_off.never") : ft("auto_off.min", m) }))}
             onChange={(v) => void props.send({ kind: "auto_off", minutes: (v === "null" ? null : Number(v)) as AutoOff })}
           />
-        </div>
         </div>
       </Section>
 

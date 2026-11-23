@@ -2475,6 +2475,21 @@ pub enum Method {
         #[ts(optional = nullable)]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         value: Option<u8>,
+        #[ts(optional = nullable)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minutes: Option<u16>,
+        #[ts(optional = nullable)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        eq: Option<serde_json::Value>,
+        #[ts(optional = nullable)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        side: Option<String>,
+        #[ts(optional = nullable)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gesture: Option<String>,
+        #[ts(optional = nullable)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<String>,
     },
     /// The UI hid its main window to the tray: the core shows v1's "still
     /// running in the tray" balloon the first time
