@@ -727,14 +727,13 @@ export function parseAfhChannels(s: string): string | null {
   return [...new Set(nums)].sort((a, b) => a - b).join(",");
 }
 
-/** LE Audio for the whole stack, as Windows has it (issue #86): only in
- *  developer mode, and when an adapter is known to have LE Audio's
- *  isochronous channels */
+/** LE Audio / BLE stack toggle in developer mode (also needed for plain BLE
+ *  GATT controls like QCY earbuds on adapters without ISO channels) */
 export function leAudioToggleShown(
-  adapter: { le_audio: boolean | null; adapters: readonly { le_audio: boolean | null }[] },
+  _adapter: { le_audio: boolean | null; adapters: readonly { le_audio: boolean | null }[] },
   developer: boolean,
 ): boolean {
-  return developer && (adapter.le_audio === true || adapter.adapters.some((a) => a.le_audio === true));
+  return developer;
 }
 
 function LeAudioToggle() {
