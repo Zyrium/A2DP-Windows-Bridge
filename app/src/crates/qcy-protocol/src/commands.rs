@@ -296,6 +296,10 @@ pub fn set_key_functions(mappings: &BTreeMap<u8, u8>) -> Vec<u8> {
     mappings.iter().flat_map(|(key, function)| [*key, *function]).collect()
 }
 
+pub fn set_key_functions_frame(mappings: &BTreeMap<u8, u8>) -> Vec<u8> {
+    packet::frame(opcode::KEY_FUNCTIONS, &set_key_functions(mappings))
+}
+
 pub fn parse_key_functions(value: &[u8]) -> BTreeMap<u8, u8> {
     if !value.len().is_multiple_of(2) {
         return BTreeMap::new();

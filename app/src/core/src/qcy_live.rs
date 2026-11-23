@@ -324,7 +324,7 @@ pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
                 .map(|r| r.state.key_functions.clone())
                 .unwrap_or_default();
             map.insert(key, action);
-            let frame = packet::frame(commands::opcode::KEY_FUNCTIONS, &commands::set_key_functions(&map));
+            let frame = commands::set_key_functions_frame(&map);
             let o = host_for_read(service).and_then(|h| write_frame_at(&h, service.config_dir(), Setting::KeyFunctions, frame));
             (Setting::KeyFunctions, action, o)
         }
@@ -362,7 +362,7 @@ pub fn set(service: &Service, change: &Value) -> Result<Value, ()> {
                             r.state.wear_detection_enabled = Some(w.enabled);
                         }
                     }
-                    Setting::Ldac | Setting::Multipoint | Setting::AutoPowerOff | Setting::Equalizer | Setting::KeyFunctions => {}
+                    Setting::AutoPowerOff | Setting::KeyFunctions => {}
                     Setting::PromptVolume => {
                         if let Some(v) = p.first() {
                             r.state.prompt_volume = Some(*v);

@@ -2536,13 +2536,11 @@ impl CoreState {
                     stream.profile = self.starting_profile.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 }
                 if state == CoreStreamState::Streaming && stream.state != StreamState::Streaming {
-                    let dev = streamed_device(&s);
-                    let addr = dev.as_ref().map(|d| d.address.as_str()).unwrap_or("");
-                    let name = dev.as_ref().map(|d| d.name.as_str()).unwrap_or("");
+                    let (addr, name) = streamed_device(&s).unwrap_or(("", ""));
                     if crate::qcy_live::should_auto_refresh(&self.config_dir(), addr, name) {
                         let me = self.clone();
                         std::thread::spawn(move || {
-                            std::thread::sleep(Duration::from_millis(800));
+                            std::thread::sleep(std::time::Duration::from_millis(800));
                             let v = crate::qcy_live::refresh(&me.service);
                             me.publish(Event::Qcy(v));
                         });
