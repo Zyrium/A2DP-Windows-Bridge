@@ -114,7 +114,7 @@ impl BtHost {
         window: u16,
         done: impl Fn(&[LeScanResult]) -> bool,
     ) -> Vec<LeScanResult> {
-        if !self.le_ready() {
+        if !self.le_core_ready() {
             return Vec::new();
         }
         self.le_fresh_operation();
@@ -282,7 +282,7 @@ impl BtHost {
         timeout: Duration,
         plain: bool,
     ) -> Result<LeDeviceId, String> {
-        if !self.le_ready() {
+        if if plain { !self.le_core_ready() } else { !self.le_ready() } {
             return Err("LE Audio is not running".into());
         }
         tracing::info!(

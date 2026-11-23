@@ -401,10 +401,10 @@ fn host_for_read(service: &Service) -> Result<std::sync::Arc<BtHost>, Unavailabl
         None => return Err(Unavailable::Other),
     };
     let until = Instant::now() + Duration::from_secs(2);
-    while !host.le_ready() && Instant::now() < until {
+    while !host.le_core_ready() && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(100));
     }
-    if host.le_ready() { Ok(host) } else { Err(Unavailable::LeOff) }
+    if host.le_core_ready() { Ok(host) } else { Err(Unavailable::LeOff) }
 }
 
 /// Fills KNOWN from qcy-cache.json the first time (no Bluetooth traffic)

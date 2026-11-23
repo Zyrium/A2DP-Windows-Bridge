@@ -623,8 +623,8 @@ impl BtHost {
             h.sink = Some(sink.clone());
             sink
         });
-        // Keyboards and mice over LE need the LE core, also without LE Audio
-        let le_core_on = le_on || hid_on;
+        // Keyboards, mice, and plain BLE GATT (e.g. QCY earbuds) need the LE core, also without LE Audio
+        let le_core_on = le_on || hid_on || config.le_keys.is_some();
         let hid_counters = Arc::new(HidCounters::default());
         let hid_counters_app = hid_counters.clone();
         let le_shared = Arc::new(le::core::LeShared::default());
@@ -703,7 +703,7 @@ impl BtHost {
                         // and the bonds of le_keys
                         let audio = le_audio.is_some();
                         let le_config = le_audio.or_else(|| {
-                            hid.as_ref().map(|_| LeConfig {
+                            (hid.is_some() || le_keys.is_some()).then(|| LeConfig {
                                 bonds_file: le_keys.as_ref().map(|k| k.bonds_file.clone()),
                                 imported_bonds_file: le_keys.as_ref().and_then(|k| k.imported_bonds_file.clone()),
                                 ..LeConfig::default()
