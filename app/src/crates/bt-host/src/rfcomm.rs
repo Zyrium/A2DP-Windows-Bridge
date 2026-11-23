@@ -480,7 +480,7 @@ impl Channel {
 }
 
 /// "0000xxxx-0000-1000-8000-00805F9B34FB"
-fn uuid_str(u: &[u8; 16]) -> String {
+pub fn uuid_str(u: &[u8; 16]) -> String {
     let h: String = u.iter().map(|b| format!("{b:02X}")).collect();
     format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
 }
@@ -511,6 +511,18 @@ pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
     Some(u)
 }
 
+/// Headset (0x1108), Headset AG (0x1112), Hands-Free (0x111E) and
+/// Hands-Free AG (0x111F): the services of BlueCaster's own headset
+/// microphone link
+const VOICE_SERVICES: [u16; 4] = [0x1108, 0x1112, 0x111E, 0x111F];
+
+/// The UUID is one of the headset / hands-free services on the Bluetooth
+/// base UUID, which BlueCaster's headset microphone uses itself
+pub fn is_voice_service(uuid: &[u8; 16]) -> bool {
+    const BASE_TAIL: [u8; 12] = [0, 0, 0x10, 0, 0x80, 0, 0, 0x80, 0x5F, 0x9B, 0x34, 0xFB];
+    uuid[..2] == [0, 0] && uuid[4..] == BASE_TAIL && VOICE_SERVICES.contains(&u16::from_be_bytes([uuid[2], uuid[3]]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,5 +541,29 @@ mod tests {
         assert_eq!(uuid_str(&spp), "00001101-0000-1000-8000-00805F9B34FB");
         let vendor = parse_uuid("0000079a-d102-11e1-9b23-00025b00a5a5").unwrap();
         assert_eq!(uuid_str(&vendor), "0000079A-D102-11E1-9B23-00025B00A5A5");
+    }
+
+    #[test]
+    fn voice_services() {
+        let voice = |s: &str| is_voice_service(&parse_uuid(s).unwrap());
+        for s in ["1108", "1112", "111E", "111f", "0x111E", "0000111F"] {
+            assert!(voice(s), "{s}");
+        }
+        assert!(voice("0000111e-0000-1000-8000-00805f9b34fb"));
+        assert!(voice("{00001108-0000-1000-8000-00805F9B34FB}"));
+        assert!(voice("0000111200001000800000805F9B34FB"));
+        // Other services, and the same short value on another base
+        for s in [
+            "1101",
+            "110B",
+            "111D",
+            "1120",
+            "0001111E",
+            "0000111E-0000-1000-8000-00805F9B34FC",
+            "0000111E-d102-11e1-9b23-00025b00a5a5",
+            "0000079a-d102-11e1-9b23-00025b00a5a5",
+        ] {
+            assert!(!voice(s), "{s}");
+        }
     }
 }

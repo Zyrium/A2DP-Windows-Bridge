@@ -49,6 +49,7 @@ const CLASSIC: &[&str] = &[
     "hfp.c",
     "hfp_ag.c",
     "hfp_gsm_model.c",
+    "hid_host.c",
     "sdp_client.c",
     "sdp_client_rfcomm.c",
     "sdp_server.c",
@@ -57,9 +58,9 @@ const CLASSIC: &[&str] = &[
 ];
 
 /// src/ble/*.c not built: LE bonds are kept in a TLV file
-/// (le_device_db_tlv.c), as in v1; sm.c is built from a patched copy
-/// ([`patched_sm`])
-const BLE_EXCLUDE: &[&str] = &["le_device_db_memory.c", "sm.c"];
+/// (le_device_db_tlv.c), as in v1; the others are built from patched copies
+/// ([`patched_sm`], [`patched_le_device_db`], [`patched_att_server`])
+const BLE_EXCLUDE: &[&str] = &["le_device_db_memory.c", "sm.c", "le_device_db_tlv.c", "att_server.c"];
 
 /// Bluedroid SBC encoder (Apache-2.0): mSBC for the headset microphone
 /// ([`add_voice_codecs`]), and the reference of feature "sbc-reference"
@@ -150,8 +151,10 @@ fn main() {
     // ENABLE_PRINTF_TO_LOG sends those lines to the HCI dump log instead
     // (HCI_DUMP_LOG_LEVEL_PRINT), for this file only
     let mut realtek = build.clone();
-    // csrc/realtek.c includes btstack_chipset_realtek.c (reads its firmware table)
-    realtek.define("ENABLE_PRINTF_TO_LOG", None).file(csrc.join("realtek.c"));
+    // csrc/realtek.c includes btstack_chipset_realtek.c (reads its firmware
+    // table), as patched_realtek writes it to OUT_DIR
+    let patched = patched_realtek(&btstack);
+    realtek.include(patched.parent().unwrap()).define("ENABLE_PRINTF_TO_LOG", None).file(csrc.join("realtek.c"));
     realtek.compile("btstack_realtek");
 
     let mut core: Vec<PathBuf> = std::fs::read_dir(btstack.join("src"))
@@ -172,6 +175,8 @@ fn main() {
     ble.sort();
     build.files(&ble);
     build.file(patched_sm(&btstack));
+    build.file(patched_le_device_db(&btstack));
+    build.file(patched_att_server(&btstack));
     build.files(CLASSIC.iter().map(|f| match *f {
         "a2dp.c" => patched_a2dp(&btstack),
         "avdtp_initiator.c" => patched_avdtp_initiator(&btstack),
@@ -256,6 +261,13 @@ fn patched_a2dp(btstack: &Path) -> PathBuf {
 /// Disallowed), waited for its disconnection forever and never removed the
 /// CIG. A CIS found IDLE there (its disconnection set that) stays IDLE, and
 /// its CIS created event carries Connection Failed to be Established.
+///
+/// A CIG whose CIS were never created (an earbud that rejected Enable after
+/// Set CIG Parameters) was not removed either: gap_cig_remove took their
+/// REQUESTED state for a live CIS and waited forever. The CIG stayed in the
+/// controller, and after a few such tries Set CIG Parameters failed with
+/// Connection Limit Exceeded (0x09). A REQUESTED CIS is discarded like an
+/// IDLE one, so LE Remove CIG goes out.
 fn patched_hci(btstack: &Path) -> PathBuf {
     const FILE: &str = "hci.c";
     let mut source = std::fs::read_to_string(btstack.join("src").join(FILE)).unwrap().replace("\r\n", "\n");
@@ -286,6 +298,17 @@ fn patched_hci(btstack: &Path) -> PathBuf {
          \x20                                   iso_stream->state = HCI_ISO_STREAM_STATE_ACTIVE;\n\
          \x20                                   hci_cis_handle_created(iso_stream, status);\n",
     );
+    let idle = "                            case HCI_ISO_STREAM_STATE_IDLE:\n\
+                \x20                               // Either never established or already disconnected, discard\n";
+    replace_once(
+        &mut source,
+        FILE,
+        idle,
+        &format!(
+            "{idle}                            case HCI_ISO_STREAM_STATE_REQUESTED: /* BlueCaster: patched by btstack-sys \
+             build.rs (patched_hci), never created */\n"
+        ),
+    );
     let path = PathBuf::from(env::var("OUT_DIR").unwrap()).join(FILE);
     std::fs::write(&path, source).unwrap();
     path
@@ -293,6 +316,31 @@ fn patched_hci(btstack: &Path) -> PathBuf {
 
 fn replace_once(source: &mut String, file: &str, from: &str, to: &str) {
     replace_n(source, file, from, to, 1);
+}
+
+/// chipset/realtek/btstack_chipset_realtek.c taking an "RTBTCore" (v2)
+/// firmware over USB on a chip whose key ID reads 0, written to OUT_DIR as
+/// btstack_chipset_realtek_patched.c (csrc/realtek.c includes it).
+///
+/// BTstack stops such a download over USB ("Wrong key id"), although its
+/// own section parser handles key ID 0: it skips the security sections and
+/// takes the plain and dummy ones. Realtek's Windows driver treats key ID 0
+/// the same way (bt-host realtek_btnic: section 3 only for another key ID).
+/// A file with no section for the chip still fails, as "firmware_size == 0".
+fn patched_realtek(btstack: &Path) -> PathBuf {
+    const FILE: &str = "btstack_chipset_realtek.c";
+    let mut source = std::fs::read_to_string(btstack.join("chipset/realtek").join(FILE)).unwrap();
+    source.insert_str(0, "/* BlueCaster: patched by btstack-sys build.rs (patched_realtek) */\n");
+    replace_once(
+        &mut source,
+        FILE,
+        "if ((realtek_interface == REALTEK_INTERFACE_USB) && (key_id == 0)) {",
+        "if (0) { /* BlueCaster: key ID 0, a chip without a security key */",
+    );
+    let path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("btstack_chipset_realtek_patched.c");
+    std::fs::write(&path, source).unwrap();
+    println!("cargo:rerun-if-changed={}", btstack.join("chipset/realtek").join(FILE).display());
+    path
 }
 
 fn replace_n(source: &mut String, file: &str, from: &str, to: &str, n: usize) {
@@ -643,6 +691,80 @@ fn patched_sm(btstack: &Path) -> PathBuf {
         ),
     );
     let path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("sm.c");
+    std::fs::write(&path, source).unwrap();
+    path
+}
+
+/// src/ble/le_device_db_tlv.c telling when a new bond takes the place of an
+/// old one, written to OUT_DIR.
+///
+/// With every entry taken, le_device_db_add writes the new bond over the one
+/// with the lowest sequence number (the one stored first; using a bond does
+/// not renew it) and tells nobody: the old device's CCC values then belong
+/// to the new device, and the old device fails to connect ("pairing failed")
+/// without a word in the log. Here the old bond is deleted as
+/// gap_delete_bonding would, with GAP_SUBEVENT_BONDING_DELETED
+/// (bluecaster_le_bond_evicted in shim.c, src/le_bonds.rs). A bond of a
+/// device that is connected stays: its link still refers to the entry.
+fn patched_le_device_db(btstack: &Path) -> PathBuf {
+    const FILE: &str = "le_device_db_tlv.c";
+    // LF patterns: a checkout with core.autocrlf (CI) has CRLF
+    let mut source = std::fs::read_to_string(btstack.join("src/ble").join(FILE)).unwrap().replace("\r\n", "\n");
+    source.insert_str(
+        0,
+        "/* BlueCaster: patched by btstack-sys build.rs (patched_le_device_db) */\n\
+         int bluecaster_le_bond_in_use(int index);\n\
+         void bluecaster_le_bond_evicted(int index, int addr_type, const unsigned char *addr);\n",
+    );
+    replace_once(
+        &mut source,
+        FILE,
+        "if ((index_for_lowest_seq_nr == -1) || (entry.seq_nr < lowest_seq_nr)){",
+        "if (((index_for_lowest_seq_nr == -1) || (entry.seq_nr < lowest_seq_nr)) && !bluecaster_le_bond_in_use(i)){",
+    );
+    replace_once(
+        &mut source,
+        FILE,
+        "        index_to_use = index_for_lowest_seq_nr;
+    } else {
+        // should not happen
+",
+        "        index_to_use = index_for_lowest_seq_nr;
+        le_device_db_entry_t evicted;
+        le_device_db_tlv_fetch(index_for_lowest_seq_nr, &evicted);
+        le_device_db_remove(index_for_lowest_seq_nr);
+        new_entry = true;
+        bluecaster_le_bond_evicted(index_for_lowest_seq_nr, evicted.addr_type, evicted.addr);
+    } else {
+        log_error(\"LE bond not stored: every bond belongs to a connected device\");
+",
+    );
+    let path = PathBuf::from(env::var("OUT_DIR").unwrap()).join(FILE);
+    std::fs::write(&path, source).unwrap();
+    path
+}
+
+/// src/ble/att_server.c with room for more than 256 CCC values (its TLV tag
+/// has one byte for the slot), written to OUT_DIR. The first 256 keep their
+/// tags (bluecaster_ccc_tag in shim.c).
+fn patched_att_server(btstack: &Path) -> PathBuf {
+    const FILE: &str = "att_server.c";
+    let mut source = std::fs::read_to_string(btstack.join("src/ble").join(FILE)).unwrap().replace("\r\n", "\n");
+    replace_once(
+        &mut source,
+        FILE,
+        "static uint32_t att_server_persistent_ccc_tag_for_index(uint8_t index){
+    return (((uint8_t)'B') << 24u) | (((uint8_t)'T') << 16u) | (((uint8_t)'C') << 8u) | index;
+}
+",
+        "/* BlueCaster: patched by btstack-sys build.rs (patched_att_server) */
+uint32_t bluecaster_ccc_tag(uint32_t slot);
+static uint32_t att_server_persistent_ccc_tag_for_index(uint32_t index){
+    return bluecaster_ccc_tag(index);
+}
+",
+    );
+    let path = PathBuf::from(env::var("OUT_DIR").unwrap()).join(FILE);
     std::fs::write(&path, source).unwrap();
     path
 }

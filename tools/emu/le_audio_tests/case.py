@@ -35,3 +35,8 @@ class Case:
     # BlueCaster must not stream but exit with an error matching this regex
     # (bluecaster.log); nothing else is checked then
     expect_error: str = None
+    # One sink leaves and the others play on without it (its channel silent,
+    # the others get the mono mix) until the stream is set up again: every
+    # stream but the last may lack the stereo tone for up to this long at
+    # its end
+    play_on_s: float = 0

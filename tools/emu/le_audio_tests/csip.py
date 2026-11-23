@@ -30,10 +30,11 @@ CASES = [
          sink_args=['--csip-set', 'plaintext', '--csip-missing'], tags=('csip',), first_address_only=True),
     # Both earbuds named (-d / --le-device) and a set: no member twice
     Case('csip-both-named', 'earbuds', TWO_CIS, sink_args=['--csip-set', 'plaintext'], tags=('csip',)),
-    # The named earbud drops its link while streaming: BlueCaster reconnects it,
-    # keeps the other (still connected) and streams to both again
+    # The named earbud drops its link while streaming: the other plays on
+    # alone, BlueCaster finds the first one advertising again, reconnects it
+    # and streams to both again
     Case('csip-link-loss', 'earbuds', TWO_CIS, sink_args=['--csip-set', 'plaintext', '--drop-link-after', '5'],
-         tags=('csip',), first_address_only=True, streams=2, lossy=True, duration=14),
+         tags=('csip',), first_address_only=True, streams=2, lossy=True, duration=14, play_on_s=5.0),
     # Another coordinator holds the second earbud's lock for the first two
     # requests: Lock Denied -> BlueCaster releases the first earbud, waits, tries
     # again and gets the set on the third attempt
@@ -126,6 +127,10 @@ def check(case, ctx):
         if (r1, r2) != ('1', '2') or {a1, a2} != {first, second}:
             failures.append(f'CSIP: members not ordered by rank: {a1} rank {r1}, {a2} rank {r2}')
     if case.name == 'csip-link-loss':
+        if 'LE Audio: 1 device(s) left the stream, 1 play on' not in log:
+            failures.append('the other earbud did not play on alone')
+        if '*** LE Audio stream lost' in log:
+            failures.append('the whole stream was lost, not only the earbud')
         if 'LE Audio stream restored' not in log:
             failures.append('the stream was not set up again after the link loss')
         if not re.search(re.escape(first) + r' \(rank \d of coordinated set 0\) disconnected', log):

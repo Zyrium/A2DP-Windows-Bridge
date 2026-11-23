@@ -153,7 +153,7 @@ flowchart TD
 |:-------|:---------|:-----|
 | capture | MMCSS "Audio" | 讀取 WASAPI；無聲的區段以靜音填補 |
 | encode | MMCSS "Pro Audio" | 將 PCM 轉換為編碼器接受的格式，以完整的編碼器區塊為單位編碼（剩餘部分留待下一輪），並將訊框打包成媒體酬載；每輪約 10 ms，讓封包平均送出 |
-| bt-runloop | -- | BTstack 的 run loop；每當 L2CAP 可以傳送時，就送出佇列中的封包。每次有封包加入佇列時，傳送佇列（64 個封包）會從最舊的開始，捨棄已等待 350 ms 的封包 |
+| bt-runloop | -- | BTstack 的 run loop；每當 L2CAP 可以傳送時，就送出佇列中的封包。每次有封包加入佇列時，傳送佇列（64 個封包）會從最舊的開始，捨棄已等待 350 ms（LHDC V5 低延遲時為 100 ms）的封包 |
 | USB | -- | WinUSB 傳輸：每個 IN 管道（事件、ACL 資料）上同時有三個讀取在進行，另有一個命令寫入者與一個 ACL 資料寫入者（同時最多 8 個傳輸） |
 | core | Normal | 狀態機、IPC（tokio；RFCOMM 轉送的各連線佇列）、設定、統計資料（4 Hz）、更新檢查 |
 
@@ -279,7 +279,7 @@ sequenceDiagram
 
 | 編碼器 | 程式庫 | 位元率 | 特色 |
 |---------|---------|---------|----------|
-| LHDC V5 | lhdcv5-enc（AOSP 編碼器的 C 語言移植版） | 400/500/900/1000 kbps（低/中/中高/高），不超過接收端列出的最大值，ABR 160–400 kbps | 16/24 位元、5 ms 訊框、2 位元組媒體酬載標頭、RTP 標頭 |
+| LHDC V5 | lhdcv5-enc（AOSP 編碼器的 C 語言移植版） | 400/500/900/1000 kbps（低/中/中高/高），不超過接收端列出的最大值，ABR 160–400 kbps | 16/24 位元、5 ms 訊框、2 位元組媒體酬載標頭、RTP 標頭；接收端有列出時支援低延遲（每 10 ms 而非 20 ms 編碼一次；ABR 關閉時，另加下文的佇列保護） |
 | LDAC | libldac (AOSP) | 330/660/990 kbps | 高/中/低（HQ/SQ/MQ）模式、ABR |
 | aptX Adaptive | aptx-adaptive（AKS-Logic/aptx-adaptive-linux 的純 Rust 編碼器，MIT） | 高 427 kbps、低延遲 265 kbps（R2 接收端：270）；ABR 降至 364/318（R2：270/204） | 48 kHz 立體聲（選擇 96 kHz 時，對列出 96 kHz 的 R2 接收端於高品質使用 96 kHz：646/340/255 kbps）、24 位元；每個媒體封包一個編解碼器封包，前面加上 BlueCaster 自己的 RTP 標頭；高品質時使用 ABR；「自動」將它排在 LHDC V5 與 LDAC 之後 |
 | Opus | libopus 1.6.1 | 256 kbps（立體聲；單聲道為一半） | Android 的 A2DP Opus：48 kHz、20 ms 訊框（接收端只支援 10 ms 時使用 10 ms）、以媒體酬載大小為上限的受限 VBR、每個封包一個訊框、1 位元組媒體酬載標頭、RTP 標頭 |
@@ -290,6 +290,8 @@ sequenceDiagram
 | SBC XQ | 同一個 SBC 編碼器 | 約 385/505/552 kbps | 雙聲道（dual channel），44.1 / 48 kHz 時 bitpool 47 / 43（高）；只在接收端的 SBC 允許雙聲道且 bitpool 至少為 29 時使用（之後與 PipeWire 一樣，將 bitpool 限制在接收端的最大值）；與 SBC 共用串流端點、媒體酬載標頭與 RTP 標頭 |
 | SBC | Bluedroid 編碼器的 Rust 移植版 | 最高約 345 kbps | A2DP 必備的基本編解碼器；輸出與 C 編碼器位元完全一致（已測試所有設定組合） |
 | FastStream | 同一個 SBC 編碼器 | 198/216 kbps (44.1/48 kHz) | CSR 廠商編解碼器，只傳送音樂（無語音回傳通道）：SBC joint stereo、bitpool 29，訊框補齊至 72 位元組，每個封包 3 個訊框，沒有媒體酬載標頭也沒有 RTP 標頭（與 PipeWire 相同）；「自動」永遠不會選用 |
+
+**LHDC V5 佇列保護**（低延遲開啟、ABR 關閉時）：傳送佇列在一秒內平均有 12 個以上的封包時，編碼器會將位元率降低一級（1000、900、再到 500 kbps），兩次之間至少間隔 2 s。平穩一分鐘後，編碼器會將位元率提高一級。若提高後未能維持 30 s，等待時間加倍，最長 10 分鐘。
 
 所有編碼器都實作 `codec::Encoder` trait：說明 PCM 格式與每次呼叫消耗的訊框數，並傳回編解碼器訊框。
 
@@ -318,7 +320,7 @@ AAC 與 SBC 使用 A2DP 規格中定義的標準 Codec ID。
 - **aptX**：7 位元組（第 6 位元組 = 取樣率 / 聲道模式）
 - **aptX HD**：11 位元組（第 6 位元組同 aptX，另加 4 個保留位元組）；必須為立體聲
 - **aptX LL**：8 位元組；接收端設定延伸（「new caps」）旗標時為 17 位元組。BlueCaster 註冊一個 aptX LL 端點，並以接收端使用的 Vendor ID 設定串流
-- **LHDC V5**：11 位元組（Android `a2dp_vendor_lhdcv5_constants.h`）：第 6 位元組為取樣率（0x20 44.1k、0x10 48k、0x04 96k、0x01 192k），第 7 位元組為位元深度（0x04 16-bit、0x02 24-bit）與接收端的最小 / 最大位元率限制，第 8 位元組為編解碼器子版本（0x01 = V5 ver.1）與 0x10 = 5 ms 訊框，第 9-10 位元組為選用功能（low latency、lossless、JAS、AR、META），BlueCaster 都不提供。只支援立體聲。與 Android 相同，接收端的位元率限制會在設定中回傳，並套用到編碼器。媒體封包帶有 2 位元組的酬載標頭：訊框數 << 2（延遲位元為 0）與序號
+- **LHDC V5**：11 位元組（Android `a2dp_vendor_lhdcv5_constants.h`）：第 6 位元組為取樣率（0x20 44.1k、0x10 48k、0x04 96k、0x01 192k），第 7 位元組為位元深度（0x04 16-bit、0x02 24-bit）與接收端的最小 / 最大位元率限制，第 8 位元組為編解碼器子版本（0x01 = V5 ver.1）與 0x10 = 5 ms 訊框，第 9-10 位元組為選用功能（low latency、lossless、JAS、AR、META）。LHDC V5 設定中開啟低延遲且接收端有列出時，BlueCaster 會要求低延遲（第 9 位元組，0x40）。其他功能 BlueCaster 都不提供。只支援立體聲。與 Android 相同，接收端的位元率限制會在設定中回傳，並套用到編碼器。媒體封包帶有 2 位元組的酬載標頭：訊框數 << 2（延遲位元為 0）與序號
 - **FastStream**：8 位元組（PipeWire `a2dp_faststream_t`）：第 6 位元組為方向（0x01 sink = 音樂、0x02 source = 語音），第 7 位元組的低 4 位元為接收端取樣率（0x2 44.1k、0x1 48k），高 4 位元為來源端取樣率（0x2 16k）。BlueCaster 只提供並設定音樂方向
 - **Opus**：7 位元組（Android `a2dp_vendor_opus_constants.h`）：第 6 位元組的位元 2..0 為聲道模式（0x01 單聲道、0x02 立體聲、0x04 雙單聲道），位元 4..3 為訊框長度（0x08 10 ms、0x10 20 ms），位元 7 為 48 kHz。BlueCaster 提供單聲道與立體聲、10 與 20 ms，並設定為 20 ms 立體聲（只有在輸入為單聲道且接收端支援單聲道時才使用單聲道）。媒體封包在 1 位元組的酬載標頭（低 4 位元為訊框數 1）之後帶有一個 Opus 封包
 - **aptX Adaptive**：40 位元組。BTstack 的能力事件會把接收端的編解碼器資訊截斷為 30 位元組，但其中仍包含 BlueCaster 使用的所有內容。SET_CONFIGURATION：48 kHz、來源類型 2（主機編碼器：由接收端自行控制播放時序）、立體聲；R1 接收端會收到自己的目標延遲位元組，其中 LL0 提高到至少 80 ms，HQ 延遲為 0 時改為 200 ms；R2 接收端則會收到來源端自己的 R2 區塊
@@ -337,6 +339,7 @@ AAC 與 SBC 使用 A2DP 規格中定義的標準 Codec ID。
 | `profiles.json` | 設定檔 |
 | `devices\devices.txt` | 已知裝置 |
 | `devices\le_audio_devices.txt` | LE Audio：裝置清單中的 LE Audio 項目 |
+| `devices\le_audio_sets.txt` | LE Audio：已儲存裝置的協調集（僅成員位址；一對耳機視為一個裝置） |
 | `devices\device_codecs.json` | 每個傳統藍牙裝置上次連線時提供的內容（以及是否曾向 OPPO 耳機要求 Hi-Res） |
 | `pairing\link_keys.txt` | 連結金鑰：與 v1 或 2.0.x 配對過的耳機不需重新配對即可重新連線 |
 | `pairing\le_audio_bonds.tlv`、`pairing\le_audio_csip.txt` | LE Audio：LE 綁定資訊（含 GATT 伺服器持久保存的 CCC 值）以及協調集 |

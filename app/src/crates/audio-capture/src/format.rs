@@ -2,7 +2,7 @@
 //! stream format (kept free of COM so it can be unit tested).
 
 /// Sample type of the delivered data. The pipeline converts all three.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SampleFormat {
     /// 32-bit float, nominally -1.0..=1.0 (the shared-mode mix format of
     /// practically every device, application capture, the test tone)
@@ -36,7 +36,7 @@ impl SampleFormat {
 }
 
 /// Format of the delivered audio: interleaved frames of `channels` samples
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Format {
     pub sample_rate: u32,
     pub channels: u16,

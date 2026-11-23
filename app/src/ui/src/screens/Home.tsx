@@ -10,7 +10,7 @@
 import { createEffect, createSignal, For, on, onCleanup, Show } from "solid-js";
 import { useApp, type AppContext } from "../app/context";
 import { saveSettings } from "../app/settings";
-import { Banner, Button } from "../components/controls";
+import { Banner, Button, titleWhenCut } from "../components/controls";
 import { Icon } from "../components/Icon";
 import {
   BatteryLevel,
@@ -22,7 +22,7 @@ import {
   MIC_NOTES,
   MicBadge,
   micShown,
-  openFirmwareFolder,
+  FirmwareFolderButton,
   QualityIndicator,
   Ring,
   showsBattery,
@@ -91,9 +91,7 @@ function FirmwareMissing() {
           // download, the folder for the files fetched by hand, the details
           <>
             <Show when={downloadable()}>{(a) => <FirmwareDownload files={a().firmware_files} kind="strong" />}</Show>
-            <Button icon="folder_open" onClick={() => void openFirmwareFolder(app)}>
-              {t("firmware.open_folder")}
-            </Button>
+            <FirmwareFolderButton />
             <Button kind={downloadable() ? undefined : "strong"} icon="usb_stick" onClick={toFirmware}>
               {t("ui.home.firmware_fix")}
             </Button>
@@ -326,7 +324,7 @@ function DeviceCard(props: { entry: AudioEntry; onError: (e: unknown) => void })
         </Ring>
         <div class="device-info">
           {/* The device, battery and state, the codec; the sidebar shows the same */}
-          <div class="device-name ellipsis" title={name()}>
+          <div class="device-name clamp-2" ref={titleWhenCut(name)}>
             {name()}
           </div>
           <div class="device-state">

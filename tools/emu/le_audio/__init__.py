@@ -32,6 +32,17 @@ def add_arguments(parser):
     parser.add_argument('--cis-up-after', type=float, metavar='SECONDS',
                         help='with --refuse-cis: the other CIS come up this much later, '
                              "on BlueCaster's side only")
+    parser.add_argument('--reencrypt-fail', choices=['drop', 'key-missing'],
+                        help="the first re-encryption with BlueCaster's stored key fails once: the sink ends the "
+                             'link (drop) or has no key (key-missing, 0x06)')
+    parser.add_argument('--iso-buffers', type=int, metavar='N',
+                        help="BlueCaster's controller reports N ISO buffers (LE Read Buffer Size v2)")
+    parser.add_argument('--completion-delay-ms', type=float, metavar='MS',
+                        help="BlueCaster's controller sends Number Of Completed Packets MS after delivering "
+                             'an SDU (and reports the matching flush timeout)')
+    parser.add_argument('--withhold-completions', type=int, metavar='N',
+                        help="BlueCaster's controller never completes the SDUs of the Nth CIS of LE Create CIS "
+                             '(0: the first) while it is up')
     for module in MODULES:
         if hasattr(module, 'add_arguments'):
             module.add_arguments(parser)
@@ -42,6 +53,13 @@ def configure_sink(sink, args):
         controller.NO_ISO_BUFFERS.add('BlueCaster')   # the controller served over H4 (emu_le_audio_sink.py)
     if args.refuse_cis is not None:
         controller.REFUSE_CIS = (args.refuse_cis, args.cis_up_after)
+    controller.REENCRYPT_FAIL = args.reencrypt_fail
+    if args.iso_buffers is not None:
+        controller.ISO_BUFFERS = args.iso_buffers
+    if args.completion_delay_ms:
+        controller.COMPLETION_DELAY_S = args.completion_delay_ms / 1000
+    if args.withhold_completions is not None:
+        controller.WITHHOLD_CIS = args.withhold_completions
     for module in MODULES:
         if hasattr(module, 'configure_sink'):
             module.configure_sink(sink, args)

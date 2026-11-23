@@ -1,5 +1,7 @@
 //! Files only this Windows user can read: the pairing keys at rest,
-//! encrypted with DPAPI (CryptProtectData, current-user scope).
+//! encrypted with DPAPI (CryptProtectData, current-user scope). In service
+//! mode the core encrypts for the service's own account instead
+//! ([`Scope`], [`use_service_scope`]).
 //!
 //! An encrypted file is [`MAGIC`] followed by the DPAPI blob. A file without
 //! it is an older plain-text one: [`read_secret`] returns its bytes and
@@ -26,6 +28,49 @@ pub const MAGIC: &[u8; 8] = b"BCDPAPI1";
 /// Bound into every blob: another program's DPAPI blobs of this user do not
 /// decrypt as ours, nor ours as theirs
 const ENTROPY: &[u8] = b"BlueCaster pairing keys";
+/// The same for the service's files: a blob of the user's folder copied
+/// into the service's does not decrypt there, even where both run as one
+/// account (tests), as it would not for a real service account
+const SERVICE_ENTROPY: &[u8] = b"BlueCaster service pairing keys";
+
+/// Whose files the secrets are: the one place that decides how they are
+/// protected. Both scopes encrypt for the account the process runs as
+/// (DPAPI's user scope) and never with CRYPTPROTECT_LOCAL_MACHINE, which
+/// lets any process on the PC decrypt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// The signed-in user's folder (the app, the session agent)
+    User,
+    /// The service's data folder (the core in service mode, for the
+    /// service's own account)
+    Service,
+}
+
+static SERVICE_SCOPE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This process keeps its secrets in the service's scope from now on (the
+/// core in service mode, at start, before any secret is read)
+pub fn use_service_scope() {
+    SERVICE_SCOPE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The scope [`protect`], [`unprotect`] and the files use in this process
+pub fn scope() -> Scope {
+    if SERVICE_SCOPE.load(std::sync::atomic::Ordering::SeqCst) { Scope::Service } else { Scope::User }
+}
+
+fn entropy(scope: Scope) -> &'static [u8] {
+    match scope {
+        Scope::User => ENTROPY,
+        Scope::Service => SERVICE_ENTROPY,
+    }
+}
+
+/// CryptProtectData's flags of a scope: no UI, and never the machine-wide
+/// flag
+fn flags(_scope: Scope) -> u32 {
+    CRYPTPROTECT_UI_FORBIDDEN
+}
 
 fn blob(data: &[u8]) -> CRYPT_INTEGER_BLOB {
     CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr().cast_mut() }
@@ -46,30 +91,56 @@ fn take(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
     }
 }
 
-/// `data` encrypted for the current Windows user
+/// `data` encrypted for the account this process runs as, in this
+/// process's [`scope`]
 pub fn protect(data: &[u8]) -> io::Result<Vec<u8>> {
+    protect_in(scope(), data)
+}
+
+/// `data` encrypted for the account this process runs as, in `scope`
+pub fn protect_in(scope: Scope, data: &[u8]) -> io::Result<Vec<u8>> {
     let input = blob(data);
-    let entropy = blob(ENTROPY);
+    let entropy = blob(entropy(scope));
     let mut out = CRYPT_INTEGER_BLOB::default();
     // SAFETY: input and entropy point to live slices for the call; out
     // receives a LocalAlloc'd buffer that take() frees.
-    unsafe {
-        CryptProtectData(&input, PCWSTR::null(), Some(&entropy), None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out)
-    }
-    .map_err(io::Error::other)?;
+    unsafe { CryptProtectData(&input, PCWSTR::null(), Some(&entropy), None, None, flags(scope), &mut out) }
+        .map_err(io::Error::other)?;
     Ok(take(out))
 }
 
-/// The data of a [`protect`]ed blob; an error when another user (or PC)
-/// encrypted it, or it is damaged
+/// The data of a [`protect`]ed blob of this process's [`scope`]; an error
+/// when another user (or PC, or scope) encrypted it, or it is damaged
 pub fn unprotect(data: &[u8]) -> io::Result<Vec<u8>> {
+    unprotect_in(scope(), data)
+}
+
+/// The data of a blob [`protect_in`] `scope` made
+pub fn unprotect_in(scope: Scope, data: &[u8]) -> io::Result<Vec<u8>> {
     let input = blob(data);
-    let entropy = blob(ENTROPY);
+    let entropy = blob(entropy(scope));
     let mut out = CRYPT_INTEGER_BLOB::default();
-    // SAFETY: as in protect()
-    unsafe { CryptUnprotectData(&input, None, Some(&entropy), None, None, CRYPTPROTECT_UI_FORBIDDEN, &mut out) }
+    // SAFETY: as in protect_in()
+    unsafe { CryptUnprotectData(&input, None, Some(&entropy), None, None, flags(scope), &mut out) }
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(take(out))
+}
+
+/// The content of the secret file `path` of the signed-in user's folder,
+/// whatever this process's scope (the session agent reads it for the move
+/// into the service's folder): Ok(None) when there is no file or it cannot
+/// be decrypted (nothing is renamed or rewritten), a plain-text file as it
+/// is
+pub fn read_user_secret(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match bytes.strip_prefix(MAGIC.as_slice()) {
+        Some(blob) => Ok(unprotect_in(Scope::User, blob).ok()),
+        None => Ok(Some(bytes)),
+    }
 }
 
 /// Whether the file's bytes are an encrypted file
@@ -151,6 +222,47 @@ mod tests {
         assert!(!blob.windows(secret.len()).any(|w| w == secret));
         assert_eq!(unprotect(&blob).unwrap(), secret);
         assert_eq!(unprotect(&protect(b"").unwrap()).unwrap(), b"");
+    }
+
+    #[test]
+    fn the_scopes_do_not_read_each_others_blobs() {
+        let secret = b"a link key";
+        let user = protect_in(Scope::User, secret).unwrap();
+        let service = protect_in(Scope::Service, secret).unwrap();
+        assert_eq!(unprotect_in(Scope::User, &user).unwrap(), secret);
+        assert_eq!(unprotect_in(Scope::Service, &service).unwrap(), secret);
+        // A user's blob copied into the service's folder does not decrypt
+        // there, nor the service's in the user's
+        assert!(unprotect_in(Scope::Service, &user).is_err());
+        assert!(unprotect_in(Scope::User, &service).is_err());
+        // Never the machine-wide flag (any process on the PC could decrypt)
+        for s in [Scope::User, Scope::Service] {
+            assert_eq!(flags(s) & windows::Win32::Security::Cryptography::CRYPTPROTECT_LOCAL_MACHINE, 0);
+        }
+        // This test process never switched: the user's scope
+        assert_eq!(scope(), Scope::User);
+    }
+
+    #[test]
+    fn the_users_secrets_are_read_without_touching_the_file() {
+        let d = dir("user");
+        let file = d.join("keys.txt");
+        assert_eq!(read_user_secret(&file).unwrap(), None);
+        let mut enc = MAGIC.to_vec();
+        enc.extend(protect_in(Scope::User, b"k").unwrap());
+        std::fs::write(&file, &enc).unwrap();
+        assert_eq!(read_user_secret(&file).unwrap().as_deref(), Some(&b"k"[..]));
+        // Plain text as it is, not rewritten
+        std::fs::write(&file, "plain").unwrap();
+        assert_eq!(read_user_secret(&file).unwrap().as_deref(), Some(&b"plain"[..]));
+        assert_eq!(std::fs::read(&file).unwrap(), b"plain");
+        // Not decryptable: none, and the file stays where it is
+        let mut foreign = MAGIC.to_vec();
+        foreign.extend(protect_in(Scope::Service, b"k").unwrap());
+        std::fs::write(&file, &foreign).unwrap();
+        assert_eq!(read_user_secret(&file).unwrap(), None);
+        assert_eq!(std::fs::read(&file).unwrap(), foreign);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

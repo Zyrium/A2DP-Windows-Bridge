@@ -29,15 +29,25 @@ features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
+    # authenticode.rs: the service set-up tool checks what it copies
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
     "Win32_System_Com",
     "Win32_System_Console",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
     "Win32_System_Threading",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Pipes",
     "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Diagnostics_ToolHelp",
+    # session_launch.rs: CreateEnvironmentBlock; service.rs: the SCM
+    "Win32_System_Environment",
+    "Win32_System_Services",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
     "Win32_System_Memory",
@@ -62,6 +72,10 @@ features = [
     "UI",
     "UI_ViewManagement",
 ]
+
+[dev-dependencies]
+# pipe_peer.rs tests: a pipe served and opened in the test itself
+tokio = { version = "1", features = ["net", "rt", "io-util"] }
 
 [lints]
 workspace = true

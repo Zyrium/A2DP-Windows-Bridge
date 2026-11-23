@@ -22,7 +22,7 @@ import { CableNotes } from "../components/CableNotes";
 import { DevicePicker, saveWithProfile } from "../components/DevicePicker";
 import { ImportPairings } from "../components/ImportPairings";
 import { Icon } from "../components/Icon";
-import { openFirmwareFolder, statusText } from "../components/stream";
+import { FirmwareFolderButton, statusText } from "../components/stream";
 import { t } from "../i18n";
 import { IpcError } from "../ipc/types";
 import type { AdapterInfo, AudioDevice, Device, Snapshot, WindowsPairedDevice } from "../ipc/types";
@@ -417,9 +417,7 @@ function StepDriver(props: { adapter: AdapterInfo | null }) {
                     <Button icon="open" onClick={() => core.transport.openUrl(firmwareUrl(a().vendor))}>
                       {t("firmware.open_download_page")}
                     </Button>
-                    <Button icon="folder_open" onClick={() => openFirmwareFolder(app)}>
-                      {t("firmware.open_folder")}
-                    </Button>
+                    <FirmwareFolderButton />
                     <Button icon="open" kind="subtle" onClick={() => core.transport.openUrl(LINKS.setupGuide)}>
                       {t("ui.setup.guide")}
                     </Button>

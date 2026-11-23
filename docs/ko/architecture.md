@@ -181,7 +181,7 @@ flowchart TD
 |:-------|:---------|:-----|
 | capture | MMCSS "Audio" | WASAPI를 읽음. 소리가 없는 구간은 무음으로 채움 |
 | encode | MMCSS "Pro Audio" | PCM을 인코더 입력 형식으로 변환하고, 인코더 블록 단위로 인코딩하고(남은 부분은 다음 회차로), 프레임을 미디어 페이로드로 묶음. 패킷이 고르게 나가도록 약 10 ms 단위로 처리 |
-| bt-runloop | -- | BTstack의 run loop. L2CAP가 보낼 수 있을 때마다 대기 중인 패킷을 전송. 패킷을 넣을 때마다 전송 대기열(64패킷)에서 350 ms 넘게 기다린 패킷을 오래된 것부터 버림 |
+| bt-runloop | -- | BTstack의 run loop. L2CAP가 보낼 수 있을 때마다 대기 중인 패킷을 전송. 패킷을 넣을 때마다 전송 대기열(64패킷)에서 350 ms(LHDC V5 저지연에서는 100 ms) 넘게 기다린 패킷을 오래된 것부터 버림 |
 | USB | -- | WinUSB 전송: IN 파이프(이벤트, ACL 데이터)마다 읽기 세 개를 동시에 진행. 쓰기는 명령용 하나, ACL 데이터용 하나(최대 8개 전송을 동시에 진행) |
 | core | Normal | 상태 머신, IPC(tokio. 연결별 RFCOMM 패스스루 대기열 포함), 설정, 통계(4 Hz), 업데이트 확인 |
 
@@ -401,7 +401,7 @@ DPAPI로 Windows 사용자별로 암호화됩니다(`win-sys::dpapi`). 다른 �
 
 | 인코더 | 라이브러리 | 비트레이트 | 특징 |
 |---------|---------|---------|----------|
-| LHDC V5 | lhdcv5-enc (AOSP 인코더의 C 포팅) | 400/500/900/1000 kbps (낮음/중간/중상/높음), 싱크가 알리는 최대값 이하, ABR 160–400 kbps | 16/24비트, 5 ms 프레임, 2바이트 미디어 페이로드 헤더, RTP 헤더 |
+| LHDC V5 | lhdcv5-enc (AOSP 인코더의 C 포팅) | 400/500/900/1000 kbps (낮음/중간/중상/높음), 싱크가 알리는 최대값 이하, ABR 160–400 kbps | 16/24비트, 5 ms 프레임, 2바이트 미디어 페이로드 헤더, RTP 헤더. 싱크가 알리면 저지연 지원 (20 ms 대신 10 ms마다 인코딩. ABR이 꺼져 있으면 아래 대기열 보호도 적용) |
 | LDAC | libldac (AOSP) | 330/660/990 kbps | 높음/중간/낮음 (HQ/SQ/MQ) 모드, ABR |
 | aptX Adaptive | aptx-adaptive (AKS-Logic/aptx-adaptive-linux의 순수 Rust 인코더, MIT) | 높음 427 kbps, 저지연 265 kbps (R2 싱크: 270). ABR은 364/318 (R2: 270/204)까지 낮춤 | 48 kHz 스테레오(선택했고 R2 싱크가 96 kHz를 알리면 높음에서 96 kHz: 646/340/255 kbps), 24비트. 미디어 패킷당 코덱 패킷 하나, BlueCaster 자체 RTP 헤더. 높음에서 ABR. 자동은 LHDC V5와 LDAC 다음으로 선택 |
 | Opus | libopus 1.6.1 | 256 kbps (스테레오, 모노는 절반) | Android의 A2DP Opus: 48 kHz, 20 ms 프레임(싱크가 10 ms만 지원하면 10 ms), 미디어 페이로드에 맞춘 상한이 있는 constrained VBR, 패킷당 프레임 하나, 1바이트 미디어 페이로드 헤더, RTP 헤더 |
@@ -412,6 +412,11 @@ DPAPI로 Windows 사용자별로 암호화됩니다(`win-sys::dpapi`). 다른 �
 | SBC XQ | 같은 SBC 인코더 | 약 385/505/552 kbps | 듀얼 채널, 44.1 / 48 kHz에서 비트풀 47 / 43 (높음). 싱크의 SBC가 듀얼 채널과 비트풀 29 이상을 허용할 때만 사용(이때 비트풀은 PipeWire처럼 싱크의 최대값으로 제한). SBC의 스트림 엔드포인트, 미디어 페이로드 헤더, RTP 헤더를 공유 |
 | SBC | Bluedroid 인코더의 Rust 포팅 | 최대 약 345 kbps | A2DP 필수 기본 코덱. C 인코더와 비트 단위로 일치 (모든 구성에서 테스트) |
 | FastStream | 같은 SBC 인코더 | 198/216 kbps (44.1/48 kHz) | CSR 벤더 코덱, 음악 방향만 (음성 백채널 없음): SBC joint stereo bitpool 29, 프레임을 72바이트로 패딩, 패킷당 3개, 미디어 페이로드 헤더와 RTP 헤더 없음 (PipeWire와 동일). 자동에서는 선택되지 않음 |
+
+**LHDC V5 대기열 보호**(저지연 켜짐, ABR 꺼짐): 전송 대기열의 패킷이 1초 평균
+12개 이상인 동안 인코더는 비트레이트를 한 단계 낮춥니다(1000, 900, 500 kbps 순,
+최소 2 s 간격). 안정된 상태가 1분 이어지면 한 단계 올립니다. 올린 단계가 30 s를
+버티지 못하면 대기 시간이 두 배가 되며, 최대 10분까지 늘어납니다.
 
 모든 인코더는 `codec::Encoder` 트레이트를 구현합니다. 각 인코더는 PCM 형식과
 한 번 호출할 때 소비하는 프레임 수를 밝히고, 코덱 프레임을 반환합니다.
@@ -450,8 +455,9 @@ AAC와 SBC는 A2DP 사양에 정의된 표준 A2DP 코덱 ID를 사용합니다.
   샘플링 속도(0x20 44.1k, 0x10 48k, 0x04 96k, 0x01 192k), 바이트 7은 비트 심도
   (0x04 16-bit, 0x02 24-bit)와 싱크의 최소/최대 비트레이트 제한, 바이트 8은
   코덱 하위 버전(0x01 = V5 ver.1)과 0x10 = 5 ms 프레임, 바이트 9-10은
-  선택 기능(low latency, lossless, JAS, AR, META)이며 BlueCaster는 이 중 어느 것도
-  제공하지 않음. 스테레오만 지원. 싱크의 비트레이트 제한은 Android와 마찬가지로
+  선택 기능(low latency, lossless, JAS, AR, META). LHDC V5 설정에서 저지연이
+  켜져 있고 싱크가 이를 알리면 BlueCaster는 저지연을 요청함(바이트 9, 0x40). 다른
+  기능은 제공하지 않음. 스테레오만 지원. 싱크의 비트레이트 제한은 Android와 마찬가지로
   구성에 그대로 반영되고 인코더에 적용됨. 미디어 패킷에는 2바이트 페이로드 헤더가
   포함됨: frame count << 2 (지연 비트 0)와 시퀀스 번호
 - **FastStream**: 8바이트 (PipeWire `a2dp_faststream_t`): 바이트 6은 방향
@@ -496,6 +502,7 @@ LHDC V5와 LDAC보다는 뒤입니다(issue #86의 순서).
 | `profiles.json` | 프로필 |
 | `devices\devices.txt` | 알려진 장치 |
 | `devices\le_audio_devices.txt` | LE Audio: 장치 목록의 LE Audio 항목 |
+| `devices\le_audio_sets.txt` | LE Audio: 저장된 장치의 코디네이티드 세트(구성원 주소만 저장하며, 한 쌍의 이어버드는 장치 하나로 취급) |
 | `devices\device_codecs.json` | 각 클래식 장치가 마지막으로 연결했을 때 제공한 내용 (그리고 OPPO 이어폰에 Hi-Res를 요청했는지 여부) |
 | `pairing\link_keys.txt` | 링크 키: v1이나 2.0.x에서 페어링한 헤드폰은 다시 페어링하지 않고 다시 연결됨 |
 | `pairing\le_audio_bonds.tlv`, `pairing\le_audio_csip.txt` | LE Audio: LE 본딩 정보(GATT 서버가 유지하는 CCC 값 포함)와 조정 세트 |

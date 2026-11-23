@@ -3,29 +3,65 @@
 //! and no IPC). A GUI-subsystem program: the resident process opens no
 //! console window; `--cli` attaches to the console it was started from.
 //! `--quit` asks a running core to exit (the installer uses it).
+//! `--headless` runs the core without a tray of its own: the session agent
+//! shows it (what a Windows service will host).
 
 #![forbid(unsafe_code)]
 #![windows_subsystem = "windows"]
 
+mod agent;
+mod agent_shell;
 mod bundle;
 mod cli;
 mod crashes;
 mod driver;
+mod handover;
+mod headless;
 mod logging;
 mod pairing;
 mod qcy_cache;
 mod qcy_live;
 mod qcy_probe;
 mod quit;
+mod request;
 mod resident;
 mod rfcomm;
+mod rules;
 mod server;
+mod service_host;
+mod service_setup;
 mod state;
 mod vb_cable;
 mod zip;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The keyboards and mice guard (win_sys::hid_guard), started by a core
+    // that passes their input to Windows: no logs, no settings, no window
+    if args.first().map(String::as_str) == Some(win_sys::hid_guard::GUARD_ARG) {
+        std::process::exit(win_sys::hid_guard::run(&args[1..]));
+    }
+    // The input helper (crate input-helper), started by a headless core or
+    // the service: no logs, no settings, no window
+    if args.first().map(String::as_str) == Some(input_helper::HELPER_ARG) {
+        std::process::exit(input_helper::helper::run(&args[1..]));
+    }
+    // The session agent (session_host::run_agent), started by hand or by a
+    // core with --session-agent: logs to that core, no settings, no window
+    if args.first().map(String::as_str) == Some(agent::AGENT_ARG) {
+        std::process::exit(agent::run(&args[1..]));
+    }
+    // Service mode's elevated helper: one request to the service, then
+    // exit; neither logs nor the settings folder
+    if args.first().map(String::as_str) == Some(request::REQUEST_ARG) {
+        std::process::exit(request::run(&args));
+    }
+    // The Windows service (`--service`, started by the service control
+    // manager: the headless core in service mode), and creating or
+    // removing it (`--install-service`, `--uninstall-service`)
+    if let Some(code) = service_host::dispatch(&args) {
+        std::process::exit(code);
+    }
     if args.iter().any(|a| a == "--quit") {
         // Neither logs nor the settings folder: only the running core's
         win_sys::console::attach_parent();
@@ -40,6 +76,13 @@ fn main() {
     // once no 2.0.x core or v1 writes to it any more (resident::run stops
     // them, then calls config_dir again)
     bluecaster_core::paths::set_old_app_check(old_app_runs);
+    // Service mode (`--headless --service-data <dir>`): the data root is
+    // that folder, before anything reads a path
+    if args.iter().any(|a| a == headless::HEADLESS_ARG)
+        && let Some(code) = headless::enter_service_mode(&args)
+    {
+        std::process::exit(code);
+    }
     let config = bluecaster_core::paths::config_dir();
     // Developer mode's logging from the first line (the settings are read
     // again, with their log lines, when the service starts)
@@ -49,11 +92,18 @@ fn main() {
         console: cli_mode,
         crash_dir: Some(bluecaster_core::paths::crash_dir(&config)),
         dev,
+        agent: false,
     });
     if let Some(note) = bluecaster_core::paths::take_folder_note() {
         tracing::info!("{note}");
     }
-    let code = if cli_mode { cli::run(&args) } else { resident::run(&args) };
+    let code = if cli_mode {
+        cli::run(&args)
+    } else if args.iter().any(|a| a == headless::HEADLESS_ARG) {
+        headless::run(&args)
+    } else {
+        resident::run(&args)
+    };
     // process::exit skips destructors: flush the log first
     drop(log);
     std::process::exit(code);
@@ -174,6 +224,7 @@ fn core_codec_details(d: ipc::CodecDetails) -> bluecaster_core::CodecDetails {
             sample_rates: c.sample_rates,
             bit_depths: c.bit_depths,
             max_bitrate: c.max_bitrate,
+            lhdcv5_low_latency: c.lhdcv5_low_latency,
         }),
     }
 }
@@ -207,6 +258,7 @@ pub(crate) fn diag_text(state: &state::CoreState, mask: bool) -> String {
         abr: i.abr,
         bitrate_capped: i.bitrate_capped,
         hi_res_set: i.hi_res_set,
+        low_latency: i.low_latency,
         source: core_source(i.source.as_ref()),
         details: i.details.clone().map(|d| Box::new(core_codec_details(*d))),
     });

@@ -168,6 +168,22 @@ export function createCore(transport: Transport) {
       case "audio_endpoints":
         setState("snap", "audio_endpoints", ev.value);
         break;
+      case "hid_devices":
+        setState("snap", "hid_devices", reconcile(ev.value));
+        break;
+      case "hid_candidates":
+        setState("snap", "hid_candidates", reconcile(ev.value));
+        break;
+      case "hid_passkey":
+        setState("snap", "hid_passkey", ev.value === null ? null : reconcile(ev.value));
+        break;
+      case "hid_check":
+        setState("snap", "hid_checks", reconcile(ev.value.checks));
+        setState("snap", "hid_rolled_back", ev.value.rolled_back === null ? null : reconcile(ev.value.rolled_back));
+        break;
+      case "hid_health":
+        setState("snap", "hid_health", ev.value === null ? null : reconcile(ev.value));
+        break;
       default:
         // An event kind of a newer core: the next snapshot has it
         break;
@@ -183,6 +199,10 @@ export function createCore(transport: Transport) {
       setState("snap", null);
       return;
     }
+    // The window closes (the shell ends this process); not state
+    if (ev.kind === "ui_close") return;
+    // Headphone buttons are for other clients: not state, no revision
+    if (ev.kind === "media_button") return;
     const cur = state.rev;
     if (cur !== null) {
       if (rev <= cur) return; // already in the snapshot

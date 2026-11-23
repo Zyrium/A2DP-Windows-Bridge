@@ -31,8 +31,9 @@ pub const CEILING_DB: f32 = -0.3;
 
 /// Frames processed at a time (the scratch buffers' length)
 const CHUNK: usize = 256;
-/// Most channels processed (the encoders take mono or stereo)
-const MAX_CHANNELS: usize = 2;
+/// Most channels processed (the A2DP encoders take mono or stereo, the LE
+/// path up to four speakers)
+const MAX_CHANNELS: usize = 4;
 /// Points of the response scanned for its highest boost, log spaced
 const SCAN_POINTS: usize = 192;
 
@@ -185,7 +186,7 @@ pub struct EqProcessor {
 }
 
 impl EqProcessor {
-    /// For interleaved audio of `channels` (1 or 2) at `sample_rate`
+    /// For interleaved audio of `channels` (1 to 4) at `sample_rate`
     pub fn new(handle: EqHandle, sample_rate: u32, channels: usize) -> EqProcessor {
         let rate = sample_rate.max(1) as f32;
         let mut p = EqProcessor {
@@ -198,7 +199,7 @@ impl EqProcessor {
             used: 0,
             preamp: 1.0,
             preamp_now: 1.0,
-            limiters: [Limiter::new(rate), Limiter::new(rate)],
+            limiters: std::array::from_fn(|_| Limiter::new(rate)),
             scratch: [[0.0; CHUNK]; MAX_CHANNELS],
             active: false,
         };
@@ -460,6 +461,78 @@ mod tests {
         for (rate, f, want) in table {
             let got = dsp::biquad::eq_response_db(&bands, f, rate);
             assert!((got - want).abs() < 1e-6, "{rate} Hz rate, {f} Hz: {got}");
+        }
+    }
+
+    /// Gain (dB) from `inp` to `out` at `freq`, channel `c` of `ch`: one DFT
+    /// bin over the second half of a second of audio (the filters settled;
+    /// every whole multiple of 2 Hz is its own bin)
+    fn gain_at(inp: &[f32], out: &[f32], ch: usize, c: usize, freq: f64, rate: f64) -> f64 {
+        let frames = inp.len() / ch;
+        let bin = |x: &[f32]| {
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (n, f) in x.chunks_exact(ch).enumerate().skip(frames / 2) {
+                let w = 2.0 * PI * freq * n as f64 / rate;
+                re += f64::from(f[c]) * w.cos();
+                im -= f64::from(f[c]) * w.sin();
+            }
+            re.hypot(im)
+        };
+        20.0 * (bin(out) / bin(inp)).log10()
+    }
+
+    /// One point at ±1 dB, measured through the processor at every rate a
+    /// stream runs at, mono and stereo: the touched band follows the
+    /// designed bell and the rest of the spectrum stays flat (but for the
+    /// preamp), up to the top of the audio band, on each channel
+    #[test]
+    fn one_point_leaves_the_rest_flat() {
+        let freqs = [50.0, 200.0, 700.0, 1000.0, 1400.0, 5000.0, 10_000.0, 15_000.0, 19_000.0];
+        for rate in [16_000u32, 44_100, 48_000, 96_000] {
+            let r = f64::from(rate);
+            let tones: Vec<f64> = freqs.iter().copied().filter(|&f| f < r * 0.45).collect();
+            for ch in [1usize, 2] {
+                for gain in [1.0f32, -1.0] {
+                    let band = [EqBand::peaking(1000.0, gain, 1.41)];
+                    let h = EqHandle::default();
+                    h.set(EqSettings::new(true, &band));
+                    let mut p = EqProcessor::new(h, rate, ch);
+                    assert!(p.active());
+                    let preamp = f64::from(p.preamp_db());
+                    assert!((preamp + f64::from(gain.max(0.0))).abs() < 0.01, "{rate} Hz: preamp {preamp:.3}");
+                    // All tones at once, in another phase on each channel
+                    let inp: Vec<f32> = (0..rate as usize)
+                        .flat_map(|n| {
+                            let tones = &tones;
+                            (0..ch).map(move |c| {
+                                tones
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(k, &f)| 0.05 * (2.0 * PI * f * n as f64 / r + (k + 3 * c) as f64).sin())
+                                    .sum::<f64>() as f32
+                            })
+                        })
+                        .collect();
+                    let mut out = inp.clone();
+                    for block in out.chunks_mut(480 * ch) {
+                        p.process(block);
+                    }
+                    for c in 0..ch {
+                        for &f in &tones {
+                            let got = gain_at(&inp, &out, ch, c, f, r);
+                            let want = dsp::biquad::eq_response_db(&band, f, r) + preamp;
+                            assert!(
+                                (got - want).abs() < 0.05,
+                                "{rate} Hz, {ch} ch, {gain:+} dB point: {got:+.3} dB at {f} Hz (designed {want:+.3}), channel {c}"
+                            );
+                            // Two octaves and more from the point: flat but for the preamp
+                            if !(250.0..=4000.0).contains(&f) {
+                                assert!((got - preamp).abs() < 0.1, "{rate} Hz: {got:+.3} dB at {f} Hz");
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

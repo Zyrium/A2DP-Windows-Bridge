@@ -116,7 +116,7 @@ pub struct LeKeys {
 }
 
 /// Ours, beside le_device_db's bond `index`: the classic device it came from
-fn tag(index: usize) -> u32 {
+pub(crate) fn tag(index: usize) -> u32 {
     (u32::from(b'A') << 24) | (u32::from(b'W') << 16) | (u32::from(b'K') << 8) | (index as u32 & 0xFF)
 }
 

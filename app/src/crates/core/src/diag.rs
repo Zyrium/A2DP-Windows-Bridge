@@ -776,6 +776,13 @@ pub fn quoted(name: &str) -> String {
     format!("\u{201C}{name}\u{201D}")
 }
 
+/// A name, ID or path for a log line: as it is, or in service mode a
+/// placeholder. The service's log holds counts and states only; the UI
+/// shows the names through its own channels (the snapshot, diag.flow).
+pub fn log_name(name: &str) -> &str {
+    if crate::paths::service_mode() { "<hidden>" } else { name }
+}
+
 /// Masks what identifies the user, the PC and their devices:
 /// - Device names: the text between typographic quotes `“...”` (what
 ///   [`quoted`] makes: the app logs device names that way) and the names
@@ -2351,6 +2358,7 @@ mod tests {
             abr: false,
             bitrate_capped: false,
             hi_res_set: false,
+            low_latency: false,
             source: crate::stream::SourceInfo { kind: "app", name: "Spotify.exe".into(), waiting: true },
             details: Some(Box::new(crate::CodecDetails {
                 mtu: 679,
@@ -2534,6 +2542,7 @@ mod tests {
                 overflows: 3,
                 send_errors: 0,
                 prefill: 6,
+                ..Default::default()
             }),
             devices: vec![bt_host::LeDeviceInfo {
                 id: bt_host::LeDeviceId(1),

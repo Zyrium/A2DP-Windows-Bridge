@@ -1,0 +1,25 @@
+# cargo-nextest: how CI runs the unit tests (.github/workflows/ci.yml).
+# `cargo test` works as before.
+
+[profile.ci]
+# A test that fails is run again, up to twice. One that then passes is
+# listed as FLAKY in the summary and does not fail the run; one that fails
+# three times does.
+retries = 2
+# The other tests still run after a failure, so one run shows all of them
+fail-fast = false
+# A hung test is stopped after 5 minutes instead of holding the job
+slow-timeout = { period = "60s", terminate-after = 5 }
+failure-output = "immediate-final"
+status-level = "retry"
+final-status-level = "flaky"
+
+# nextest runs every test in a process of its own, several at a time. The
+# session agent tests look this test program up by its file name and share
+# one volume mirror, so they run one at a time.
+[test-groups]
+one-at-a-time = { max-threads = 1 }
+
+[[profile.ci.overrides]]
+filter = 'binary(session_agent)'
+test-group = 'one-at-a-time'

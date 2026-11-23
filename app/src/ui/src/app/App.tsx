@@ -27,6 +27,8 @@ import { Setup, needsSetup } from "../screens/Setup";
 import { applyTheme, followAccent } from "../theme";
 import { AppProvider, useApp, type RouteName } from "./context";
 import { mixerShown, saveSettings } from "./settings";
+import { HidNotice } from "../components/HidHost";
+import { ServiceConnectionNotice, ServiceNewerNotice } from "../components/ServiceAddon";
 import { CaptureSign, CrashNotice, UpdateNotice } from "./indicators";
 import "./shell.css";
 
@@ -83,6 +85,22 @@ function ConnectionScreen(props: { compact?: boolean }) {
           <h1>{t("ui.conn.rejected_title")}</h1>
           <p>{t("ui.conn.rejected_body")}</p>
           <p class="muted mono">{(conn() as { reason: string }).reason}</p>
+        </Match>
+        <Match when={conn().state === "service_needs_update"}>
+          <ServiceConnectionNotice
+            stopped={false}
+            version={(conn() as { version: string }).version}
+            app={(conn() as { app: string }).app}
+          />
+        </Match>
+        <Match when={conn().state === "service_newer"}>
+          <ServiceNewerNotice
+            version={(conn() as { version: string }).version}
+            app={(conn() as { app: string }).app}
+          />
+        </Match>
+        <Match when={conn().state === "service_stopped"}>
+          <ServiceConnectionNotice stopped />
         </Match>
         <Match when={true}>
           <span class="spinner big" aria-hidden="true" />
@@ -222,6 +240,7 @@ function MainWindow() {
           </nav>
           <main class="content" id="main" tabindex="-1" lang={lang()}>
             <div class="app-notices">
+              <HidNotice />
               <CrashNotice />
               <UpdateNotice />
             </div>
@@ -334,7 +353,7 @@ function DevicePill(props: { entry: AudioEntry | null }) {
       <span class="status-pill-text">
         {/* As Home's card: the device, battery and state, the codec */}
         <Show when={device()}>
-          <span class="status-pill-device ellipsis">{device()}</span>
+          <span class="status-pill-device clamp-2">{device()}</span>
         </Show>
         <span class="status-pill-line">
           <Show when={live() && showsBattery(stream())}>

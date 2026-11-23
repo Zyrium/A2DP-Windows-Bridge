@@ -153,6 +153,8 @@ code; all other crates have `#![forbid(unsafe_code)]`.
 | 2. Parts | `aptx-adaptive` | The aptX Adaptive encoder in Rust (vendored from AKS-Logic/aptx-adaptive-linux, MIT) |
 | 2. Parts | `codec` | The `Encoder` trait, the SBC encoder (Rust port of Bluedroid's), safe wrappers of the C encoders, Codec Information parsing and the codec choice |
 | 2. Parts | `audio-capture` | WASAPI capture (`wasapi` crate): system loopback, virtual device, one application (process loopback); device and app lists, test tone, per-app volume (Volume Mixer) |
+| 2. Parts | `pcm-link` | PCM between two processes: a lock-free ring in shared memory and a wake event |
+| 3. Engine | `session-host` | The session-bound work (device lists, capture, playback) behind one facade, `SessionHost`: done in the core's process, or in the session agent (`--session-agent`) over a named pipe |
 | 2. Parts | `voice-link` | The headset microphone's audio (developer mode): mono PCM rendered to the chosen output device (WASAPI), the capture downmixed for the uplink, and the CVSD / mSBC / LC3-SWB voice codecs over SCO payloads |
 | 3. Engine | `bt-host` | Runs BTstack on its own thread, driven by commands and typed events: GAP, A2DP Source, AVRCP, SDP, RFCOMM channels for the passthrough (`rfcomm.*`), link keys, a device's SDP services, AFH, firmware loading and chip loaders (`bringup`), the chip probe and chip scripts, HCI capture (`.pklg`), LE Audio (`le/`) |
 | 2. Parts | `le-audio` | LE Audio: the logic without BTstack or Windows (assigned numbers, LTV, PACS / ASCS PDUs, presets, the CSIP / VCP / MCP / CCP models) |
@@ -185,7 +187,7 @@ flowchart TD
 |:-------|:---------|:-----|
 | capture | MMCSS "Audio" | Reads WASAPI; fills silent stretches with silence |
 | encode | MMCSS "Pro Audio" | Converts PCM to the encoder's input format, encodes whole encoder blocks (the remainder waits for the next round) and packs frames into media payloads, in rounds of about 10 ms so packets go out evenly |
-| bt-runloop | -- | BTstack's run loop; sends a queued packet whenever L2CAP can send. Each time a packet is queued, the send queue (64 packets) drops packets that have waited 350 ms, oldest first |
+| bt-runloop | -- | BTstack's run loop; sends a queued packet whenever L2CAP can send. Each time a packet is queued, the send queue (64 packets) drops packets that have waited 350 ms (100 ms with LHDC V5 low latency), oldest first |
 | USB | -- | WinUSB transfers: three reads in flight on each IN pipe (events, ACL data), a writer for commands and one for ACL data (up to 8 transfers in flight) |
 | core | Normal | State machine, IPC (tokio; the RFCOMM passthrough's queues per connection), settings, statistics (4 Hz), update check |
 
@@ -423,7 +425,7 @@ administrator) and is deleted when the helper exits.
 
 | Encoder | Library | Bitrate | Features |
 |---------|---------|---------|----------|
-| LHDC V5 | lhdcv5-enc (C port of the AOSP encoder) | 400/500/900/1000 kbps (Low/Medium/Medium-High/High), at most the sink's listed maximum, ABR 160–400 kbps | 16/24-bit, 5 ms frames, 2-byte media payload header, RTP header |
+| LHDC V5 | lhdcv5-enc (C port of the AOSP encoder) | 400/500/900/1000 kbps (Low/Medium/Medium-High/High), at most the sink's listed maximum, ABR 160–400 kbps | 16/24-bit, 5 ms frames, 2-byte media payload header, RTP header; low latency where the sink lists it (encodes every 10 ms instead of 20; with ABR off, adds the queue guard below) |
 | LDAC | libldac (AOSP) | 330/660/990 kbps | High/Medium/Low (HQ/SQ/MQ) modes, ABR |
 | aptX Adaptive | aptx-adaptive (pure-Rust encoder of AKS-Logic/aptx-adaptive-linux, MIT) | 427 kbps High, 265 kbps Low Latency (R2 sinks: 270); ABR steps down to 364/318 (R2: 270/204) | 48 kHz stereo (96 kHz in High when chosen, to an R2 sink that lists it: 646/340/255 kbps), 24-bit; one codec packet per media packet behind BlueCaster's own RTP header; ABR in High; Auto takes it after LHDC V5 and LDAC |
 | Opus | libopus 1.6.1 | 256 kbps (stereo; mono half) | Android's A2DP Opus: 48 kHz, 20 ms frames (10 ms if the sink has only that), constrained VBR capped to the media payload, one frame per packet, 1-byte media payload header, RTP header |
@@ -434,6 +436,12 @@ administrator) and is deleted when the helper exits.
 | SBC XQ | the same SBC encoder | ~385/505/552 kbps | Dual channel, bitpool 47 / 43 at 44.1 / 48 kHz (High); only when the sink's SBC allows dual channel and a bitpool of at least 29 (the bitpool is then capped at the sink's maximum, as PipeWire); shares SBC's stream endpoint, media payload header and RTP header |
 | SBC | Rust port of the Bluedroid encoder | up to ~345 kbps | Mandatory A2DP baseline; bit-exact with the C encoder (tested over all configurations) |
 | FastStream | the same SBC encoder | 198/216 kbps (44.1/48 kHz) | CSR vendor codec, music direction only (no voice backchannel): SBC joint stereo bitpool 29, frames padded to 72 bytes, 3 per packet, no media payload header and no RTP header (as PipeWire); never chosen by Auto |
+
+**LHDC V5 queue guard** (low latency on, ABR off): while the send queue
+averages 12 packets or more over a second, the encoder steps down one level
+(1000, 900, then 500 kbps), at least 2 s apart. After a calm minute it steps
+back up one level. If a step up does not hold for 30 s, the wait doubles, up
+to 10 minutes.
 
 All encoders implement the `codec::Encoder` trait: they state the PCM
 format and the number of frames one call consumes, and return codec frames.
@@ -472,8 +480,10 @@ Codec information element sizes (including the 6-byte vendor/codec ID):
   sample rates (0x20 44.1k, 0x10 48k, 0x04 96k, 0x01 192k), byte 7 bit depth
   (0x04 16-bit, 0x02 24-bit) and the sink's min/max bit rate limits, byte 8
   codec sub-version (0x01 = V5 ver.1) and 0x10 = 5 ms frames, bytes 9-10
-  optional features (low latency, lossless, JAS, AR, META), none of which
-  BlueCaster offers. Stereo only. The sink's bit rate limits are echoed back in the
+  optional features (low latency, lossless, JAS, AR, META). BlueCaster asks
+  for low latency (byte 9, 0x40) when low latency is on in the LHDC V5
+  settings and the sink lists it. BlueCaster offers none of the other
+  features. Stereo only. The sink's bit rate limits are echoed back in the
   configuration and applied to the encoder, as Android does. Media packets
   carry a 2-byte payload header: frame count << 2 (latency bits 0) and a
   sequence number
@@ -519,6 +529,7 @@ renames on its first start, sorting the files into these folders:
 | `profiles.json` | Profiles |
 | `devices\devices.txt` | Known devices |
 | `devices\le_audio_devices.txt` | LE Audio: the LE Audio entries of the device list |
+| `devices\le_audio_sets.txt` | LE Audio: the coordinated sets of the saved devices (member addresses only; both earbuds of a pair are one device) |
 | `devices\device_codecs.json` | What each classic device offered when it last connected (and whether OPPO earbuds were asked for Hi-Res) |
 | `pairing\link_keys.txt` | Link keys: headphones paired with v1 or 2.0.x reconnect without pairing again |
 | `pairing\le_audio_bonds.tlv`, `pairing\le_audio_csip.txt` | LE Audio: LE bonds (with the GATT server's persistent CCC values) and coordinated sets |

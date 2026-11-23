@@ -11,6 +11,7 @@ use serde_json::Value;
 use tauri::{AppHandle, State, WebviewWindow};
 
 use crate::connection::{Ipc, Status};
+use crate::service;
 use crate::update::{self, Phase, Updates};
 use crate::windows;
 
@@ -171,10 +172,55 @@ pub async fn save_text_file(window: WebviewWindow, name: String, text: String) -
     Ok(true)
 }
 
-/// The in-app update's state (also sent as `update://phase`)
+/// The in-app update's state (also sent as `update://phase`). It updates
+/// the user's own install, also while the window uses the service add-on:
+/// the service has its own copy, which then needs an update (service.rs).
 #[tauri::command]
 pub fn update_status(updates: State<'_, Arc<Updates>>) -> Phase {
     updates.phase()
+}
+
+/// The service add-on's state (read-only queries)
+#[tauri::command]
+pub async fn service_state() -> Result<service::Route, String> {
+    tauri::async_runtime::spawn_blocking(service::current).await.map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+pub struct SetupResult {
+    #[serde(flatten)]
+    outcome: service::Outcome,
+    service: service::Route,
+}
+
+/// Adds ("install"), updates ("update") or removes ("remove", with
+/// `remove_data` its data too) the service add-on: the per-user install's
+/// set-up tool runs as administrator (Windows' prompt) and is waited for.
+/// Then the state is read again.
+#[tauri::command]
+pub async fn service_setup(ipc: State<'_, Arc<Ipc>>, action: String, remove_data: bool) -> Result<SetupResult, String> {
+    let action = service::Action::parse(&action, remove_data)?;
+    let before = tauri::async_runtime::spawn_blocking(service::current).await.map_err(|e| e.to_string())?;
+    action.allowed(&before)?;
+    let ipc = ipc.inner().clone();
+    // The core that stops for the set-up says Bye: the window stays
+    ipc.set_switching(true);
+    let outcome = tauri::async_runtime::spawn_blocking(move || service::run_setup(action))
+        .await
+        .unwrap_or_else(|e| service::Outcome::NotStarted { detail: e.to_string() });
+    let route = tauri::async_runtime::spawn_blocking(service::current).await.map_err(|e| e.to_string())?;
+    // Added (running or still starting) or gone: the other core serves next
+    let added = route != service::Route::NotAdded;
+    let switched = outcome == service::Outcome::Done && ipc.service() != added;
+    if switched && !ipc.service() {
+        // Added: the user's own core hands the adapter to the service and
+        // exits; the window connects to the service next
+        let _ = ipc.request("main", "app.quit", None).await;
+    } else if !switched {
+        // Nothing to connect to again: a later Bye ends the window as usual
+        ipc.set_switching(false);
+    }
+    Ok(SetupResult { outcome, service: route })
 }
 
 /// Downloads the update of `manifest_url` (UpdateInfo.manifest_url) and
@@ -185,7 +231,6 @@ pub fn update_install(app: AppHandle, manifest_url: String) -> Result<(), String
     update::start(&app, manifest_url)
 }
 
-// The Fones screen's QCY earbuds (ipc/qcy.ts): state, refresh and reconnect
 // go to the core (qcy.*). qcy_set forwards ONLY { kind: "game_mode" |
 // "sleep_mode" | "wind_reduction", enabled: bool } and (phase F3)
 // { kind: "noise_control", value: 0..=6 } and (phase F3b)

@@ -27,13 +27,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use btstack_sys::Stack;
 use btstack_sys::consts::{
     ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH, ATT_ERROR_INVALID_OFFSET, ATT_PROPERTY_DYNAMIC,
     ATT_TRANSACTION_MODE_ACTIVE, ATT_TRANSACTION_MODE_CANCEL, ATT_TRANSACTION_MODE_EXECUTE,
     ATT_TRANSACTION_MODE_VALIDATE, GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_INDICATION,
     GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_NOTIFICATION,
 };
+use btstack_sys::{Stack, ccc_device_index, ccc_slots, ccc_tag, service_changed_tag};
 pub use le_audio::db_hash::AttUuid;
 use le_audio::defs::{
     UUID_CHR_APPEARANCE, UUID_CHR_DATABASE_HASH, UUID_CHR_DEVICE_NAME, UUID_CHR_SERVICE_CHANGED, UUID_SERVICE_GAP,
@@ -51,22 +51,8 @@ pub const ATT_PROPERTY_INDICATE: u16 = 0x20;
 pub const ATT_SECURITY_NONE: u8 = 0;
 pub const ATT_SECURITY_ENCRYPTED: u8 = 1;
 
-/// att_server.c's NVN_NUM_GATT_SERVER_CCC (btstack_config.h)
-const NVN_NUM_GATT_SERVER_CCC: u32 = 256;
-
-/// BTstack's persistent CCC store (att_server.c, private there): one TLV
-/// tag 'BTC' + slot per CCC value of a bonded client
-fn tag_ccc(slot: u32) -> u32 {
-    (u32::from(b'B') << 24) | (u32::from(b'T') << 16) | (u32::from(b'C') << 8) | (slot & 0xFF)
-}
-
 /// 'BTDB': the Database Hash the stored CCC values were written for
 const TAG_DB_HASH: u32 = (b'B' as u32) << 24 | (b'T' as u32) << 16 | (b'D' as u32) << 8 | b'B' as u32;
-
-/// Ours: a Service Changed indication is due for this le_device_db index
-fn tag_service_changed(index: usize) -> u32 {
-    (u32::from(b'A') << 24) | (u32::from(b'W') << 16) | (u32::from(b'S') << 8) | (index as u32 & 0xFF)
-}
 
 /// A read of a module's characteristic
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +318,11 @@ impl GattServer {
                 tracing::error!("LE Audio: GATT database: attribute at handle 0x{got:04x}, expected 0x{want:04x}");
             }
         }
+        let cccs = self.attrs.values().filter(|a| matches!(a, Attr::Ccc { .. })).count();
+        if cccs * stack.le_device_db_max_count() > ccc_slots() as usize {
+            // BLUECASTER_GATT_SERVER_CCCS (btstack_config.h) is behind
+            tracing::warn!("LE Audio: GATT server: {cccs} CCCs, not room for those of every bonded client");
+        }
         self.compute_db_hash(stack);
         self.check_stored_client_configs(stack);
         if !stack.att_server_init() {
@@ -375,25 +366,21 @@ impl GattServer {
         }
         let mut clients = std::collections::BTreeSet::new();
         let mut notify = std::collections::BTreeSet::new();
-        for slot in 0..NVN_NUM_GATT_SERVER_CCC {
-            let Some(e) = stack.tlv_get(tag_ccc(slot)) else { continue };
-            if e.len() != 8 {
-                continue;
-            }
-            // persistent_ccc_entry_t: seq_nr u32, att_handle u16, value u8,
-            // device_index u8
-            let (att_handle, value, device_index) = (u16::from_le_bytes([e[4], e[5]]), e[6], e[7]);
+        for tag in (0..ccc_slots()).map(ccc_tag) {
+            let Some(e) = stack.tlv_get(tag) else { continue };
+            let Some(device_index) = ccc_device_index(&e) else { continue };
+            let (att_handle, value) = (u16::from_le_bytes([e[4], e[5]]), e[6]);
             clients.insert(device_index);
             if att_handle == self.service_changed + 1
                 && u16::from(value) & GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_INDICATION != 0
             {
                 notify.insert(device_index);
             }
-            stack.tlv_delete(tag_ccc(slot));
+            stack.tlv_delete(tag);
         }
         stack.tlv_store(TAG_DB_HASH, &self.db_hash);
         for &index in &notify {
-            stack.tlv_store(tag_service_changed(index as usize), &[1]);
+            stack.tlv_store(service_changed_tag(index as usize), &[1]);
         }
         if !clients.is_empty() {
             tracing::info!(
@@ -409,7 +396,7 @@ impl GattServer {
     /// An LE link is encrypted: a bonded client (le_device_db `index`) that
     /// saw an older database gets the Service Changed indication now
     pub(crate) fn on_encrypted(&mut self, stack: &Stack, con: u16, index: usize) {
-        let tag = tag_service_changed(index);
+        let tag = service_changed_tag(index);
         if stack.tlv_get(tag).is_none() {
             return;
         }
@@ -426,7 +413,7 @@ impl GattServer {
     /// A bond was deleted: no Service Changed due for it any more
     pub(crate) fn on_bonding_deleted(&mut self, stack: &Stack, index: usize) {
         tracing::debug!("LE Audio: GATT server: bond {index} deleted, no Service Changed due for it");
-        stack.tlv_delete(tag_service_changed(index));
+        stack.tlv_delete(service_changed_tag(index));
     }
 
     pub(crate) fn on_mtu(&mut self, con: u16, mtu: u16) {

@@ -31,6 +31,7 @@ import {
   onlyChoice,
   qualityIgnored,
   unlistedCaps,
+  lowLatencyOffered,
   type CodecCaps,
   type CodecSpec,
   type CodecSupport,
@@ -180,6 +181,7 @@ export type CodecChoice = Pick<
   | "sbc_allocation"
   | "sbc_channel_mode"
   | "unlisted_options"
+  | "lhdcv5_low_latency"
 >;
 
 export function codecChoice(p: CodecChoice): CodecChoice {
@@ -198,6 +200,7 @@ export function codecChoice(p: CodecChoice): CodecChoice {
     sbc_allocation: p.sbc_allocation,
     sbc_channel_mode: p.sbc_channel_mode,
     unlisted_options: p.unlisted_options,
+    lhdcv5_low_latency: p.lhdcv5_low_latency,
   };
 }
 
@@ -358,6 +361,7 @@ export function CodecSettings(props: {
     sbc_allocation: "",
     sbc_channel_mode: "",
     unlisted_options: false,
+    lhdcv5_low_latency: false,
   });
   /** `from` with what the device does not list back to Auto, a bitpool
    *  above the device's largest down to it, a quality capped like a higher
@@ -667,6 +671,14 @@ export function CodecSettings(props: {
         </Show>
         <Show when={spec().vbr}>
           <Toggle label={t("connection.vbr")} hint={t("tooltip.vbr")} checked={v.abr} onChange={(x) => set("abr", x)} />
+        </Show>
+        <Show when={lowLatencyOffered(v.codec, listedCaps())}>
+          <Toggle
+            label={t("connection.lhdcv5_low_latency")}
+            hint={t("tooltip.lhdcv5_low_latency")}
+            checked={v.lhdcv5_low_latency}
+            onChange={(x) => set("lhdcv5_low_latency", x)}
+          />
         </Show>
         <Show when={spec().bitpool}>
           <Field label={t("connection.sbc_bitpool")} hint={t("tooltip.sbc_bitpool")} error={bitpoolError()} stacked>

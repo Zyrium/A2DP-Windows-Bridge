@@ -197,6 +197,10 @@ pub struct Settings {
     /// the Output and Input Source lists offer every output, the 16-channel
     /// cable and the other side's cable too (only with debug_mode on)
     pub all_audio_devices: bool,
+    /// Developer > "Keyboard and mouse through BlueCaster" (experimental,
+    /// dangerous; issue #413): in force only with debug_mode on
+    /// ([`Settings::hid_host`]). Only crate::hid's confirmation turns it on.
+    pub hid_host: bool,
 
     pub debug_mode: bool,
     /// Developer mode: overrides of the codec and media path (in force only
@@ -223,6 +227,15 @@ pub struct Settings {
     /// Windows driver on this PC has its firmware, which is loaded by
     /// default (issue #86; adapter::configure)
     pub realtek_custom_firmware: bool,
+    /// The adapter to use when several are on WinUSB: its Windows device
+    /// instance ID, opened first (adapter::configure); empty: automatic
+    /// (the first one found)
+    pub adapter_id: String,
+    /// The adapter Auracast broadcasts go on (developer mode), its instance
+    /// ID: Bluetooth restarts on it for a broadcast and back on
+    /// `adapter_id` for the next scan or connection; empty: the same as
+    /// everything else
+    pub auracast_adapter_id: String,
 
     /// AFH host channel classification: "auto", "off" or Wi-Fi channels "6,11"
     #[serde(default = "default_afh")]
@@ -405,6 +418,7 @@ impl Default for Settings {
             mute_output: false,
             volume_mixer: false,
             all_audio_devices: false,
+            hid_host: false,
             debug_mode: false,
             dev_overrides: codec::dev::DevOverrides::default(),
             dev_vendors: Default::default(),
@@ -413,6 +427,8 @@ impl Default for Settings {
             bt_chip_pid: 0,
             bt_chip_fw_stem: String::new(),
             realtek_custom_firmware: false,
+            adapter_id: String::new(),
+            auracast_adapter_id: String::new(),
             afh: default_afh(),
             remote_sink: String::new(),
             last_profile: String::new(),
@@ -486,6 +502,10 @@ impl Settings {
         let text = serde_json::to_string_pretty(&s).map_err(std::io::Error::other)?;
         let path = Settings::path(dir);
         let tmp = path.with_extension("json.tmp");
+        // One save at a time: saves from several threads share the
+        // temporary file, and one rename found it already moved (NotFound)
+        static SAVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = SAVE.lock().unwrap_or_else(|e| e.into_inner());
         std::fs::write(&tmp, text)?;
         let r = std::fs::rename(&tmp, &path);
         tracing::debug!("settings: saved {}: {r:?}", path.display());
@@ -509,6 +529,12 @@ impl Settings {
     /// #86: off for everyone else until a later version)
     pub fn le_audio(&self) -> bool {
         self.le_audio_experimental && self.debug_mode
+    }
+
+    /// Keyboards and mice through BlueCaster in force: only in developer
+    /// mode (issue #413; turning developer mode off turns it off)
+    pub fn hid_host(&self) -> bool {
+        self.hid_host && self.debug_mode
     }
 
     /// Whether a stream mutes the default output device
@@ -793,6 +819,21 @@ mod tests {
         std::fs::write(Settings::path(&dir), "{}").unwrap();
         assert_eq!(Settings::load(&dir).theme, "system");
         assert_eq!(Settings::default().theme, "system");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saves_at_the_same_time_all_succeed() {
+        let dir = std::env::temp_dir().join(format!("bluecaster-save-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || (0..20).all(|_| Settings::default().save(&dir).is_ok()))
+            })
+            .collect();
+        assert!(threads.into_iter().all(|t| t.join().unwrap()));
+        assert!(!Settings::path(&dir).with_extension("json.tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

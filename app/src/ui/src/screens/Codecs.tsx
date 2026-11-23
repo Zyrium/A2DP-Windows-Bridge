@@ -59,7 +59,7 @@ import { unwrap } from "solid-js/store";
 import { onAudioDevicesChanged, useApp } from "../app/context";
 import { saveSettings } from "../app/settings";
 import { CodecCard, CodecSettings, type CardSpec, type CodecChoice } from "../components/CodecCards";
-import { Banner, Button, Dialog, Field, Select, Toggle } from "../components/controls";
+import { Banner, Button, Dialog, Field, Select, titleWhenCut, Toggle } from "../components/controls";
 import { Icon } from "../components/Icon";
 import { stateLabel } from "../components/stream";
 import { t } from "../i18n";
@@ -776,7 +776,7 @@ function DeviceCodecs(props: {
         <span class={`dot st-${state() === "error" ? "idle" : state()}`} role="img" aria-label={stateLabel(state())} title={stateLabel(state())} />
         <Icon name="headphones" />
         <div class="device-codecs-title">
-          <h2 id={titleId()} class="ellipsis">
+          <h2 id={titleId()} class="clamp-2" ref={titleWhenCut(() => e().name || t("device.name_unknown"))}>
             {e().name || t("device.name_unknown")}
           </h2>
         </div>

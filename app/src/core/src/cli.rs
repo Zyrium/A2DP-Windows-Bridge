@@ -67,6 +67,7 @@ Usage: bluecaster-core --cli [-d XX:XX:XX:XX:XX:XX] [options]
   -q <quality>          hq (default); sq, mq for LDAC and LHDC V5; mhq for LHDC V5; ll (low latency)
                         for aptX Adaptive (other codecs: hq, their highest bit rate)
   -a                    adaptive bit rate (LDAC, LHDC V5, aptX Adaptive; SBC / SBC XQ: bitpool)
+  --lhdcv5-ll           LHDC V5 low latency, where the device lists it
   --fallback            a codec -c the device does not offer falls back to the
                         best one it offers (as the app does), instead of an error
   --force-codec         a codec -c the device does not offer is asked for anyway
@@ -112,6 +113,19 @@ LE Audio (experimental, LC3 over LE isochronous channels):
   --auracast-code <code>
                         encrypt the broadcast with this code (4-16 bytes)
   --auracast-mono       one mono channel instead of left and right
+  --auracast-layout <layout>
+                        stereo (default); split: left and right as two
+                        broadcasts of their own (<name> L / <name> R, a mono
+                        channel each); matrix-<front>-<rear>: the matrix
+                        mixer's outputs, front (FL FR) and rear (RL RR) each
+                        stereo (one broadcast), separate (a mono broadcast
+                        each), subgroups (one broadcast of two subgroups) or
+                        off; older names: quad, front-rear, pairs,
+                        rear-subgroups, subgroups
+  --auracast-split      the same as --auracast-layout split
+  --auracast-rear-preset <name>
+                        use this BAP configuration for a matrix layout's rear
+                        (e.g. 24_2_2 with a 48 kHz front; same frame duration)
 
 Headset microphone:
   --headset-mic [on|auto]
@@ -135,15 +149,53 @@ Headset microphone:
   --mic-noise-suppression
                         suppress noise on the microphone
 
+Keyboards and mice (experimental):
+  --hid-test <seconds>  start Bluetooth with keyboards and mice on and nothing
+                        streamed, print their counts once a second for this
+                        time and exit
+  --hid-device <address>
+                        a keyboard or mouse that may connect (repeatable); any
+                        other is refused
+  --hid-le-device <address>[/random]
+                        an LE keyboard or mouse (repeatable), with a public
+                        address or a random one; it is connected whenever it
+                        advertises
+  --hid-connect <address>
+                        connect to this one (one of --hid-device or
+                        --hid-le-device) and pair it as the app adds one;
+                        without it the test waits for a device to connect.
+                        Over --hci-tcp a passkey to type is printed as
+                        'hid passkey shown <digits>'
+  --hid-scan <seconds>  list nearby devices with keyboards and mice on (LE ones
+                        too) and exit
+  --hid-inject          pass the input to Windows; without it the input is only
+                        decoded and counted. Never with --hci-tcp: the
+                        emulator's input is always only counted
+  --hid-leds <mask>     without --hid-inject: the keyboard lights to send (bit
+                        0 Num Lock, 1 Caps Lock, 2 Scroll Lock) instead of
+                        none
+  --hid-confirm <seconds>
+                        with --hid-connect: keep the device only if its input
+                        arrives within this many seconds after it is ready
+                        (as the app's 30 s check); otherwise it is removed.
+                        Prints 'hid check waiting', then 'hid check
+                        confirmed' or 'hid check removed <reason>'
+
 Development / testing:
   --hci-tcp <host:port> H4 over TCP to a virtual controller (tools/emu)
   --hci-capture <path>  HCI capture (.pklg) of the whole run
   --test-tone           1 kHz left / 1.5 kHz right at 48 kHz instead of capture
+  --session-agent       do the session's work (capture, the test tone, device
+                        lists) in a second process, the session agent
+                        (--capture-agent: the same)
   --duration <seconds>  stop after this time (default: Ctrl+C)
   --sessions <n>        stream n times in a row with --duration each, as
                         Disconnect / Connect in the app (A2DP)
   --wait-off            headphones turned off: wait for them, as the app does
   --services            once streaming, list the services the device gives in SDP
+  --ipc                 serve the IPC pipe during the run (needs
+                        BLUECASTER_INSTANCE, so it never takes the installed
+                        core's pipe)
   --eq <point>[,<point>...]
                         the playback EQ on, a point as <Hz>:<dB>[:<Q>[:<type>]]
                         (type peak, lowshelf, highshelf, highpass, lowpass;
@@ -177,6 +229,8 @@ struct Args {
     codec: Option<CodecKind>,
     quality: Quality,
     abr: bool,
+    /// --lhdcv5-ll: LHDC V5 low latency (issue #543)
+    lhdcv5_low_latency: bool,
     /// --fallback: a codec the device does not offer falls back, as a profile's
     fallback: bool,
     /// --force-codec: a codec the device does not offer is asked for anyway
@@ -198,6 +252,8 @@ struct Args {
     probe: bool,
     /// --services: once streaming, the services the device lists in SDP
     services: bool,
+    /// --ipc: the IPC pipe served during the run (a test instance's only)
+    ipc: bool,
     /// --headset-mic [on|auto], --mic-output: headset mode once streaming
     headset_mic: HeadsetMic,
     mic_output: Option<String>,
@@ -216,6 +272,9 @@ struct Args {
     hci_tcp: Option<String>,
     hci_capture: Option<PathBuf>,
     test_tone: bool,
+    /// --session-agent (or --capture-agent): the session-bound work runs in
+    /// the session agent (agent.rs)
+    session_agent: bool,
     duration: Option<u64>,
     /// --sessions: streams one after the other in this process (Connect,
     /// --duration, Disconnect), as the UI's Disconnect / Connect (issue #84)
@@ -228,6 +287,31 @@ struct Args {
     /// --wait-off: headphones turned off do not end the run
     wait_off: bool,
     le: LeArgs,
+    hid: HidArgs,
+}
+
+/// Keyboards and mice (experimental, issue #413) options
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HidArgs {
+    /// --hid-test <seconds>
+    test: Option<u64>,
+    /// --hid-device: the allow-list, as typed
+    devices: Vec<String>,
+    /// --hid-le-device: the LE part of it, as typed
+    le_devices: Vec<String>,
+    /// --hid-scan <seconds>
+    scan: Option<u32>,
+    /// --hid-connect: BlueCaster opens the connection
+    connect: Option<String>,
+    /// --hid-inject: the input goes to Windows (never over --hci-tcp)
+    inject: bool,
+    /// --hid-leds: the keyboard lights sent in dry run (the emulator test)
+    leds: Option<u8>,
+    /// --hid-helper-record: test switch of debug builds, the input goes
+    /// through a real input helper that records it instead of injecting
+    helper_record: bool,
+    /// --hid-confirm: the countdown for --hid-connect's device
+    confirm: Option<u64>,
 }
 
 /// LE Audio (experimental) options (v1 LeAudioCliOptions)
@@ -253,6 +337,10 @@ struct LeArgs {
     broadcast_code: Option<String>,
     /// --auracast-mono
     broadcast_mono: bool,
+    /// --auracast-layout (--auracast-split: split)
+    broadcast_layout: Option<String>,
+    /// --auracast-rear-preset
+    broadcast_rear_preset: Option<String>,
 }
 
 /// --le-scan without a time (v1 scan_seconds)
@@ -285,6 +373,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
         codec: None,
         quality: Quality::High,
         abr: false,
+        lhdcv5_low_latency: false,
         fallback: false,
         force_codec: false,
         unlisted_options: false,
@@ -301,6 +390,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
         scan: None,
         probe: false,
         services: false,
+        ipc: false,
         headset_mic: HeadsetMic::Off,
         mic_output: None,
         voice_codec: None,
@@ -312,6 +402,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
         hci_tcp: None,
         hci_capture: None,
         test_tone: false,
+        session_agent: false,
         eq: Vec::new(),
         duration: None,
         sessions: 1,
@@ -319,6 +410,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
         restart_on_link: false,
         wait_off: false,
         le: LeArgs::default(),
+        hid: HidArgs::default(),
     };
     let mut it = args.iter().peekable();
     let value = |it: &mut std::iter::Peekable<std::slice::Iter<String>>, name: &str| {
@@ -347,6 +439,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             }
             "-q" => a.quality = Quality::from_key(&value(&mut it, "-q")?.to_lowercase()),
             "-a" => a.abr = true,
+            "--lhdcv5-ll" => a.lhdcv5_low_latency = true,
             "--fallback" => a.fallback = true,
             "--force-codec" => a.force_codec = true,
             "--unlisted-options" => a.unlisted_options = true,
@@ -405,6 +498,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             }
             "--probe" => a.probe = true,
             "--services" => a.services = true,
+            "--ipc" => a.ipc = true,
             "--headset-mic" => {
                 // An optional mode; alone: on
                 let mode = match it.peek().map(|s| s.as_str()) {
@@ -456,6 +550,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--hci-tcp" => a.hci_tcp = Some(value(&mut it, "--hci-tcp")?),
             "--hci-capture" => a.hci_capture = Some(value(&mut it, "--hci-capture")?.into()),
             "--test-tone" => a.test_tone = true,
+            "--session-agent" | "--capture-agent" => a.session_agent = true,
             "--duration" => a.duration = Some(value(&mut it, "--duration")?.parse().map_err(|_| "bad --duration")?),
             "--sessions" => {
                 a.sessions = value(&mut it, "--sessions")?.parse().map_err(|_| "bad --sessions")?;
@@ -501,8 +596,89 @@ fn parse(args: &[String]) -> Result<Args, String> {
             }
             "--auracast-code" => a.le.broadcast_code = Some(value(&mut it, "--auracast-code")?),
             "--auracast-mono" => a.le.broadcast_mono = true,
+            "--hid-test" => {
+                let v = value(&mut it, "--hid-test")?;
+                a.hid.test = Some(v.parse().ok().filter(|&s| s > 0).ok_or("--hid-test takes seconds (1 or more)")?);
+            }
+            "--hid-device" => a.hid.devices.push(value(&mut it, "--hid-device")?),
+            "--hid-le-device" => a.hid.le_devices.push(value(&mut it, "--hid-le-device")?),
+            "--hid-scan" => {
+                let v = value(&mut it, "--hid-scan")?;
+                a.hid.scan = Some(v.parse().ok().filter(|&s| s > 0).ok_or("--hid-scan takes seconds (1 or more)")?);
+            }
+            "--hid-connect" => a.hid.connect = Some(value(&mut it, "--hid-connect")?),
+            "--hid-inject" => a.hid.inject = true,
+            "--hid-helper-record" => a.hid.helper_record = true,
+            "--hid-confirm" => {
+                let v = value(&mut it, "--hid-confirm")?;
+                a.hid.confirm = Some(
+                    v.parse().ok().filter(|&s| (1..=600).contains(&s)).ok_or("--hid-confirm takes 1 to 600 seconds")?,
+                );
+            }
+            "--hid-leds" => {
+                let v = value(&mut it, "--hid-leds")?;
+                a.hid.leds = Some(v.parse().ok().filter(|&m| m <= 7).ok_or("--hid-leds takes a mask from 0 to 7")?);
+            }
+            "--auracast-split" => a.le.broadcast_layout = Some("split".into()),
+            "--auracast-layout" => {
+                let v = value(&mut it, "--auracast-layout")?;
+                if bt_host::BroadcastLayout::parse(&v).is_none() {
+                    return Err(
+                        "--auracast-layout takes stereo, mono, split, matrix-<front>-<rear> (each stereo, separate, subgroups or off), quad, front-rear, pairs, rear-subgroups or subgroups"
+                            .into(),
+                    );
+                }
+                a.le.broadcast_layout = Some(v);
+            }
+            "--auracast-rear-preset" => {
+                a.le.broadcast_rear_preset = Some(value(&mut it, "--auracast-rear-preset")?);
+            }
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown option {other}")),
+        }
+    }
+    // Mono: one channel, not split or a matrix
+    let layout = a.le.broadcast_layout.as_deref().and_then(bt_host::BroadcastLayout::parse);
+    if a.le.broadcast_mono {
+        match layout {
+            Some(bt_host::BroadcastLayout::Split) => {
+                return Err("--auracast-mono and --auracast-split cannot be used together".into());
+            }
+            Some(l) if l.is_matrix() => {
+                return Err(format!("--auracast-mono and --auracast-layout {} cannot be used together", l.as_str()));
+            }
+            _ => {}
+        }
+    }
+    let hid_options =
+        !a.hid.devices.is_empty() || !a.hid.le_devices.is_empty() || a.hid.connect.is_some() || a.hid.inject;
+    if a.hid.helper_record && (a.hid.test.is_none() || a.hid.inject) {
+        return Err("--hid-helper-record needs --hid-test and cannot be used with --hid-inject".into());
+    }
+    if a.hid.test.is_none() && (hid_options || a.hid.leds.is_some()) {
+        return Err("--hid-device, --hid-le-device, --hid-connect, --hid-inject and --hid-leds need --hid-test".into());
+    }
+    if a.hid.confirm.is_some() && a.hid.connect.is_none() {
+        return Err("--hid-confirm needs --hid-connect".into());
+    }
+    if a.hid.test.is_some() && a.hid.scan.is_some() {
+        return Err("--hid-test and --hid-scan cannot be used together".into());
+    }
+    for d in a.hid.devices.iter().chain(&a.hid.connect) {
+        if parse_device_address(d).is_none() {
+            return Err(format!("Invalid Bluetooth address: {d}"));
+        }
+    }
+    for d in &a.hid.le_devices {
+        if parse_hid_le_address(d).is_none() {
+            return Err(format!("Invalid LE address: {d} (an address, with /random for a random one)"));
+        }
+    }
+    if let Some(c) = &a.hid.connect {
+        let listed = a.hid.devices.iter().any(|d| parse_device_address(d) == parse_device_address(c))
+            || a.hid.le_devices.iter().any(|d| parse_hid_le_address(d).map(|l| l.addr) == parse_device_address(c));
+        if !listed {
+            return Err("--hid-connect needs the same address as a --hid-device or --hid-le-device".into());
         }
     }
     Ok(a)
@@ -533,6 +709,12 @@ pub fn run(args: &[String]) -> i32 {
             }
         };
     }
+    if a.session_agent
+        && let Err(e) = crate::agent::use_agent()
+    {
+        eoutln!("{e}");
+        return 1;
+    }
     let running = Arc::new(AtomicBool::new(true));
     {
         let running = running.clone();
@@ -556,8 +738,12 @@ pub fn run(args: &[String]) -> i32 {
         eoutln!("Cannot create HCI capture file {}: {e}", path.display());
         return 1;
     }
+    if a.ipc && ipc::instance_suffix().is_empty() {
+        eoutln!("--ipc needs BLUECASTER_INSTANCE (a test instance's own pipe)");
+        return 2;
+    }
     let (tx, rx) = mpsc::channel();
-    let service = Service::new(
+    let service = Arc::new(Service::new(
         ServiceOptions {
             config_dir: bluecaster_core::paths::config_dir(),
             hci_tcp: a.hci_tcp.clone(),
@@ -566,7 +752,10 @@ pub fn run(args: &[String]) -> i32 {
             usb: a.usb.as_ref().map(|(_, s)| s.clone()).unwrap_or_default(),
         },
         tx,
-    );
+    ));
+    if a.ipc {
+        serve_ipc(service.clone());
+    }
     if !a.eq.is_empty() {
         let eq = bluecaster_core::media_eq::MediaEq { enabled: true, bands: a.eq.clone() };
         outln!("Playback EQ: {} point(s)", eq.settings().bands().len());
@@ -576,6 +765,32 @@ pub fn run(args: &[String]) -> i32 {
     // a stream started in headset mode would
     if a.headset_mic_toggle.is_some() {
         service.set_voice_offered(true);
+    }
+
+    if let Some(secs) = a.hid.test {
+        let code = hid_test(&a, &service, secs, &running);
+        service.shutdown();
+        capture.stop();
+        return code;
+    }
+
+    if let Some(secs) = a.hid.scan {
+        // The app's device scan with keyboards and mice on: LE ones are
+        // listed too (no device allowed, nothing connects)
+        service.set_hid_cli(Vec::new(), Vec::new(), true);
+        let code = match service.scan_devices(secs, &mut |_| {}) {
+            Ok(found) => {
+                print_scanned(&found);
+                0
+            }
+            Err(m) => {
+                eoutln!("{m}");
+                1
+            }
+        };
+        service.shutdown();
+        capture.stop();
+        return code;
     }
 
     if a.le.broadcast.is_some() {
@@ -591,22 +806,7 @@ pub fn run(args: &[String]) -> i32 {
         service.set_le_audio_cli(bluecaster_core::LeCliOptions { mcp_dry_run: a.le.mcp_dry_run, ..Default::default() });
         let code = match service.scan_devices(secs, &mut |_| {}) {
             Ok(found) => {
-                for d in found {
-                    outln!(
-                        "{}  {:<32} CoD 0x{:06X}  RSSI {}{}",
-                        d.address,
-                        d.name,
-                        d.class_of_device,
-                        d.rssi,
-                        if d.le_audio {
-                            "  (LE Audio)"
-                        } else if d.audio {
-                            "  (audio)"
-                        } else {
-                            ""
-                        }
-                    );
-                }
+                print_scanned(&found);
                 0
             }
             Err(m) => {
@@ -808,6 +1008,7 @@ pub fn run(args: &[String]) -> i32 {
         auto_order: codec::AutoOrder::default(),
         quality: a.quality,
         abr: a.abr,
+        lhdcv5_low_latency: a.lhdcv5_low_latency,
         sbc_bitpool: a.sbc_bitpool,
         sbcxq_bitpool: a.sbc_bitpool,
         sbc_min_bitpool: 0,
@@ -973,6 +1174,21 @@ fn stream_session(
             Ok(ServiceEvent::OtherDeviceBack(a)) => outln!("Another device connected: {}", bt_host::addr_str(&a)),
             // The loader's own log lines say it
             Ok(ServiceEvent::Loader(_)) => {}
+            // The set is kept with the saved device; merging is the UI core's
+            Ok(ServiceEvent::LeSetLearned) => {}
+            // Over TCP there is no USB adapter to tell
+            Ok(ServiceEvent::Adapter(_)) => {}
+            // Keyboards and mice have their own mode (--hid-test)
+            Ok(
+                ServiceEvent::HidDevices | ServiceEvent::HidPasskey | ServiceEvent::HidCheck | ServiceEvent::HidHealth,
+            ) => {}
+            // --ipc: the clients get the button
+            Ok(ServiceEvent::Button(b)) => {
+                outln!("Headphone button: {:?} {}", b.button, if b.pressed { "pressed" } else { "released" });
+                if let Some(state) = IPC_STATE.get() {
+                    state.on_service_event(ServiceEvent::Button(b));
+                }
+            }
             Ok(ServiceEvent::Voice(Some(v))) => outln!(
                 "Voice: {} at {} Hz, microphone to {}",
                 v.codec,
@@ -983,6 +1199,36 @@ fn stream_session(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return false,
         }
+    }
+}
+
+/// The state --ipc serves ([`serve_ipc`])
+static IPC_STATE: std::sync::OnceLock<Arc<crate::state::CoreState>> = std::sync::OnceLock::new();
+
+/// --ipc: the IPC pipe of this test instance, for the run (the emulator's
+/// RFCOMM passthrough and button cases). The state the clients see is not
+/// kept up to date: the service's events stay with the command line, which
+/// passes on only the headphone buttons.
+fn serve_ipc(service: Arc<Service>) {
+    let spawned = std::thread::Builder::new().name("ipc".into()).spawn(move || {
+        let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => return eoutln!("IPC runtime: {e}"),
+        };
+        let sid = match win_sys::pipe::current_user_sid() {
+            Ok(sid) => sid,
+            Err(e) => return eoutln!("cannot read the user SID: {e}"),
+        };
+        let state = crate::state::CoreState::new(service, Box::new(|_| {}), Box::new(|| {}), Box::new(|_| {}));
+        let _ = IPC_STATE.set(state.clone());
+        let (name, old_name) = (ipc::pipe_name(&sid), ipc::old_pipe_name(&sid));
+        outln!("IPC: serving the pipe of instance {}", ipc::instance_suffix().trim_start_matches('-'));
+        if let Err(e) = rt.block_on(crate::server::serve(state, name, old_name)) {
+            eoutln!("IPC server: {e}");
+        }
+    });
+    if let Err(e) = spawned {
+        eoutln!("IPC thread: {e}");
     }
 }
 
@@ -1021,6 +1267,218 @@ const LE_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Set-ups after a lost stream, in all (v1)
 const LE_RESTORE_ATTEMPTS: u32 = 3;
 const LE_STATS_EVERY: Duration = Duration::from_secs(5);
+/// A member that left a stream the others play on is looked for this long
+/// after it went, then every [`LE_REJOIN_EVERY`] (as the app's session)
+const LE_REJOIN_FIRST: Duration = Duration::from_secs(3);
+const LE_REJOIN_EVERY: Duration = Duration::from_secs(4);
+const LE_REJOIN_SCAN: Duration = Duration::from_millis(1500);
+
+/// The entries of Service::scan_devices, one line each
+fn print_scanned(found: &[bluecaster_core::ScannedDevice]) {
+    for d in found {
+        let kind = match d.hid_le {
+            Some(t) => {
+                format!("  (LE keyboard or mouse, {})", if t == bt_host::LeAddr::PUBLIC { "public" } else { "random" })
+            }
+            None if d.le_audio => "  (LE Audio)".into(),
+            None if d.audio => "  (audio)".into(),
+            None => String::new(),
+        };
+        outln!("{}  {:<32} CoD 0x{:06X}  RSSI {}{kind}", d.address, d.name, d.class_of_device, d.rssi);
+    }
+}
+
+/// --hid-le-device: "<address>" (public) or "<address>/random"
+fn parse_hid_le_address(s: &str) -> Option<bt_host::LeAddr> {
+    let (address, addr_type) = match s.trim().rsplit_once('/') {
+        Some((a, t)) if t.eq_ignore_ascii_case("random") => (a, bt_host::LeAddr::RANDOM),
+        Some((a, t)) if t.eq_ignore_ascii_case("public") => (a, bt_host::LeAddr::PUBLIC),
+        Some(_) => return None,
+        None => (s, bt_host::LeAddr::PUBLIC),
+    };
+    Some(bt_host::LeAddr { addr: parse_device_address(address)?, addr_type })
+}
+
+/// --hid-test: Bluetooth with keyboards and mice forced on and nothing
+/// streamed; a count line a second, then a final one. Counts only: nothing
+/// of what was typed or moved, and no address.
+fn hid_test(a: &Args, service: &Service, secs: u64, running: &AtomicBool) -> i32 {
+    let devices: Vec<[u8; 6]> = a.hid.devices.iter().filter_map(|d| parse_device_address(d)).collect();
+    let le_devices: Vec<bt_host::LeAddr> = a.hid.le_devices.iter().filter_map(|d| parse_hid_le_address(d)).collect();
+    // The emulator's input must never reach the machine that runs the tests
+    let dry_run = !a.hid.inject || a.hci_tcp.is_some();
+    if a.hid.inject && dry_run {
+        outln!("--hid-inject is not used with --hci-tcp: the input is only counted");
+    }
+    outln!(
+        "Keyboards and mice: {} allowed ({} LE), their input {}",
+        devices.len() + le_devices.len(),
+        le_devices.len(),
+        if dry_run { "only counted" } else { "goes to Windows" }
+    );
+    service.set_hid_cli(devices, le_devices, dry_run);
+    // The input through a real input helper that only records it (debug
+    // builds): what it would inject is read back here and counted
+    let recorded = if a.hid.helper_record {
+        if !crate::agent::TEST_SWITCHES {
+            eoutln!("--hid-helper-record is a test switch of debug builds");
+            return 2;
+        }
+        match helper_recorder(service) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eoutln!("the input helper's record pipe failed: {e}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+    if dry_run {
+        // The lights come from the command line only: the real lock keys are
+        // never read
+        service.set_hid_cli_leds(a.hid.leds);
+    } else {
+        if a.hid.leds.is_some() {
+            outln!("--hid-leds is not used with --hid-inject: the lights follow Windows");
+        }
+        // This executable releases held keys if the test is killed
+        if let Ok(exe) = std::env::current_exe() {
+            service.enable_hid_guard(exe);
+        }
+    }
+    let host = match service.ensure_host() {
+        Ok(h) => h,
+        Err(m) => {
+            eoutln!("{m}");
+            return 1;
+        }
+    };
+    if !host.hid_enabled() {
+        eoutln!("Bluetooth started without keyboards and mice");
+        return 1;
+    }
+    if let Some(secs) = a.hid.confirm {
+        service.set_hid_confirm_window(Duration::from_secs(secs));
+    }
+    if let Some(address) = a.hid.connect.as_deref().and_then(parse_device_address) {
+        // As the app adds one: the list (here the command line's) decides
+        // classic or LE, and its pairing may show a number
+        if let Err(m) = service.hid_pair(&bt_host::addr_str(&address)) {
+            eoutln!("hid: connecting failed ({})", m.key);
+            return 1;
+        }
+        outln!("hid: connecting");
+    }
+    let counts = || match service.hid_counts() {
+        Some(c) => format!(
+            "connected={} reports={} events={} injected={} blocked={} undecoded={} refused={} leds={} dropped={}",
+            host.hid_connected().len(),
+            c.reports,
+            c.events,
+            c.injected,
+            c.blocked,
+            c.undecoded,
+            c.refused,
+            host.hid_counters().leds.load(Ordering::Relaxed),
+            host.hid_counters().dropped.load(Ordering::Relaxed)
+        ),
+        None => "stopped".to_owned(),
+    };
+    // The number to type: printed for the emulator test only (over
+    // --hci-tcp), which types it on the emulated keyboard. Never in a log.
+    let mut shown: Option<String> = None;
+    let mut show_passkey = || {
+        let now = service.hid_passkey().map(|(_, digits)| digits);
+        if now != shown {
+            match (&now, a.hci_tcp.is_some()) {
+                (Some(digits), true) => outln!("hid passkey shown {digits}"),
+                (Some(_), false) => outln!("hid: the device asks for a number to be typed; add it in the app instead"),
+                (None, _) => outln!("hid passkey cleared"),
+            }
+            shown = now;
+        }
+    };
+    // --hid-confirm: the device's check, as it changes (states only)
+    let mut check_state = if a.hid.confirm.is_some() { "connecting" } else { "" };
+    let mut show_check = || {
+        if check_state.is_empty() || check_state == "done" {
+            return;
+        }
+        let now = match service.hid_checks().first() {
+            Some(c) if c.waiting => "waiting",
+            Some(_) => "connecting",
+            None => "done",
+        };
+        if now == check_state {
+            return;
+        }
+        match now {
+            "waiting" => outln!("hid check waiting"),
+            "done" => match service.hid_rolled_back() {
+                Some(r) => outln!("hid check removed {}", r.reason.as_str()),
+                None => outln!("hid check confirmed"),
+            },
+            _ => {}
+        }
+        check_state = now;
+    };
+    let start = Instant::now();
+    for second in 1..=secs {
+        let at = start + Duration::from_secs(second);
+        while Instant::now() < at && running.load(Ordering::Acquire) {
+            show_passkey();
+            show_check();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !running.load(Ordering::Acquire) {
+            break;
+        }
+        outln!("hid: t={second} {}", counts());
+    }
+    outln!("hid final: {}", counts());
+    if let Some(r) = recorded {
+        let (started, connected) = service.input_helper_state().unwrap_or_default();
+        let lines = r.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let inputs = lines.iter().filter(|l| !l.starts_with("exit")).count();
+        let held = record_held(&lines);
+        outln!("hid helper: started={started} connected={} recorded={inputs} held={held}", u8::from(connected));
+    }
+    0
+}
+
+/// A pipe the input helper records to (its write end inherited), read on
+/// a thread into lines; the helper is enabled with it
+fn helper_recorder(service: &Service) -> std::io::Result<Arc<std::sync::Mutex<Vec<String>>>> {
+    use std::io::BufRead;
+    let (read, write) = win_sys::input_desktop::inheritable_pipe()?;
+    let number = win_sys::input_desktop::handle_number(std::os::windows::io::AsHandle::as_handle(&write));
+    // Kept open for the life of this process: each helper inherits it
+    std::mem::forget(write);
+    let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = lines.clone();
+    std::thread::Builder::new().name("helper-record".into()).spawn(move || {
+        for line in std::io::BufReader::new(read).lines().map_while(Result::ok) {
+            sink.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+        }
+    })?;
+    let exe = std::env::current_exe()?;
+    service.enable_input_helper(exe, Some(number));
+    Ok(lines)
+}
+
+/// The keys and buttons a record leaves held (downs without their up)
+fn record_held(lines: &[String]) -> usize {
+    let mut held = std::collections::BTreeSet::new();
+    for l in lines {
+        if let Some(k) = l.strip_suffix(" down") {
+            held.insert(k.to_string());
+        } else if let Some(k) = l.strip_suffix(" up") {
+            held.remove(k);
+        }
+    }
+    held.len()
+}
 
 fn le_print_stats(host: &bt_host::BtHost) {
     outln!("{}", bluecaster_core::le_stats_line(&host.le_stream_stats()));
@@ -1208,6 +1666,7 @@ fn le_broadcast(a: &Args, service: &Service, rx: &mpsc::Receiver<ServiceEvent>, 
         code: le.broadcast_code.clone(),
         quality: "hq".into(),
         mono: Some(le.broadcast_mono),
+        layout: le.broadcast_layout.clone(),
         source: "tone".into(),
         ..Default::default()
     };
@@ -1221,6 +1680,9 @@ fn le_broadcast(a: &Args, service: &Service, rx: &mpsc::Receiver<ServiceEvent>, 
     request.source = le_source(a);
     if let (Some(p), Some(l)) = (&le.preset, request.le.as_mut()) {
         l.preset = Some(p.clone());
+    }
+    if let (Some(p), Some(b)) = (&le.broadcast_rear_preset, request.le.as_mut().and_then(|l| l.broadcast.as_mut())) {
+        b.rear_preset = Some(p.clone());
     }
     outln!("Starting the broadcast \"{}\"...", b.name.trim());
     service.start_streaming(request);
@@ -1346,6 +1808,7 @@ fn le_run(a: &Args, service: &Service, running: &Arc<AtomicBool>) -> i32 {
         &source,
         started,
         host.stats().clone(),
+        None,
     ) {
         Ok(path) => {
             let rate = path.rate();
@@ -1407,6 +1870,7 @@ fn le_run(a: &Args, service: &Service, running: &Arc<AtomicBool>) -> i32 {
     let start = Instant::now();
     let mut last_print = start;
     let mut restarts = 0;
+    let (mut shown_dropped, mut rejoin_at) = (0, None);
     while rc == 0 && is_running() {
         std::thread::sleep(Duration::from_millis(100));
         if let Some(d) = a.duration
@@ -1422,9 +1886,40 @@ fn le_run(a: &Args, service: &Service, running: &Arc<AtomicBool>) -> i32 {
         if let Some(v) = sim_volume.as_mut() {
             v.tick(&bluecaster_core::volume_sync::LeHeadphones(&host));
         }
-        if host.le_stream_lost() {
+        // A member left while the others play on: looked for, then the
+        // stream is set up again with it
+        let dropped = host.le_stream_dropped();
+        if dropped.len() != shown_dropped {
+            shown_dropped = dropped.len();
+            let playing = started.status.devices.iter().filter(|d| !dropped.contains(d)).count();
+            if shown_dropped > 0 && playing > 0 {
+                outln!("\n*** LE Audio: {shown_dropped} device(s) left the stream, {playing} play on ***");
+                if let Some(p) = audio.as_ref() {
+                    p.set_mono(playing <= 1);
+                }
+                rejoin_at = Some(Instant::now() + LE_REJOIN_FIRST);
+            }
+        }
+        let lost = host.le_stream_lost();
+        let mut member_back = false;
+        if !lost && rejoin_at.is_some_and(|t| Instant::now() >= t) {
+            let known = host.le_devices();
+            let gone: Vec<_> = known.iter().filter(|d| dropped.contains(&d.id)).collect();
+            let addrs: Vec<[u8; 6]> = gone.iter().map(|d| d.addr.addr).collect();
+            // Still connected (only its CIS or ASE ended), or advertising again
+            member_back = gone.iter().any(|d| d.connected)
+                || host.le_find_any_quietly(&addrs, LE_REJOIN_SCAN).is_some_and(|(_, seen)| {
+                    outln!("*** LE Audio: {} is back - setting the stream up with it ***", seen.addr);
+                    true
+                });
+            rejoin_at = (!member_back).then(|| Instant::now() + LE_REJOIN_EVERY);
+        }
+        if lost || member_back {
             // A device or CIS went away: tear down and set it up again
-            outln!("\n*** LE Audio stream lost - setting it up again ***");
+            if lost {
+                outln!("\n*** LE Audio stream lost - setting it up again ***");
+            }
+            (shown_dropped, rejoin_at) = (0, None);
             if let Some(p) = audio.take() {
                 p.stop();
             }
@@ -1447,11 +1942,12 @@ fn le_run(a: &Args, service: &Service, running: &Arc<AtomicBool>) -> i32 {
                     }
                 }
             }
-            let Some(mut started) = again else {
+            let Some(s) = again else {
                 eoutln!("LE Audio: could not restore the stream");
                 rc = 1;
                 break;
             };
+            started = s;
             outln!("*** LE Audio stream restored: {} ***", started.status.summary);
             audio = start_audio(&started);
             mic_streams += 1;
@@ -1581,6 +2077,14 @@ mod tests {
     }
 
     #[test]
+    fn session_agent_option() {
+        assert!(!parse(&args("--cli --test-tone")).unwrap().session_agent);
+        assert!(parse(&args("--cli --test-tone --session-agent")).unwrap().session_agent);
+        // The stage 1 name still works
+        assert!(parse(&args("--cli --test-tone --capture-agent")).unwrap().session_agent);
+    }
+
+    #[test]
     fn sbc_options() {
         use codec::sbc::{Allocation, ChannelMode, SbcParams};
         let a = parse(&args("--cli -c sbc")).unwrap();
@@ -1698,12 +2202,61 @@ mod tests {
     }
 
     #[test]
+    fn hid_test_options() {
+        let a = parse(&args(
+            "--cli --hci-tcp 127.0.0.1:1 --hid-test 12 --hid-device 00:A2:D0:00:00:03 \
+             --hid-device 00:A2:D0:00:00:04 --hid-connect 00:a2:d0:00:00:03 --hid-inject",
+        ))
+        .unwrap();
+        assert_eq!(a.hid.test, Some(12));
+        assert_eq!(a.hid.devices.len(), 2);
+        assert_eq!(a.hid.connect.as_deref(), Some("00:a2:d0:00:00:03"));
+        assert!(a.hid.inject);
+        assert!(parse(&args("--cli --hid-test 0")).is_err());
+        assert!(parse(&args("--cli --hid-device 00:A2:D0:00:00:03")).is_err());
+        assert!(parse(&args("--cli --hid-test 5 --hid-device 00:A2:D0:00:00")).is_err());
+        // Connecting needs the device on the list
+        assert!(parse(&args("--cli --hid-test 5 --hid-connect 00:A2:D0:00:00:03")).is_err());
+        // LE devices, public or random
+        let a = parse(&args(
+            "--cli --hid-test 5 --hid-le-device 00:A2:D0:00:00:05 --hid-le-device C0:A2:D0:00:00:06/random \
+             --hid-connect c0:a2:d0:00:00:06",
+        ))
+        .unwrap();
+        let le: Vec<_> = a.hid.le_devices.iter().filter_map(|d| parse_hid_le_address(d)).collect();
+        assert_eq!(le.iter().map(|l| l.addr_type).collect::<Vec<_>>(), [0, 1]);
+        assert!(parse(&args("--cli --hid-test 5 --hid-le-device 00:A2:D0:00:00:05/static")).is_err());
+        assert!(parse(&args("--cli --hid-le-device 00:A2:D0:00:00:05")).is_err());
+        assert_eq!(parse(&args("--cli --hid-scan 6")).unwrap().hid.scan, Some(6));
+        assert!(parse(&args("--cli --hid-scan 6 --hid-test 5")).is_err());
+        let a = parse(&args(
+            "--cli --hid-test 5 --hid-device 00:A2:D0:00:00:03 --hid-connect 00:A2:D0:00:00:03 --hid-confirm 4",
+        ))
+        .unwrap();
+        assert_eq!(a.hid.confirm, Some(4));
+        assert!(parse(&args("--cli --hid-test 5 --hid-device 00:A2:D0:00:00:03 --hid-confirm 4")).is_err());
+        assert!(
+            parse(&args(
+                "--cli --hid-test 5 --hid-device 00:A2:D0:00:00:03 --hid-connect 00:A2:D0:00:00:03 --hid-confirm 0"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn auracast_options() {
         let a =
             parse(&args("--cli --hci-tcp 127.0.0.1:9900 --auracast BlueCaster-test --test-tone --duration 5")).unwrap();
         assert!(a.le.on && a.test_tone && a.device.is_none());
         assert_eq!(a.le.broadcast.as_deref(), Some("BlueCaster-test"));
-        assert!(a.le.broadcast_code.is_none() && !a.le.broadcast_mono);
+        assert!(a.le.broadcast_code.is_none() && !a.le.broadcast_mono && a.le.broadcast_layout.is_none());
+        let layout = |s: &str| parse(&args(s)).map(|a| a.le.broadcast_layout);
+        assert_eq!(layout("--cli --auracast Speakers --auracast-split").unwrap().as_deref(), Some("split"));
+        assert_eq!(layout("--cli --auracast Speakers --auracast-layout quad").unwrap().as_deref(), Some("quad"));
+        assert!(layout("--cli --auracast Speakers --auracast-layout 5.1").is_err());
+        let a =
+            parse(&args("--cli --auracast Speakers --auracast-layout pairs --auracast-rear-preset 24_2_2")).unwrap();
+        assert_eq!(a.le.broadcast_rear_preset.as_deref(), Some("24_2_2"));
         let a = parse(&[
             "--cli".into(),
             "--auracast".into(),
@@ -1720,6 +2273,13 @@ mod tests {
         assert!(a.le.broadcast_mono);
         assert_eq!(a.le.preset.as_deref(), Some("24_2_2"));
         assert_eq!(parse(&args("--cli --auracast")).err().as_deref(), Some("--auracast needs a value"));
+        // Mono and split exclude each other, in either order
+        for both in ["--auracast-mono --auracast-split", "--auracast-split --auracast-mono"] {
+            assert_eq!(
+                parse(&args(&format!("--cli --auracast Speakers {both}"))).err().as_deref(),
+                Some("--auracast-mono and --auracast-split cannot be used together")
+            );
+        }
     }
 
     #[test]

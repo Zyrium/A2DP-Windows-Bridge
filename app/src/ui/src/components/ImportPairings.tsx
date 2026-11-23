@@ -9,7 +9,7 @@
 import { createResource, createSignal, For, Show } from "solid-js";
 import { useApp } from "../app/context";
 import { t } from "../i18n";
-import { Button, Dialog } from "./controls";
+import { Button, Dialog, titleWhenCut } from "./controls";
 import { Icon } from "./Icon";
 
 export function ImportPairings() {
@@ -89,7 +89,9 @@ export function ImportPairings() {
                       />
                       <Icon name="headphones" />
                       <span class="check-item-text">
-                        <span class="ellipsis">{d.name || d.address}</span>
+                        <span class="device-name-text clamp-2" ref={titleWhenCut(() => d.name || d.address)}>
+                          {d.name || d.address}
+                        </span>
                         <Show when={d.name}>
                           <span class="mono muted">{d.address}</span>
                         </Show>

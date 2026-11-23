@@ -153,7 +153,7 @@ flowchart TD
 |:-------|:---------|:-----|
 | capture | MMCSS "Audio" | 读取 WASAPI；在无声的时段填充静音 |
 | encode | MMCSS "Pro Audio" | 把 PCM 转换为编码器所需的输入格式，按完整的编码块进行编码（剩余部分等下一轮），并将帧打包进媒体负载；每轮约 10 ms，使数据包均匀发出 |
-| bt-runloop | -- | BTstack 的运行循环；每当 L2CAP 可以发送时，就发送一个排队的数据包。每次有数据包入队时，发送队列（64 个数据包）会从最旧的开始，丢弃已等待 350 ms 的数据包 |
+| bt-runloop | -- | BTstack 的运行循环；每当 L2CAP 可以发送时，就发送一个排队的数据包。每次有数据包入队时，发送队列（64 个数据包）会从最旧的开始，丢弃已等待 350 ms（LHDC V5 低延迟时为 100 ms）的数据包 |
 | USB | -- | WinUSB 传输：每个 IN 管道（事件、ACL 数据）上同时有三个读取请求，另有一个写入器负责命令、一个负责 ACL 数据（最多同时进行 8 个传输） |
 | core | Normal | 状态机、IPC（tokio；RFCOMM 直通按连接划分的队列）、设置、统计（4 Hz）、更新检查 |
 
@@ -280,7 +280,7 @@ sequenceDiagram
 
 | 编码器 | 库 | 比特率 | 特性 |
 |---------|---------|---------|----------|
-| LHDC V5 | lhdcv5-enc（AOSP 编码器的 C 语言移植版） | 400/500/900/1000 kbps（低/中/中高/高），不超过接收端列出的最大值，ABR 160–400 kbps | 16/24-bit，5 ms 帧，2 字节媒体负载标头，RTP 标头 |
+| LHDC V5 | lhdcv5-enc（AOSP 编码器的 C 语言移植版） | 400/500/900/1000 kbps（低/中/中高/高），不超过接收端列出的最大值，ABR 160–400 kbps | 16/24-bit，5 ms 帧，2 字节媒体负载标头，RTP 标头；接收端列出时支持低延迟（每 10 ms 而非 20 ms 编码一次；ABR 关闭时，另加下文的队列保护） |
 | LDAC | libldac (AOSP) | 330/660/990 kbps | 高/中/低（HQ/SQ/MQ）模式，ABR |
 | aptX Adaptive | aptx-adaptive（AKS-Logic/aptx-adaptive-linux 的纯 Rust 编码器，MIT） | 高 427 kbps，低延迟 265 kbps（R2 接收端：270）；ABR 降至 364/318（R2：270/204） | 48 kHz 立体声（如果选择了 96 kHz，且 R2 接收端列出 96 kHz，则在高音质下使用 96 kHz：646/340/255 kbps），24-bit；每个媒体数据包一个编解码器数据包，位于 BlueCaster 自己的 RTP 标头之后；高音质下支持 ABR；“自动”将它排在 LHDC V5 和 LDAC 之后 |
 | Opus | libopus 1.6.1 | 256 kbps（立体声；单声道减半） | Android 的 A2DP Opus：48 kHz，20 ms 帧（接收端只支持 10 ms 时为 10 ms），以媒体负载为上限的受约束 VBR，每个数据包一帧，1 字节媒体负载标头，RTP 标头 |
@@ -291,6 +291,8 @@ sequenceDiagram
 | SBC XQ | 同一 SBC 编码器 | 约 385/505/552 kbps | 双声道（Dual Channel），44.1 / 48 kHz 下 bitpool 为 47 / 43（高）；仅当接收端的 SBC 允许双声道且 bitpool 至少为 29 时使用（bitpool 随后与 PipeWire 一样限制在接收端的最大值）；与 SBC 共用流端点、媒体负载标头和 RTP 标头 |
 | SBC | Bluedroid 编码器的 Rust 移植版 | 最高约 345 kbps | A2DP 必备的基础编解码器；与 C 编码器逐位一致（已在所有配置下测试） |
 | FastStream | 同一 SBC 编码器 | 198/216 kbps（44.1/48 kHz） | CSR 厂商编解码器，仅音乐方向（无语音回传）：SBC 联合立体声、bitpool 29，帧填充到 72 字节，每个数据包 3 帧，无媒体负载标头也无 RTP 标头（与 PipeWire 相同）；“自动”从不选择 |
+
+**LHDC V5 队列保护**（低延迟开启、ABR 关闭时）：当发送队列在一秒内平均有 12 个或更多数据包时，编码器将比特率降低一级（1000、900、再到 500 kbps），两次之间至少间隔 2 s。平稳一分钟后，编码器将比特率升高一级。如果升高后未能保持 30 s，等待时间加倍，最长 10 分钟。
 
 所有编码器都实现了 `codec::Encoder` trait：编码器声明 PCM 格式以及每次调用消耗的帧数，并返回编解码器帧。
 
@@ -319,7 +321,7 @@ AAC 和 SBC 使用 A2DP 规范中定义的标准 A2DP 编解码器 ID。
 - **aptX**：7 字节（第 6 字节 = 采样率 / 声道模式）
 - **aptX HD**：11 字节（第 6 字节同 aptX，另加 4 个保留字节）；必须为立体声
 - **aptX LL**：8 字节；当接收端设置了扩展（“new caps”）标志时为 17 字节。BlueCaster 只注册一个 aptX LL 端点，并以接收端所用的 vendor ID 配置流
-- **LHDC V5**：11 字节（Android `a2dp_vendor_lhdcv5_constants.h`）：第 6 字节为采样率（0x20 44.1k、0x10 48k、0x04 96k、0x01 192k），第 7 字节为位深度（0x04 16-bit、0x02 24-bit）以及接收端的最小/最大比特率限制，第 8 字节为编解码器子版本（0x01 = V5 ver.1）和 0x10 = 5 ms 帧，第 9-10 字节为可选功能（低延迟、无损、JAS、AR、META），BlueCaster 均不提供。仅支持立体声。与 Android 一样，接收端的比特率限制会在配置中回传并应用到编码器。媒体数据包带有 2 字节的负载标头：帧数 << 2（延迟位为 0）以及序列号
+- **LHDC V5**：11 字节（Android `a2dp_vendor_lhdcv5_constants.h`）：第 6 字节为采样率（0x20 44.1k、0x10 48k、0x04 96k、0x01 192k），第 7 字节为位深度（0x04 16-bit、0x02 24-bit）以及接收端的最小/最大比特率限制，第 8 字节为编解码器子版本（0x01 = V5 ver.1）和 0x10 = 5 ms 帧，第 9-10 字节为可选功能（低延迟、无损、JAS、AR、META）。当 LHDC V5 设置中开启了低延迟且接收端列出该功能时，BlueCaster 会请求低延迟（第 9 字节，0x40）。其他功能 BlueCaster 均不提供。仅支持立体声。与 Android 一样，接收端的比特率限制会在配置中回传并应用到编码器。媒体数据包带有 2 字节的负载标头：帧数 << 2（延迟位为 0）以及序列号
 - **FastStream**：8 字节（PipeWire `a2dp_faststream_t`）：第 6 字节为方向（0x01 sink = 音乐，0x02 source = 语音），第 7 字节的低 4 位为接收方向的采样率（0x2 44.1k、0x1 48k），高 4 位为发送方向的采样率（0x2 16k）。BlueCaster 只提供并配置音乐方向
 - **Opus**：7 字节（Android `a2dp_vendor_opus_constants.h`）：第 6 字节的位 2..0 为声道模式（0x01 单声道、0x02 立体声、0x04 双单声道），位 4..3 为帧长（0x08 10 ms、0x10 20 ms），位 7 为 48 kHz。BlueCaster 提供单声道和立体声、10 ms 和 20 ms，并配置为 20 ms 立体声（仅当输入为单声道且接收端支持单声道时才使用单声道）。媒体数据包在 1 字节的负载标头（低 4 位为帧数 1）之后携带一个 Opus 数据包
 - **aptX Adaptive**：40 字节。BTstack 的能力事件会把接收端的编解码器信息截断为 30 字节，但其中仍包含 BlueCaster 用到的全部内容。SET_CONFIGURATION：48 kHz，源类型 2（主机编码器：由接收端自行控制播放时序），立体声；R1 接收端会收到它自己的目标延迟字节，其中 LL0 提高到至少 80 ms，HQ 延迟为 0 时改为 200 ms；R2 接收端会收到源端自己的 R2 块
@@ -338,6 +340,7 @@ AAC 和 SBC 使用 A2DP 规范中定义的标准 A2DP 编解码器 ID。
 | `profiles.json` | 配置文件 |
 | `devices\devices.txt` | 已知设备 |
 | `devices\le_audio_devices.txt` | LE Audio：设备列表中的 LE Audio 条目 |
+| `devices\le_audio_sets.txt` | LE Audio：已保存设备的协调集（仅成员地址；一对耳机算作一个设备） |
 | `devices\device_codecs.json` | 每台经典设备上次连接时提供的内容（以及是否已向 OPPO 耳塞请求过 Hi-Res） |
 | `pairing\link_keys.txt` | 链接密钥：与 v1 或 2.0.x 配对过的耳机无需重新配对即可再次连接 |
 | `pairing\le_audio_bonds.tlv`、`pairing\le_audio_csip.txt` | LE Audio：LE 绑定信息（含 GATT 服务器持久保存的 CCC 值）以及协调集 |

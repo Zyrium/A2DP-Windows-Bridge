@@ -22,7 +22,10 @@ codec = { workspace = true, features = ["default"] }
 dsp.workspace = true
 ipc.workspace = true
 win-sys.workspace = true
+input-helper.workspace = true
 audio-capture.workspace = true
+# agent.rs: the session agent and the core's end of its pipe
+session-host.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true

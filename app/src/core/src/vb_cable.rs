@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ipc::{ErrorInfo, Msg};
+use session_host::elevation::ElevatedError;
 use sha2::{Digest, Sha256};
-use win_sys::elevation::{self, ElevationError};
 
 const PACK_URL: &str = "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack46.zip";
 const PACK_NAME: &str = "VBCABLE_Driver_Pack46.zip";
@@ -104,7 +104,7 @@ fn unpack(data: &[u8]) -> Result<PathBuf, ErrorInfo> {
 }
 
 fn vb_cable_listed() -> bool {
-    audio_capture::render_devices()
+    session_host::devices::render_devices()
         .is_ok_and(|list| list.iter().any(|d| bluecaster_core::profiles::is_vb_cable(&d.name, d.is_virtual)))
 }
 
@@ -131,9 +131,12 @@ pub fn install() -> Result<bool, ErrorInfo> {
     }
 }
 
+/// The setup as administrator, through the session host (in the agent when
+/// it does the session's work: a service shows no UAC prompt)
 fn run(setup: &Path) -> Result<(), ErrorInfo> {
-    let code = elevation::run_elevated(setup, &["-i", "-h"]).map_err(|e| match e {
-        ElevationError::Cancelled => err("vb_cable.uac_cancelled", "error.vb_cable_uac_cancelled"),
+    let args = ["-i".to_string(), "-h".to_string()];
+    let code = session_host::elevation::run_setup(setup, &args).map_err(|e| match e {
+        ElevatedError::Cancelled => err("vb_cable.uac_cancelled", "error.vb_cable_uac_cancelled"),
         e => {
             tracing::error!("VB-CABLE setup: {e}");
             err("vb_cable.install_failed", "error.vb_cable_install_failed")
@@ -204,7 +207,7 @@ fn hifi_remover() -> Option<PathBuf> {
 }
 
 fn listed(hifi: bool) -> bool {
-    audio_capture::render_devices().is_ok_and(|list| {
+    session_host::devices::render_devices().is_ok_and(|list| {
         list.iter().any(|d| {
             if hifi {
                 bluecaster_core::profiles::is_hifi_cable(&d.name)
@@ -236,7 +239,7 @@ pub fn uninstall(config: &Path, hifi: bool) -> Result<bool, ErrorInfo> {
         args.push("--hifi");
     }
     let (code, result) = crate::driver::run_with(config, &args, |e| match e {
-        ElevationError::Cancelled => err("vb_cable.uac_cancelled", "error.vb_cable_uninstall_uac_cancelled"),
+        ElevatedError::Cancelled => err("vb_cable.uac_cancelled", "error.vb_cable_uninstall_uac_cancelled"),
         e => {
             tracing::error!("{name} removal: {e}");
             failed()

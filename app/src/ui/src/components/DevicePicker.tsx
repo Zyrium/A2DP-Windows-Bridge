@@ -361,7 +361,8 @@ export function DevicePicker(props: {
         <Icon name={d.audio ? "headphones" : "bluetooth"} />
         <span class="device-row-text" id={nameId()}>
           <span class="device-row-name">{label()}</span>{" "}
-          <span class="mono muted">{d.address}</span>
+          {/* Every address of a set: both earbuds' */}
+          <span class="mono muted">{[d.address, ...d.set_addresses].join(", ")}</span>
         </span>
         <span class="tags">
           <Show when={d.saved && !props.savedOnly}>
@@ -529,8 +530,14 @@ export function DevicePicker(props: {
   );
 
   // The Audio Devices screen (issue #86): the saved devices, each with its
-  // settings, then a card to add one (scan, or the address by hand)
-  const saved = () => devices().filter((d) => d.saved);
+  // settings, then a card to add one (scan, or the address by hand). The
+  // saved ones are those Home and Codecs show (LE Audio entries
+  // on an adapter not known to stream it could not be removed here)
+  const saved = createMemo(() =>
+    sortDevices(listedDevices(snap().devices, leAudioOn(snap().settings) && !props.classicOnly)).filter(
+      (d) => d.saved,
+    ),
+  );
   const pairedList = () =>
     sortDevices(listedDevices(snap().devices, false)).filter((d) => d.saved);
   const found = () => devices().filter((d) => !d.saved);

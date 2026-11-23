@@ -5,6 +5,7 @@
 pub mod bas;
 pub mod ccp;
 pub mod csip;
+pub mod hogp;
 pub mod mcp;
 pub mod tmap_gmap;
 pub mod vcp;
@@ -12,16 +13,25 @@ pub mod vcp;
 use super::module::{LeModuleEntry, LeModuleSetup};
 
 /// All modules in v1's fixed order: CSIP, VCP, MCP, CCP, TMAP / GMAP, then
-/// BAS (the headset's battery level).
-/// Called by the LE core on the BTstack thread when the stack starts with
-/// LE Audio on; hooks run in this order.
+/// BAS (the headset's battery level), with LE Audio on; then HID over GATT
+/// with keyboards and mice on (issue #413). Without LE Audio none of its
+/// modules exists: no LE Audio service is added to the PC's GATT server.
+/// Called by the LE core on the BTstack thread when the stack starts; hooks
+/// run in this order.
 pub fn create_all(setup: &mut LeModuleSetup) -> Vec<LeModuleEntry> {
-    vec![
-        csip::create(setup),
-        vcp::create(setup),
-        mcp::create(setup),
-        ccp::create(setup),
-        tmap_gmap::create(setup),
-        bas::create(setup),
-    ]
+    let mut all = Vec::new();
+    if setup.audio {
+        all.extend([
+            csip::create(setup),
+            vcp::create(setup),
+            mcp::create(setup),
+            ccp::create(setup),
+            tmap_gmap::create(setup),
+            bas::create(setup),
+        ]);
+    }
+    if let Some(hid) = setup.hid.clone() {
+        all.push(hogp::create(hid));
+    }
+    all
 }

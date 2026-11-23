@@ -14,7 +14,11 @@ codec: string,
 /**
  * hq, sq, mq; mhq for LHDC V5; ll for aptX Adaptive
  */
-quality: string, abr: boolean, codec_fallback: boolean, 
+quality: string, abr: boolean, 
+/**
+ * LHDC V5: low latency asked for (issue #543)
+ */
+lhdcv5_low_latency: boolean, codec_fallback: boolean, 
 /**
  * The codec was chosen on its card while the device did not offer it:
  * asked for anyway, no fallback (issue #86)

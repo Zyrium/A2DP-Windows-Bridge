@@ -29,6 +29,10 @@ use crate::{APP_CAPTURE_MIN_BUILD, CaptureError, CaptureOptions, EndReason, Form
 const BUFFER_HNS: i64 = 100_000;
 /// Used when the client cannot tell its period (process loopback)
 const DEFAULT_PERIOD: Duration = Duration::from_millis(10);
+
+/// Front left and right (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT): the
+/// layout of application capture and the test tone
+pub(crate) const STEREO_MASK: u32 = 0x3;
 /// Windows usually flags the first buffers after Start() as discontinuous:
 /// nothing was lost, so those are not counted (v1)
 const DISCONTINUITY_GRACE: Duration = Duration::from_millis(500);
@@ -60,6 +64,9 @@ enum Command {
 /// An opened stream whose thread waits for `start`
 pub(crate) struct Opened {
     pub format: Format,
+    /// The speakers of the interleaved channels (WAVEFORMATEXTENSIBLE
+    /// dwChannelMask; 0 = not stated)
+    pub channel_mask: u32,
     commands: mpsc::Sender<Command>,
     thread: JoinHandle<()>,
     shared: Arc<Shared>,
@@ -89,7 +96,7 @@ impl Opened {
             .spawn(move || thread_main(target, options, ready_tx, cmd_rx, thread_shared))
             .map_err(|e| CaptureError::Thread(e.to_string()))?;
         match ready_rx.recv_timeout(OPEN_TIMEOUT) {
-            Ok(Ok(format)) => Ok(Opened { format, commands: cmd_tx, thread, shared }),
+            Ok(Ok((format, channel_mask))) => Ok(Opened { format, channel_mask, commands: cmd_tx, thread, shared }),
             Ok(Err(e)) => {
                 let _ = thread.join();
                 Err(e)
@@ -143,6 +150,7 @@ struct Stream {
     /// None = polling fallback (a driver that refuses event-driven loopback)
     event: Option<Handle>,
     format: Format,
+    channel_mask: u32,
     period: Duration,
     /// Application capture: the app, to notice when it exits
     process: Option<ProcessWatch>,
@@ -151,7 +159,7 @@ struct Stream {
 fn thread_main(
     target: Target,
     options: CaptureOptions,
-    ready: mpsc::SyncSender<Result<Format, CaptureError>>,
+    ready: mpsc::SyncSender<Result<(Format, u32), CaptureError>>,
     commands: mpsc::Receiver<Command>,
     shared: Arc<Shared>,
 ) {
@@ -174,7 +182,7 @@ fn thread_main(
             return;
         }
     };
-    if ready.send(Ok(stream.format)).is_err() {
+    if ready.send(Ok((stream.format, stream.channel_mask))).is_err() {
         tracing::debug!("audio capture: open timed out before the stream was ready, closing it");
         return; // `open` gave up waiting
     }
@@ -314,7 +322,8 @@ fn open_device(id: Option<&str>, options: &CaptureOptions) -> Result<Stream, Cap
         client.get_buffer_size().ok(),
         period.as_secs_f64() * 1000.0
     );
-    Ok(Stream { client, capture, event, format: plan.format, period, process: None })
+    let channel_mask = mix.get_dwchannelmask();
+    Ok(Stream { client, capture, event, format: plan.format, channel_mask, period, process: None })
 }
 
 /// v1 WasapiCapture::init_process
@@ -373,6 +382,7 @@ fn open_process(pid: u32, options: &CaptureOptions) -> Result<Stream, CaptureErr
         capture,
         event: Some(event),
         format: fmt,
+        channel_mask: STEREO_MASK,
         // GetDevicePeriod does not work on a process loopback client
         period: DEFAULT_PERIOD,
         process: Some(process),

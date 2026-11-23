@@ -23,7 +23,9 @@ static int bluecaster_fclose(FILE *file) {
 }
 #define fclose bluecaster_fclose
 
-#include "btstack_chipset_realtek.c"
+/* build.rs writes it to OUT_DIR: BTstack's file with a "RTBTCore" firmware
+ * accepted on chips without a security key (patched_realtek) */
+#include "btstack_chipset_realtek_patched.c"
 
 #undef fclose
 

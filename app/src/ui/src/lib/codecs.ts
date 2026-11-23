@@ -480,6 +480,8 @@ export interface CodecCaps {
   sample_rates: number[];
   bit_depths: number[];
   max_bitrate: number;
+  /** LHDC V5: it lists low latency (absent from an older core: not known) */
+  lhdcv5_low_latency?: boolean;
 }
 
 /** What a codec's settings go by with its card's "Show only supported
@@ -609,6 +611,12 @@ export function carryToCodec<T extends CodecFields>(p: T, to: string): T {
   });
 }
 
+/** LHDC V5 low latency can be asked for (issue #543): the core asks only a
+ *  device that lists it, so the switch is left out for one known not to */
+export function lowLatencyOffered(codec: string, caps: CodecCaps | null): boolean {
+  return codec === "lhdcv5" && (caps?.lhdcv5_low_latency ?? true);
+}
+
 /** LHDC V5 ABR runs at 400 kbps or below whatever the quality (as on
  *  Android): the quality choice is greyed out then */
 export function qualityIgnored(codec: string, abr: boolean): boolean {
@@ -726,6 +734,7 @@ interface CodecFields {
   sbc_allocation?: string;
   sbc_channel_mode?: string;
   unlisted_options?: boolean;
+  lhdcv5_low_latency?: boolean;
 }
 
 /** Values the codec cannot use go back to the defaults (v1 did the same when the codec changed) */
@@ -749,6 +758,7 @@ export function fitToCodec<T extends CodecFields>(p: T): T {
     ...(p.sbc_subbands === undefined ? {} : { sbc_subbands: sbc ? p.sbc_subbands : 0 }),
     ...(p.sbc_allocation === undefined ? {} : { sbc_allocation: sbc ? p.sbc_allocation : "" }),
     ...(p.sbc_channel_mode === undefined ? {} : { sbc_channel_mode: p.codec === "sbc" && p.sbc_channel_mode !== "dual_channel" ? p.sbc_channel_mode : "" }),
+    ...(p.lhdcv5_low_latency === undefined ? {} : { lhdcv5_low_latency: p.codec === "lhdcv5" && p.lhdcv5_low_latency }),
   };
 }
 

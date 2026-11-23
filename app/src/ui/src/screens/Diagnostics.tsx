@@ -286,9 +286,13 @@ export function Diagnostics() {
               {t("ui.diag.capture_saved", "")}
               <span class="mono capture-path">{c().path}</span> <span class="num capture-size">({formatBytes(c().bytes)})</span>
             </span>
-            <Button icon="folder_open" kind="subtle" onClick={() => void core.transport.revealPath(c().path)}>
-              {t("ui.diag.show_in_explorer")}
-            </Button>
+            {/* A core that runs as a service keeps the capture in its protected
+                folder: the user gets it in a diagnostic bundle */}
+            <Show when={!core.state.snap?.service_mode}>
+              <Button icon="folder_open" kind="subtle" onClick={() => void core.transport.revealPath(c().path)}>
+                {t("ui.diag.show_in_explorer")}
+              </Button>
+            </Show>
             <IconButton icon="dismiss" label={t("modal.close")} onClick={() => setSavedCapture(null)} />
           </div>
         )}

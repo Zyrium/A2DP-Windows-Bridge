@@ -11,8 +11,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bt_host::{
-    BtHost, DiscoveredDevice, HciCapture, HeadsetMic, HostConfig, HostEvent, InitFailure, LeConfig, LeScanResult,
-    LinkStats, TransportConfig,
+    BtHost, DiscoveredDevice, HciCapture, HeadsetMic, HostConfig, HostEvent, InitFailure, LeConfig, LeDeviceId,
+    LeScanResult, LinkStats, TransportConfig,
 };
 use hci_transport::UsbSelector;
 
@@ -91,6 +91,10 @@ pub struct ScannedDevice {
     /// LE Audio: member of a coordinated set (advertises a CSIP RSI);
     /// connecting it streams to the whole set
     pub le_audio_set: bool,
+    /// Keyboards and mice (experimental, issue #413): an LE advertiser that
+    /// looks like a keyboard or mouse, with its address type. Only listed
+    /// while that feature is on; never an audio or LE Audio entry.
+    pub hid_le: Option<u8>,
 }
 
 /// One device, not two (issue #86): a scan that finds the other side
@@ -100,7 +104,8 @@ pub struct ScannedDevice {
 fn save_twins(dir: &std::path::Path, found: &[ScannedDevice]) -> usize {
     let saved = crate::devices::load_all(dir);
     let mut n = 0;
-    for d in found {
+    // A keyboard or mouse is neither side of headphones
+    for d in found.iter().filter(|d| d.hid_le.is_none()) {
         let has = |le: bool| saved.iter().find(|s| s.le_audio == le && s.address.eq_ignore_ascii_case(&d.address));
         if has(d.le_audio).is_some() {
             continue;
@@ -137,6 +142,7 @@ impl ScannedDevice {
             audio: d.is_audio(),
             le_audio: false,
             le_audio_set: false,
+            hid_le: None,
         }
     }
 }
@@ -144,6 +150,43 @@ impl ScannedDevice {
 /// Appearance categories (the value's upper 10 bits)
 const APPEARANCE_PHONE: u16 = 0x001;
 const APPEARANCE_COMPUTER: u16 = 0x002;
+/// Human Interface Device, 0x03C0-0x03FF (keyboard, mouse, ...)
+const APPEARANCE_HID: u16 = 0x00F;
+/// The HID service, advertised by LE keyboards and mice
+const UUID_SERVICE_HID: u16 = 0x1812;
+
+/// Keyboards and mice (experimental, issue #413): the connectable LE
+/// advertisers that look like one (the HID service advertised, or an
+/// appearance of the HID category), listed by their identity when known,
+/// with its address type. Never audio entries.
+fn hid_le_entries(results: &[LeScanResult]) -> Vec<ScannedDevice> {
+    let mut out: Vec<ScannedDevice> = Vec::new();
+    for r in results.iter().filter(|r| r.connectable) {
+        if !r.uuids16.contains(&UUID_SERVICE_HID) && r.appearance >> 6 != APPEARANCE_HID {
+            continue;
+        }
+        let a = r.identity.unwrap_or(r.addr);
+        let address = a.to_string();
+        match out.iter_mut().find(|e| e.address == address) {
+            Some(e) => {
+                if !r.name.is_empty() {
+                    e.name = r.name.clone();
+                }
+            }
+            None => out.push(ScannedDevice {
+                address,
+                name: r.name.clone(),
+                rssi: r.rssi,
+                class_of_device: 0,
+                audio: false,
+                le_audio: false,
+                le_audio_set: false,
+                hid_le: Some(a.addr_type),
+            }),
+        }
+    }
+    out
+}
 
 /// The addresses of advertisers listed as LE Audio only for their audio
 /// appearance that are a classic device (`classic`: found or saved): a
@@ -160,16 +203,34 @@ fn classic_appearance_only(results: &[LeScanResult], classic: &[String]) -> Vec<
         .collect()
 }
 
+/// What [`le_scan_entries`] knows of an entry beyond what it lists
+#[derive(Debug, Clone, Copy)]
+struct EntryFacts {
+    /// A saved LE Audio device (or a member of a saved one's set)
+    saved: bool,
+    /// The coordinated set a known SIRK resolved its RSI to
+    set_id: Option<u32>,
+    /// It advertises an RSI that no known set resolves (a set never bonded)
+    unknown_set: bool,
+    appearance: u16,
+}
+
 /// The LE Audio entries of an LE scan (v1 A2dpService scan thread): LE
 /// Audio advertisers only; a saved LE Audio device is listed (with its new
-/// name); of a coordinated set nobody saved, one member (connecting it
-/// finds the others). Classic entries of the same address are another
-/// list. Returns the entries and the number of LE Audio advertisers seen.
-/// A PC or phone is a source, not something to play to: this PC's own
-/// Windows adapters (`own`, advertising LE Audio) are left out with them.
-fn le_scan_entries(results: &[LeScanResult], saved_le: &[SavedDevice], own: &[String]) -> (Vec<ScannedDevice>, usize) {
-    let mut out: Vec<ScannedDevice> = Vec::new();
-    let mut sets_listed: Vec<u32> = Vec::new();
+/// name), and so is every member of its coordinated set, as that device
+/// (`sets`: the sets learned); of a coordinated set nobody saved, one
+/// member (connecting it finds the others). Classic entries of the same
+/// address are another list. Returns the entries and the number of LE
+/// Audio advertisers seen. A PC or phone is a source, not something to play
+/// to: this PC's own Windows adapters (`own`, advertising LE Audio) are
+/// left out with them.
+fn le_scan_entries(
+    results: &[LeScanResult],
+    saved_le: &[SavedDevice],
+    own: &[String],
+    sets: &crate::le_sets::KnownSets,
+) -> (Vec<ScannedDevice>, usize) {
+    let mut out: Vec<(ScannedDevice, EntryFacts)> = Vec::new();
     let mut found = 0;
     for r in results.iter().filter(|r| r.le_audio) {
         let category = r.appearance >> 6;
@@ -182,34 +243,101 @@ fn le_scan_entries(results: &[LeScanResult], saved_le: &[SavedDevice], own: &[St
         // A bonded device advertising under a random address is listed by
         // its identity: its saved entry and its classic side's name match
         // it, and its next random address is the same entry (issue #86)
-        let address = r.identity.unwrap_or(r.addr).to_string();
+        let own_address = r.identity.unwrap_or(r.addr).to_string();
         let set_member = r.rsi.is_some();
-        if let Some(e) = out.iter_mut().find(|e| e.address == address) {
-            // Seen twice (advertising and scan response)
+        // Another member of a saved device's set is that device
+        let group = sets.group_of(&own_address).or_else(|| r.set_id.and_then(|id| sets.group_of_set(id)));
+        let saved = saved_le.iter().find(|d| d.address.eq_ignore_ascii_case(&own_address)).or_else(|| {
+            group.and_then(|g| saved_le.iter().find(|d| g.iter().any(|a| a.eq_ignore_ascii_case(&d.address))))
+        });
+        let address = saved.map_or(own_address, |d| d.address.clone());
+        if let Some((e, facts)) = out.iter_mut().find(|(e, _)| e.address == address) {
+            // Seen twice (advertising and scan response), or another member
             if !r.name.is_empty() {
                 e.name = r.name.clone();
             }
             e.le_audio_set |= set_member;
+            facts.set_id = facts.set_id.or(r.set_id);
+            facts.unknown_set |= set_member && r.set_id.is_none();
             continue;
         }
-        let saved = saved_le.iter().any(|d| d.address.eq_ignore_ascii_case(&address));
-        if !saved && let Some(set) = r.set_id {
-            if sets_listed.contains(&set) {
-                continue;
-            }
-            sets_listed.push(set);
-        }
-        out.push(ScannedDevice {
-            address,
-            name: r.name.clone(),
-            rssi: r.rssi,
-            class_of_device: 0,
-            audio: true,
-            le_audio: true,
-            le_audio_set: set_member,
-        });
+        let facts = EntryFacts {
+            saved: saved.is_some(),
+            set_id: r.set_id,
+            unknown_set: set_member && r.set_id.is_none(),
+            appearance: r.appearance,
+        };
+        out.push((
+            ScannedDevice {
+                address,
+                name: r.name.clone(),
+                rssi: r.rssi,
+                class_of_device: 0,
+                audio: true,
+                le_audio: true,
+                le_audio_set: set_member,
+                hid_le: None,
+            },
+            facts,
+        ));
     }
-    (out, found)
+    // Of a set a known SIRK resolves: its saved entry, else one member
+    let mut keep: Vec<bool> = vec![true; out.len()];
+    for i in 0..out.len() {
+        let Some(set) = out[i].1.set_id else { continue };
+        let same: Vec<usize> = (0..out.len()).filter(|&j| out[j].1.set_id == Some(set)).collect();
+        let any_saved = same.iter().any(|&j| out[j].1.saved);
+        let first = same[0];
+        keep[i] = if any_saved { out[i].1.saved } else { i == first };
+    }
+    // A set never bonded, so nothing resolves it yet
+    for (drop, kept) in unbonded_set_twins(&out) {
+        keep[drop] = false;
+        tracing::debug!("le scan: two advertisers of one name and appearance listed as one set ({kept} kept)");
+    }
+    let entries = out.into_iter().zip(keep).filter(|(_, k)| *k).map(|((e, _), _)| e).collect();
+    (entries, found)
+}
+
+/// Advertisers of a coordinated set that no known SIRK resolves (the first
+/// scan of new earbuds): both earbuds advertise an RSI under their own
+/// address, and nothing tells the two apart from two devices until a
+/// connection reads the set's key. Two such entries are taken as one set
+/// when they are the only ones of their name (not empty, compared in full:
+/// "Buds NC" and "Buds SO" are other products) and appearance; three or
+/// more (two pairs of one model, or a pair and a lone earbud) cannot be
+/// told apart and stay listed. Of the two, a saved one stays, else the one
+/// with the lower address. Returns (index dropped, index kept).
+fn unbonded_set_twins(entries: &[(ScannedDevice, EntryFacts)]) -> Vec<(usize, usize)> {
+    let candidate =
+        |(e, f): &(ScannedDevice, EntryFacts)| f.unknown_set && f.set_id.is_none() && !e.name.trim().is_empty();
+    let mut out = Vec::new();
+    for (i, a) in entries.iter().enumerate() {
+        if !candidate(a) {
+            continue;
+        }
+        let same: Vec<usize> = (0..entries.len())
+            .filter(|&j| {
+                let b = &entries[j];
+                candidate(b) && b.0.name.trim() == a.0.name.trim() && b.1.appearance == a.1.appearance
+            })
+            .collect();
+        // Each pair once, from its first entry
+        if same.len() != 2 || same[0] != i {
+            continue;
+        }
+        let (x, y) = (same[0], same[1]);
+        let (ex, ey) = (&entries[x], &entries[y]);
+        let pair = match (ex.1.saved, ey.1.saved) {
+            (true, true) => continue,
+            (true, false) => (y, x),
+            (false, true) => (x, y),
+            (false, false) if ex.0.address <= ey.0.address => (y, x),
+            (false, false) => (x, y),
+        };
+        out.push(pair);
+    }
+    out
 }
 
 /// LE entries whose advertising carries no name (issue #86: an EarFun's LE
@@ -327,6 +455,27 @@ pub enum ServiceEvent {
     /// Headset mode: the voice link carries audio (Some), or no longer
     /// (None)
     Voice(Option<ipc::VoiceStatus>),
+    /// LE Audio: a connection learned a coordinated set
+    /// (le_audio_sets.txt): saved entries of one set become one
+    LeSetLearned,
+    /// The USB adapter (VID, PID) a stack started on, or None: the stack
+    /// stopped (also a stack over TCP, which has no adapter)
+    Adapter(Option<(u16, u16)>),
+    /// A headphone button arrived (for the IPC clients; the media key, if
+    /// any, went to Windows already)
+    Button(ipc::ButtonPress),
+    /// Keyboards and mice (experimental): one was added, removed, connected
+    /// or went away ([`Service::hid_devices`])
+    HidDevices,
+    /// The number to type on a keyboard being added appeared or went away
+    /// ([`Service::hid_passkey`])
+    HidPasskey,
+    /// A device being added started or ended its countdown, or one was
+    /// removed again ([`Service::hid_checks`], [`Service::hid_rolled_back`])
+    HidCheck,
+    /// The self-test of the path to Windows has a new result
+    /// ([`Service::hid_health`])
+    HidHealth,
 }
 
 /// Headset mode switched for the running classic stream
@@ -352,6 +501,24 @@ pub struct ServiceOptions {
     pub usb: UsbSelector,
 }
 
+/// A host's button as the IPC names it
+fn ipc_button(b: bt_host::Button) -> ipc::MediaButton {
+    use bt_host::Button as B;
+    use ipc::MediaButton as M;
+    match b {
+        B::Play => M::Play,
+        B::Pause => M::Pause,
+        B::Stop => M::Stop,
+        B::Next => M::Next,
+        B::Previous => M::Previous,
+        B::FastForward => M::FastForward,
+        B::Rewind => M::Rewind,
+        B::VolumeUp => M::VolumeUp,
+        B::VolumeDown => M::VolumeDown,
+        B::Mute => M::Mute,
+    }
+}
+
 /// The LE Audio configuration of the next stack, None: LE off
 fn le_config(le_on: bool, cli: Option<&LeCliOptions>, opts: &ServiceOptions) -> Option<LeConfig> {
     if !le_on {
@@ -364,17 +531,79 @@ fn le_config(le_on: bool, cli: Option<&LeCliOptions>, opts: &ServiceOptions) -> 
         bonds_file: Some(crate::paths::le_bonds_file(&opts.config_dir)),
         imported_bonds_file: Some(crate::paths::windows_le_keys_file(&opts.config_dir)),
         bond_dir: Some(crate::paths::pairing_dir(&opts.config_dir)),
-        media: if dry_run { None } else { crate::le_media::windows_backend() },
+        // Windows' media session, here or in the session agent (a dry run
+        // with the agent: its simulated player)
+        media: session_host::media::media_backend(dry_run),
         ccp_sim: cli.and_then(|c| c.ccp_sim.clone()),
         ccp_console: cli.is_some_and(|c| c.ccp_console),
     })
 }
 
+/// The lock behind [`Service::settings_tx`]: one thread at a time, which
+/// may enter again
+#[derive(Default)]
+pub(crate) struct SettingsTx {
+    owner: Mutex<Option<(std::thread::ThreadId, usize)>>,
+    free: Condvar,
+}
+
+impl SettingsTx {
+    pub(crate) fn enter(&self) -> SettingsTxGuard<'_> {
+        let me = std::thread::current().id();
+        let mut owner = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match owner.as_mut() {
+                None => {
+                    *owner = Some((me, 1));
+                    break;
+                }
+                Some((id, depth)) if *id == me => {
+                    *depth += 1;
+                    break;
+                }
+                Some(_) => owner = self.free.wait(owner).unwrap_or_else(|e| e.into_inner()),
+            }
+        }
+        SettingsTxGuard(self)
+    }
+}
+
+/// See [`Service::settings_tx`]
+pub struct SettingsTxGuard<'a>(&'a SettingsTx);
+
+impl Drop for SettingsTxGuard<'_> {
+    fn drop(&mut self) {
+        let mut owner = self.0.owner.lock().unwrap_or_else(|e| e.into_inner());
+        match owner.as_mut() {
+            Some((_, depth)) if *depth > 1 => *depth -= 1,
+            _ => {
+                *owner = None;
+                self.0.free.notify_one();
+            }
+        }
+    }
+}
+
+/// A broadcast session's claim on the Auracast adapter
+/// ([`Inner::broadcast_wanted`]): dropped when the session ends, so the
+/// next scan or connection goes back on the adapter to use
+pub(crate) struct BroadcastGuard(Arc<Inner>);
+
+impl Drop for BroadcastGuard {
+    fn drop(&mut self) {
+        self.0.broadcast.store(false, Ordering::Release);
+        self.0.broadcast_adapter.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.0.leave_broadcast_adapter();
+    }
+}
+
 pub(crate) struct Inner {
     opts: ServiceOptions,
     pub settings: Mutex<Settings>,
+    /// One change of the saved settings at a time ([`Service::settings_tx`])
+    settings_tx: SettingsTx,
     events: Mutex<Sender<ServiceEvent>>,
-    host: Mutex<Option<Arc<BtHost>>>,
+    pub(crate) host: Mutex<Option<Arc<BtHost>>>,
     stats: Arc<LinkStats>,
     stop: AtomicBool,
     running: AtomicBool,
@@ -401,11 +630,23 @@ pub(crate) struct Inner {
     voice_events: Mutex<Vec<bt_host::VoiceEvent>>,
     /// The microphone test (Diagnostics)
     pub mic_test: crate::mic_test::MicTest,
+    /// Keyboards and mice (experimental, crate::hid)
+    pub(crate) hid: crate::hid::HidState,
     /// The microphone's processing in force (the request's, changed in
     /// place by [`Service::set_mic_processing`])
     pub mic_dsp: voice_link::MicDsp,
     /// The running stack was started with LE Audio
     le_active: AtomicBool,
+    /// A broadcast session wants the stack (le_stream::run_broadcast): it
+    /// opens the Auracast adapter (adapter::adapter_for)
+    broadcast: AtomicBool,
+    /// The adapter the running stack was started for (adapter::adapter_for;
+    /// empty: automatic)
+    host_adapter: Mutex<String>,
+    /// The adapter the running broadcast's stack opened (its instance ID):
+    /// a broadcast set up again goes on the same one, also when none is
+    /// chosen; empty: no broadcast, or none opened yet
+    broadcast_adapter: Mutex<String>,
     /// A device scan runs
     scanning: AtomicBool,
     /// The LE Audio stream being sent (le_stream)
@@ -424,6 +665,10 @@ pub(crate) struct Inner {
     turned_off: AtomicBool,
     /// The source the running A2DP session changes to at its next tick
     source_change: Mutex<Option<SourceRequest>>,
+    /// The source a broadcast went on with after the one it was changed to
+    /// could not be captured: the request is put back to it
+    /// ([`Service::change_source`], [`Service::restart_adapter`])
+    source_kept: Mutex<Option<SourceRequest>>,
     /// Other bitpools for the session to take in place
     /// ([`Service::change_bitpools`])
     bitpool_change: Mutex<Option<stream::Bitpools>>,
@@ -450,8 +695,21 @@ impl Inner {
     }
 
     /// An event for the state machine (the LE stream's headset volume)
+    /// No stack runs, nothing is about to start one, and the PC is not
+    /// going to sleep: crate::hid may start one for its keyboards and mice
+    pub(crate) fn hid_may_start(&self) -> bool {
+        self.host.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+            && !self.running.load(Ordering::Acquire)
+            && !self.power.suspending()
+    }
+
     pub(crate) fn send_event(&self, e: ServiceEvent) {
         let _ = self.events.lock().unwrap_or_else(|e| e.into_inner()).send(e);
+    }
+
+    /// A sender of service events, for threads of their own
+    pub(crate) fn event_sender(&self) -> Sender<ServiceEvent> {
+        self.events.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn stop_requested(&self) -> bool {
@@ -460,6 +718,12 @@ impl Inner {
 
     pub fn take_source_change(&self) -> Option<SourceRequest> {
         self.source_change.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// The session could not capture the source it was changed to and plays
+    /// `source` again
+    pub fn keep_source(&self, source: SourceRequest) {
+        *self.source_kept.lock().unwrap_or_else(|e| e.into_inner()) = Some(source);
     }
 
     pub fn take_bitpool_change(&self) -> Option<stream::Bitpools> {
@@ -579,8 +843,90 @@ impl Inner {
         self.le_active.load(Ordering::Acquire)
     }
 
+    /// The adapter the next stack opens first: the Auracast adapter while a
+    /// broadcast wants the stack, else the adapter to use
+    fn wanted_adapter(&self) -> String {
+        let s = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        crate::adapter::adapter_for(&s, self.broadcast.load(Ordering::Acquire)).to_string()
+    }
+
+    /// The adapter a broadcast set up again goes on: the chosen one, else
+    /// the one its stack opened before (empty: none opened yet)
+    fn broadcast_adapter(&self) -> String {
+        let wanted = self.wanted_adapter();
+        if wanted.is_empty() {
+            self.broadcast_adapter.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        } else {
+            wanted
+        }
+    }
+
+    /// The adapter the broadcast's next stack opens first is there (always,
+    /// when none is chosen and none was opened yet, or with a virtual
+    /// controller)
+    pub(crate) fn wanted_adapter_present(&self) -> bool {
+        self.opts.hci_tcp.is_some() || crate::adapter::chosen_present(&self.broadcast_adapter())
+    }
+
+    /// The Auracast adapter is set and not there: a broadcast would go on
+    /// the first other adapter found
+    pub(crate) fn auracast_adapter_missing(&self) -> bool {
+        if self.opts.hci_tcp.is_some() {
+            return false;
+        }
+        let id = {
+            let s = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+            if s.debug_mode { s.auracast_adapter_id.trim().to_string() } else { String::new() }
+        };
+        !id.is_empty() && !crate::adapter::chosen_present(&id)
+    }
+
+    /// The broadcast's stack is up: the adapter it opened is the one a
+    /// set-up after a loss waits for and opens again
+    pub(crate) fn note_broadcast_adapter(&self) {
+        if self.opts.hci_tcp.is_none()
+            && let Some(id) = hci_transport::usb::last_opened_instance()
+        {
+            *self.broadcast_adapter.lock().unwrap_or_else(|e| e.into_inner()) = id;
+        }
+    }
+
+    /// A broadcast session wants the stack, until the guard drops: the
+    /// next stack started or checked (ensure_host) is the Auracast
+    /// adapter's
+    pub(crate) fn broadcast_wanted(self: &Arc<Self>) -> BroadcastGuard {
+        self.broadcast_adapter.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.broadcast.store(true, Ordering::Release);
+        BroadcastGuard(self.clone())
+    }
+
+    /// The broadcast ended on an adapter of its own: that stack is shut
+    /// down, so the Auracast adapter is free and not shown as in use; the
+    /// next scan or connection starts one on the adapter to use
+    fn leave_broadcast_adapter(&self) {
+        let mut slot = self.host.lock().unwrap_or_else(|e| e.into_inner());
+        let same =
+            self.host_adapter.lock().unwrap_or_else(|e| e.into_inner()).eq_ignore_ascii_case(&self.wanted_adapter());
+        if same {
+            return;
+        }
+        if let Some(h) = slot.take() {
+            tracing::info!("Auracast: the broadcast ended, leaving the Auracast adapter");
+            h.shutdown();
+            self.adapter_changed(false);
+        }
+    }
+
     fn host_config(&self, le_on: bool) -> HostConfig {
-        let s = self.settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut s = self.settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // The Auracast adapter for a broadcast: configure opens it first
+        s.adapter_id = self.wanted_adapter();
+        *self.host_adapter.lock().unwrap_or_else(|e| e.into_inner()) = s.adapter_id.clone();
+        // A broadcast set up again with no adapter chosen: the one it ran on
+        // before, not the first one found (host_adapter stays "automatic")
+        if self.broadcast.load(Ordering::Acquire) {
+            s.adapter_id = self.broadcast_adapter();
+        }
         let transport = match &self.opts.hci_tcp {
             Some(addr) => TransportConfig::Tcp(addr.clone()),
             // bt-host adds the adapters it knows to `known`
@@ -600,6 +946,8 @@ impl Inner {
             imported_bonds_file: Some(crate::paths::windows_le_keys_file(&self.opts.config_dir)),
         });
         c.battery = true;
+        // Keyboards and mice (experimental, developer mode; issue #413)
+        c.hid = self.hid_config();
         // Headset microphone: the session's request, or the developer
         // CLI's --headset-mic-toggle
         c.voice = self.voice_wanted.load(Ordering::Acquire)
@@ -615,7 +963,7 @@ impl Inner {
             let _ = events.lock().unwrap_or_else(|e| e.into_inner()).send(ServiceEvent::Loader(p.clone()));
         }));
         tracing::debug!(
-            "host config: transport {:?}, firmware dir {:?}, realtek pid {:04x} files {:?}, intel loader {}, mediatek loader {}, qualcomm loader {}, realtek driver chip {:04X?}, broadcom ids {}, LE {} (cli {:?})",
+            "host config: transport {:?}, firmware dir {:?}, realtek pid {:04x} files {:?}, intel loader {}, mediatek loader {}, qualcomm loader {}, atheros loader {}, realtek driver chip {:04X?}, broadcom ids {}, LE {} (cli {:?})",
             c.transport,
             c.firmware_dir,
             c.realtek_pid,
@@ -623,6 +971,7 @@ impl Inner {
             c.intel_loader,
             c.mediatek_loader,
             c.qualcomm_loader,
+            c.atheros_loader,
             c.realtek_driver_chip,
             c.broadcom_ids.len(),
             c.le_audio.is_some(),
@@ -658,9 +1007,11 @@ impl Inner {
                     h.set_media_keys(s.media_keys);
                     h.set_afh_policy(self.opts.afh.as_deref().unwrap_or(afh_policy(&s)));
                     self.le_active.store(le_on, Ordering::Release);
+                    self.hid.stack_started();
                     self.streamed.store(false, Ordering::Release);
                     self.note_le_capable(&h);
                     self.pump_events(&h);
+                    self.adapter_changed(true);
                     return Ok(h);
                 }
                 Err(f) => {
@@ -672,7 +1023,17 @@ impl Inner {
                 }
             }
         }
-        Err(Msg::new(if last == InitFailure::NoAnswer { "error.btstack_no_answer" } else { "error.btstack_init" }))
+        // An adapter a firmware loader left needing a power cycle: the same
+        // advice as for one that does not answer (unplug it, or shut down)
+        let needs_replug = matches!(last, InitFailure::NoAnswer | InitFailure::NeedsReplug);
+        Err(Msg::new(if needs_replug { "error.btstack_no_answer" } else { "error.btstack_init" }))
+    }
+
+    /// The state's adapter in use: the one the stack opened (`running`), or
+    /// none
+    fn adapter_changed(&self, running: bool) {
+        let ids = if running && self.opts.hci_tcp.is_none() { hci_transport::usb::last_opened() } else { None };
+        self.send_event(ServiceEvent::Adapter(ids));
     }
 
     /// Remembers whether the adapter the stack opened has LE Audio's
@@ -713,19 +1074,33 @@ impl Inner {
     fn pump_events(self: &Arc<Self>, host: &Arc<BtHost>) {
         let Some(rx) = host.take_events() else { return };
         let weak: Weak<Inner> = Arc::downgrade(self);
+        // The emulator's buttons press no key on this PC
+        let keys_dry_run = self.opts.hci_tcp.is_some();
         let _ = std::thread::Builder::new().name("host-events".into()).spawn(move || {
             while let Ok(e) = rx.recv() {
                 match e {
                     HostEvent::MediaKey(k) => {
                         tracing::debug!("host event: media key {k:?}");
                         let key = match k {
-                            bt_host::MediaKey::PlayPause => win_sys::media_keys::MediaKey::PlayPause,
-                            bt_host::MediaKey::Stop => win_sys::media_keys::MediaKey::Stop,
-                            bt_host::MediaKey::Next => win_sys::media_keys::MediaKey::Next,
-                            bt_host::MediaKey::Previous => win_sys::media_keys::MediaKey::Previous,
+                            bt_host::MediaKey::PlayPause => session_host::media::Key::PlayPause,
+                            bt_host::MediaKey::Stop => session_host::media::Key::Stop,
+                            bt_host::MediaKey::Next => session_host::media::Key::Next,
+                            bt_host::MediaKey::Previous => session_host::media::Key::Previous,
                         };
-                        if let Err(e) = win_sys::media_keys::send(key) {
-                            tracing::warn!("media key {k:?}: {e}");
+                        // In the user's session; never waits for the agent
+                        session_host::media::send_media_key(key, keys_dry_run);
+                    }
+                    HostEvent::Button { button, pressed, le_audio } => {
+                        tracing::debug!(
+                            "host event: button {button:?} {}",
+                            if pressed { "pressed" } else { "released" }
+                        );
+                        if let Some(inner) = weak.upgrade() {
+                            inner.send_event(ServiceEvent::Button(ipc::ButtonPress {
+                                button: ipc_button(button),
+                                pressed,
+                                le_audio,
+                            }));
                         }
                     }
                     HostEvent::Volume(v) => {
@@ -763,6 +1138,12 @@ impl Inner {
                                 .send(ServiceEvent::VoiceCodecs(codecs));
                         }
                     }
+                    // A keyboard or mouse (experimental): no address in the log
+                    HostEvent::Hid(e) => {
+                        if let Some(inner) = weak.upgrade() {
+                            inner.on_hid_event(e);
+                        }
+                    }
                     HostEvent::ConnectionLost | HostEvent::TransportFailed => {
                         tracing::debug!("host event: {e:?}");
                     }
@@ -795,8 +1176,26 @@ impl Inner {
                 // Turned on or off while streaming or scanning: applied now,
                 // before the next scan or connection (v1)
                 Some(if le_wanted { "LE Audio was turned on" } else { "LE Audio was turned off" })
+            } else if !self
+                .host_adapter
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .eq_ignore_ascii_case(&self.wanted_adapter())
+            {
+                // A broadcast on the Auracast adapter, or back from it
+                Some(if self.broadcast.load(Ordering::Acquire) {
+                    "the broadcast goes on the Auracast adapter"
+                } else {
+                    "back on the adapter to use after a broadcast"
+                })
             } else if (self.voice_wanted.load(Ordering::Acquire) || self.mic_test.needs_voice()) && !h.voice_enabled() {
                 Some("headset mode needs the stack with voice")
+            } else if self.hid_wanted() != h.hid_enabled() {
+                Some(if h.hid_enabled() {
+                    "keyboards and mice were turned off"
+                } else {
+                    "keyboards and mice were turned on"
+                })
             } else if !h.controller_responds(CONTROLLER_PROBE) {
                 Some("the Bluetooth adapter stopped answering")
             } else {
@@ -811,6 +1210,8 @@ impl Inner {
                     tracing::warn!("restarting BTstack: {why}");
                     h.shutdown();
                     *slot = None;
+                    self.hid_stack_stopped();
+                    self.adapter_changed(false);
                 }
             }
         }
@@ -835,7 +1236,9 @@ impl Inner {
     /// just connected then refused the PC's page for 30 s to 2 min (issue
     /// #86). So is a link that came up moments ago ([`FRESH_LINK`]): a codec
     /// chosen right after connecting. An older link left from the stream
-    /// that just ended does not count.
+    /// that just ended does not count. Also kept while a keyboard or mouse
+    /// is connected through BlueCaster: losing input for the reconnection
+    /// is worse than the stutter.
     pub fn host_for_stream(self: &Arc<Self>, device: [u8; 6]) -> Result<Arc<BtHost>, Msg> {
         let old = self.host.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let streamed = self.streamed.swap(false, Ordering::AcqRel);
@@ -846,6 +1249,10 @@ impl Inner {
                 tracing::info!("keeping BTstack: {} connected to the PC by itself on it", bt_host::addr_str(&device));
             } else if streamed && link_is_fresh(h.link_age(device)) {
                 tracing::info!("keeping BTstack: the link to {} just came up", bt_host::addr_str(&device));
+            } else if streamed && self.hid_links_up() {
+                // Untested on hardware: the stutter of issue #84 may come
+                // back on this kept stack (docs/hid-host-dev.md)
+                tracing::info!("keeping BTstack: a keyboard or mouse is connected");
             } else if streamed {
                 tracing::info!("restarting BTstack: a stream ran on it before");
                 self.shutdown_host();
@@ -887,6 +1294,8 @@ impl Inner {
         if let Some(h) = old {
             tracing::info!("stopping BTstack until the PC resumes");
             h.shutdown_lost();
+            self.hid_stack_stopped();
+            self.adapter_changed(false);
         }
     }
 
@@ -936,6 +1345,7 @@ impl Inner {
         let mut slot = self.host.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(h) = slot.take() {
             h.shutdown();
+            self.adapter_changed(false);
         }
         let mut c = self.host_config(false);
         if let (TransportConfig::Usb(sel), Some(id)) = (&mut c.transport, instance_id) {
@@ -958,6 +1368,8 @@ impl Inner {
             // free for the next stack
             h.shutdown();
             tracing::debug!("host shutdown: took {} ms", t.elapsed().as_millis());
+            self.hid_stack_stopped();
+            self.adapter_changed(false);
         }
     }
 
@@ -980,6 +1392,7 @@ impl Inner {
     /// settings when it changes)
     pub fn remember_volume(&self, addr: &str, volume: Option<u8>) {
         let Some(v) = volume else { return };
+        let _tx = self.settings_tx.enter();
         let mut s = self.settings.lock().unwrap_or_else(|e| e.into_inner());
         let key = addr.to_uppercase();
         if s.saved_volumes.get(&key) == Some(&(v as i32)) {
@@ -1067,10 +1480,58 @@ impl Inner {
             tracing::warn!("cannot save the LE Audio device: {e}");
         }
     }
+
+    /// The coordinated sets known: those learned (le_audio_sets.txt), those
+    /// of the running stack's CSIP and those kept with the bonds
+    pub fn known_le_sets(&self, host: Option<&BtHost>) -> crate::le_sets::KnownSets {
+        let dir = &self.opts.config_dir;
+        let mut sets = crate::le_sets::KnownSets::of(crate::le_sets::load(dir));
+        for members in bt_host::le_stored_sets(&crate::paths::pairing_dir(dir)) {
+            sets.add(members.iter().map(bt_host::addr_str), None);
+        }
+        for (id, members) in host.map(BtHost::le_known_sets).unwrap_or_default() {
+            sets.add(members.iter().map(bt_host::addr_str), Some(id));
+        }
+        sets
+    }
+
+    /// An LE Audio stream started: the coordinated set of its devices (its
+    /// key read on connecting) is kept with the saved device, so the other
+    /// earbud is never saved as a device of its own, and the core merges
+    /// saved entries of one set ([`ServiceEvent::LeSetLearned`]). `device`:
+    /// the address the session was asked for; `alone`: no other device was
+    /// asked for, so every device streamed came with it.
+    pub fn learn_le_set(&self, host: &BtHost, device: &[u8; 6], streamed: &[LeDeviceId], alone: bool) {
+        let addrs: Vec<[u8; 6]> = match alone {
+            true => host.le_devices().into_iter().filter(|d| streamed.contains(&d.id)).map(|d| d.addr.addr).collect(),
+            false => Vec::new(),
+        };
+        let mut members: Vec<String> = Vec::new();
+        for (_, set) in host.le_known_sets() {
+            if set.iter().any(|a| addrs.contains(a) || a == device) {
+                members.extend(set.iter().map(bt_host::addr_str));
+            }
+        }
+        if members.is_empty() {
+            return;
+        }
+        // Asked for under another address (an RPA before the bond): that
+        // one is the set's too
+        let asked = bt_host::addr_str(device);
+        if !members.iter().any(|m| m.eq_ignore_ascii_case(&asked)) {
+            members.push(asked);
+        }
+        match crate::le_sets::remember(&self.opts.config_dir, &members) {
+            Ok(true) => tracing::info!("LE Audio: coordinated set of {} members kept with the device", members.len()),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("LE Audio: cannot keep the coordinated set: {e}"),
+        }
+        self.send_event(ServiceEvent::LeSetLearned);
+    }
 }
 
 pub struct Service {
-    inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
     worker: Mutex<Option<JoinHandle<()>>>,
     /// Held while a session is stopped and the next one started: one start
     /// or stop at a time (issue #86: two codec switches in quick succession
@@ -1152,6 +1613,7 @@ impl Service {
         let inner = Arc::new(Inner {
             opts,
             settings: Mutex::new(settings),
+            settings_tx: SettingsTx::default(),
             events: Mutex::new(events),
             host: Mutex::new(None),
             stats: Arc::new(LinkStats::default()),
@@ -1168,8 +1630,12 @@ impl Service {
             voice_change: Mutex::new(None),
             voice_events: Mutex::new(Vec::new()),
             mic_test: Default::default(),
+            hid: Default::default(),
             mic_dsp: voice_link::MicDsp::new(),
             le_active: AtomicBool::new(false),
+            broadcast: AtomicBool::new(false),
+            host_adapter: Mutex::new(String::new()),
+            broadcast_adapter: Mutex::new(String::new()),
             scanning: AtomicBool::new(false),
             le_stream: Mutex::new(None),
             le_support: Mutex::new(None),
@@ -1177,6 +1643,7 @@ impl Service {
             waiting: AtomicBool::new(false),
             turned_off: AtomicBool::new(false),
             source_change: Mutex::new(None),
+            source_kept: Mutex::new(None),
             bitpool_change: Mutex::new(None),
             unlisted_keeps: Mutex::new(None),
         });
@@ -1215,6 +1682,11 @@ impl Service {
         pipeline::set_thread_priority_hook(|| pro_audio("encode thread"));
         hci_transport::set_acl_out_priority_hook(|| pro_audio("USB ACL writer"));
         bt_host::set_runloop_priority_hook(|| pro_audio("BTstack thread"));
+        // Keyboards and mice (experimental): devices added and not confirmed
+        // before the last exit are removed, then their stack runs from the
+        // start
+        inner.hid_remove_unconfirmed();
+        inner.hid_keep();
         Service {
             inner,
             worker: Mutex::new(None),
@@ -1256,13 +1728,26 @@ impl Service {
             settings.debug_mode
         );
         apply_dev_overrides(&settings);
-        let host = self.host();
-        if let Some(h) = &host {
-            h.set_media_keys(settings.media_keys);
-            h.set_afh_policy(self.inner.opts.afh.as_deref().unwrap_or(afh_policy(&settings)));
-        }
+        let media_keys = settings.media_keys;
+        let afh = self.inner.opts.afh.clone().unwrap_or_else(|| afh_policy(&settings).to_owned());
         let old = std::mem::replace(&mut *self.inner.settings.lock().unwrap_or_else(|e| e.into_inner()), settings);
         let new_le = self.inner.settings.lock().unwrap_or_else(|e| e.into_inner()).le_audio();
+        // A stack starting or stopping holds the slot, for up to tens of
+        // seconds with an adapter that does not answer: the settings are not
+        // kept waiting. A stack that starts reads them once it is up, and
+        // the next scan or connection checks LE Audio (ensure_host)
+        let host = match self.inner.host.try_lock() {
+            Ok(slot) => slot.clone(),
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().clone(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                tracing::debug!("settings applied: the stack is starting or stopping, it reads them when up");
+                None
+            }
+        };
+        if let Some(h) = &host {
+            h.set_media_keys(media_keys);
+            h.set_afh_policy(&afh);
+        }
         if old.le_audio() != new_le && host.is_some() && self.inner.le_active() != self.inner.le_wanted() {
             if self.is_running() || self.is_scanning() {
                 tracing::info!(
@@ -1277,6 +1762,23 @@ impl Service {
                 self.inner.shutdown_host();
             }
         }
+        self.hid_setting_changed(old.hid_host());
+    }
+
+    /// Service mode, after the one-time move put the user's files into the
+    /// folder (crate::service_data): the settings and the devices' codecs
+    /// read again, and an idle stack released so that the next one reads
+    /// the moved pairing keys and device lists. A stack in use (a stream,
+    /// a scan) is replaced at its next use. Returns the settings read.
+    pub fn reload_saved(&self) -> Settings {
+        let dir = self.inner.opts.config_dir.clone();
+        let settings = Settings::load(&dir);
+        *self.inner.codecs.lock().unwrap_or_else(|e| e.into_inner()) = crate::devices::load_codecs(&dir);
+        self.set_settings(settings.clone());
+        let idle = !self.is_running() && !self.is_scanning();
+        let released = self.reload_adapter(idle);
+        tracing::info!("service: the moved data read again (stack released now: {released})");
+        settings
     }
 
     /// HFP audio for every stack this service starts, so that headset mode
@@ -1323,6 +1825,8 @@ impl Service {
     /// Stops the stack, releasing the adapter (e.g. before its driver is
     /// changed); the next use starts a new one
     pub fn release_adapter(&self) {
+        // Keyboards and mice (experimental) do not take the adapter back
+        self.inner.hid.hold();
         self.forget_session();
         self.shutdown();
     }
@@ -1344,22 +1848,40 @@ impl Service {
         }
     }
 
-    /// Changes the source of the running A2DP stream: the link stays up.
-    /// False when none is streaming (it connects or reconnects, a start or
-    /// stop is under way, LE Audio has its own capture path): the caller
+    /// Changes the source of the running A2DP stream or Auracast broadcast:
+    /// the link (the BIGs) stays up. False when none is streaming (it
+    /// connects or reconnects, a start or stop is under way, an LE Audio
+    /// unicast stream, application capture for a broadcast): the caller
     /// starts it again instead.
     pub fn change_source(&self, source: SourceRequest) -> bool {
         let Ok(_control) = self.control.try_lock() else { return false };
         if !self.is_running() || self.state() != StreamState::Streaming {
             return false;
         }
+        self.follow_kept_source();
         match self.last_request.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             Some(req) if req.le.is_none() => req.source = source.clone(),
+            Some(req)
+                if req.le.as_ref().is_some_and(|l| l.broadcast.is_some())
+                    && !matches!(source, SourceRequest::Application { .. }) =>
+            {
+                req.source = source.clone()
+            }
             _ => return false,
         }
         *self.inner.source_change.lock().unwrap_or_else(|e| e.into_inner()) = Some(source);
         self.inner.tick.1.notify_all();
         true
+    }
+
+    /// A change of source the session could not make
+    /// ([`Inner::keep_source`]): the request names the source that plays
+    fn follow_kept_source(&self) {
+        let kept = self.inner.source_kept.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let (Some(source), Some(req)) = (kept, self.last_request.lock().unwrap_or_else(|e| e.into_inner()).as_mut())
+        {
+            req.source = source;
+        }
     }
 
     /// Headset mode off, on or auto, its output and the best call codec
@@ -1517,6 +2039,17 @@ impl Service {
             if !crate::devices::load(dir).iter().any(|d| d.address.eq_ignore_ascii_case(address)) {
                 self.forget_link_key_only(addr);
             }
+            // Its LE bond too: nothing reconnects it, and adding it again
+            // pairs anew. A running stack with LE holds the bonds and
+            // deletes them itself.
+            if !self.host().is_some_and(|h| h.forget_le_bond(addr)) {
+                let pairing = crate::paths::pairing_dir(dir);
+                match bt_host::le_bond_file::forget(&crate::paths::le_bonds_file(dir), &addr) {
+                    Ok(n) => tracing::debug!("device forgotten: {n} LE bond(s) removed from the file"),
+                    Err(e) => tracing::warn!("device forgotten: the LE bonds file cannot be changed ({})", e.kind()),
+                }
+                bt_host::le_forget_stored_sirk(&pairing, addr);
+            }
             return;
         }
         {
@@ -1535,7 +2068,7 @@ impl Service {
 
     /// Drops `addr`'s link key alone (its LE keys stay with its LE Audio
     /// entry's own bond)
-    fn forget_link_key_only(&self, addr: [u8; 6]) {
+    pub(crate) fn forget_link_key_only(&self, addr: [u8; 6]) {
         if !self.host().is_some_and(|h| h.forget_link_key_only(addr)) {
             bt_host::link_keys::forget(&crate::paths::link_keys_file(&self.inner.opts.config_dir), &addr);
         }
@@ -1593,6 +2126,7 @@ impl Service {
     /// Disconnect, and not when the headphones were turned off: a session
     /// that waits for them just ends (issue #86).
     pub fn restart_adapter(&self) -> Option<StreamRequest> {
+        self.follow_kept_source();
         let last = self.last_request.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let again = reconnect_after_restart(
             self.is_running() && self.inner.stop_requested(),
@@ -1645,6 +2179,11 @@ impl Service {
         self.inner.codecs.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// The coordinated sets known ([`Inner::known_le_sets`])
+    pub fn known_le_sets(&self) -> crate::le_sets::KnownSets {
+        self.inner.known_le_sets(self.host().as_deref())
+    }
+
     /// Forgets what a device offered, and that it was asked for Hi-Res: its
     /// next connection reads and asks again (issue #237). False: nothing kept.
     pub fn forget_device_codecs(&self, address: &str) -> bool {
@@ -1655,6 +2194,16 @@ impl Service {
         tracing::info!("device {address}: what it offered forgotten");
         self.inner.save_codecs(&known);
         true
+    }
+
+    /// Held while the saved settings change: read them ([`Service::settings`]),
+    /// change the copy, save it and apply it ([`Service::set_settings`]) under
+    /// one guard. Without it, a copy read before another change is saved
+    /// after it and takes that change back (the user's settings moved into
+    /// the service's folder were replaced by the defaults this way). The
+    /// same thread may take it again.
+    pub fn settings_tx(&self) -> SettingsTxGuard<'_> {
+        self.inner.settings_tx.enter()
     }
 
     pub fn settings(&self) -> Settings {
@@ -1841,6 +2390,9 @@ impl Service {
         self.inner.notify(StreamState::Idle, Msg::new("status.initializing_scan"));
         let host = self.inner.ensure_host()?;
         let mut le_scan = false;
+        // Keyboards and mice (experimental): LE ones are listed too, also
+        // without LE Audio (the stack runs LE for them)
+        let hid_le = self.inner.hid_wanted() && host.hid_enabled();
         if self.inner.le_active() {
             let until = Instant::now() + LE_SCAN_READY_WAIT;
             while !host.le_ready() && Instant::now() < until {
@@ -1850,21 +2402,32 @@ impl Service {
             if !le_scan {
                 tracing::warn!("LE Audio not ready, LE scan skipped");
             }
+        } else if hid_le {
+            let until = Instant::now() + LE_SCAN_READY_WAIT;
+            while !host.hid_le_ready() && !host.hid_le_unavailable() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            le_scan = host.hid_le_ready() && host.le_scan_start();
+            if !le_scan {
+                tracing::info!("keyboards and mice: no LE scan (the adapter has no LE, or it is not ready)");
+            }
         }
+        // LE Audio's entries only with LE Audio on
+        let audio_le = le_scan && self.inner.le_active();
         let le_started = Instant::now();
-        let (saved_le, own) = if le_scan {
+        let (saved_le, own, sets) = if audio_le {
             let own: Vec<String> = win_sys::bt_radios::radios().into_iter().filter_map(|r| r.address).collect();
-            (crate::devices::load_le(&self.inner.opts.config_dir), own)
+            (crate::devices::load_le(&self.inner.opts.config_dir), own, self.inner.known_le_sets(Some(&host)))
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Default::default())
         };
         let saved = crate::devices::load(&self.inner.opts.config_dir);
         self.inner.notify(StreamState::Idle, Msg::new("status.scanning_devices"));
         let classic = host.scan_with(seconds, &mut |found| {
             let mut list: Vec<ScannedDevice> = found.iter().map(ScannedDevice::classic).collect();
-            if le_scan {
-                let results = host.le_scan_results();
-                let mut le = le_scan_entries(&results, &saved_le, &own).0;
+            let results = if le_scan { host.le_scan_results() } else { Vec::new() };
+            if audio_le {
+                let mut le = le_scan_entries(&results, &saved_le, &own, &sets).0;
                 let classic: Vec<String> =
                     list.iter().map(|d| d.address.clone()).chain(saved.iter().map(|d| d.address.clone())).collect();
                 let drop = classic_appearance_only(&results, &classic);
@@ -1877,6 +2440,9 @@ impl Service {
                     .collect();
                 fill_le_names(&mut le, &known);
                 list.extend(le);
+            }
+            if hid_le {
+                list.extend(hid_le_entries(&results));
             }
             // A device is listed once its name is known: most follow within
             // seconds (name request, scan response), and "Unknown" turning
@@ -1907,6 +2473,16 @@ impl Service {
                 }
             }
             let results = host.le_scan_stop();
+            let hid = if hid_le { hid_le_entries(&results) } else { Vec::new() };
+            if hid_le {
+                tracing::info!("LE scan: {} keyboard(s) or mice", hid.len());
+            }
+            if !audio_le {
+                le_found = hid.len();
+                list.extend(hid);
+                self.inner.notify(StreamState::Idle, Msg::with("status.scan_complete", &[&(classic.len() + le_found)]));
+                return Ok(list);
+            }
             for r in results.iter().filter(|r| r.le_audio) {
                 tracing::debug!(
                     "le scan: advertiser {} {} appearance 0x{:04X}, connectable {}, UUIDs {:04X?}",
@@ -1917,7 +2493,7 @@ impl Service {
                     r.uuids16
                 );
             }
-            let (mut entries, found) = le_scan_entries(&results, &saved_le, &own);
+            let (mut entries, found) = le_scan_entries(&results, &saved_le, &own, &sets);
             let classic: Vec<String> =
                 list.iter().map(|d| d.address.clone()).chain(saved.iter().map(|d| d.address.clone())).collect();
             let drop = classic_appearance_only(&results, &classic);
@@ -1968,8 +2544,9 @@ impl Service {
                     e.le_audio_set
                 );
             }
-            le_found = found;
+            le_found = found + hid.len();
             list.extend(entries);
+            list.extend(hid);
             save_twins(&self.inner.opts.config_dir, &list);
         }
         self.inner.notify(StreamState::Idle, Msg::with("status.scan_complete", &[&(classic.len() + le_found)]));
@@ -2004,6 +2581,7 @@ impl Service {
 
     /// Stops streaming and the stack (the adapter is released)
     pub fn shutdown(&self) {
+        self.inner.hid.hold();
         self.stop_streaming();
         self.inner.shutdown_host();
     }
@@ -2051,6 +2629,28 @@ fn link_is_fresh(age: Option<Duration>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_thread_at_a_time_changes_the_saved_settings() {
+        let tx = Arc::new(SettingsTx::default());
+        let outer = tx.enter();
+        // The same thread again: no deadlock
+        let inner = tx.enter();
+        let (t2, entered) = (tx.clone(), Arc::new(AtomicBool::new(false)));
+        let seen = entered.clone();
+        let other = std::thread::spawn(move || {
+            let _g = t2.enter();
+            seen.store(true, Ordering::Release);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!entered.load(Ordering::Acquire), "another thread waits");
+        drop(inner);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!entered.load(Ordering::Acquire), "still held once");
+        drop(outer);
+        other.join().unwrap();
+        assert!(entered.load(Ordering::Acquire));
+    }
 
     #[test]
     fn afh_blend_runs_only_in_developer_mode() {
@@ -2101,6 +2701,7 @@ mod tests {
             audio: true,
             le_audio,
             le_audio_set: false,
+            hid_le: None,
         };
         let list =
             [found("AA:BB:CC:DD:EE:01", false), found("aa:bb:cc:dd:ee:01", true), found("AA:BB:CC:DD:EE:02", true)];
@@ -2126,6 +2727,33 @@ mod tests {
         };
         let (tx, _rx) = std::sync::mpsc::channel();
         Service::new(opts, tx)
+    }
+
+    #[test]
+    fn a_broadcast_set_up_again_goes_on_the_adapter_it_ran_on() {
+        const OPENED: &str = r"USB\VID_1234&PID_5678\NOT-THERE";
+        const AURACAST: &str = r"USB\VID_1234&PID_5678\NOT-THERE-EITHER";
+        let s = service();
+        let inner = &s.inner;
+        // Nothing chosen, none opened yet: automatic, nothing to wait for
+        assert_eq!(inner.broadcast_adapter(), "");
+        assert!(inner.wanted_adapter_present());
+        assert!(!inner.auracast_adapter_missing());
+        let guard = inner.broadcast_wanted();
+        // The adapter the stack opened is the one to wait for
+        *inner.broadcast_adapter.lock().unwrap() = OPENED.into();
+        assert_eq!(inner.broadcast_adapter(), OPENED);
+        assert!(!inner.wanted_adapter_present());
+        // The Auracast adapter comes first, in developer mode only
+        inner.settings.lock().unwrap().auracast_adapter_id = AURACAST.into();
+        assert!(!inner.auracast_adapter_missing());
+        assert_eq!(inner.broadcast_adapter(), OPENED);
+        inner.settings.lock().unwrap().debug_mode = true;
+        assert!(inner.auracast_adapter_missing());
+        assert_eq!(inner.broadcast_adapter(), AURACAST);
+        // The session ended: the next broadcast starts anew
+        drop(guard);
+        assert_eq!(*inner.broadcast_adapter.lock().unwrap(), "");
     }
 
     #[test]
@@ -2318,6 +2946,18 @@ mod tests {
         *s.last_request.lock().unwrap() = Some(StreamRequest { le: Some(le), ..request() });
         assert!(!s.change_source(tone()));
         assert_eq!(s.inner.take_source_change(), None);
+        // An Auracast broadcast: in place too, but not to an application
+        let b = bt_host::LeRequest { broadcast: Some(bt_host::LeBroadcast::default()), ..Default::default() };
+        *s.last_request.lock().unwrap() = Some(StreamRequest { le: Some(b), ..request() });
+        assert!(!s.change_source(SourceRequest::Application { exe: "a.exe".into() }));
+        assert!(s.change_source(tone()));
+        assert_eq!(s.inner.take_source_change(), Some(tone()));
+        // The broadcast could not capture it and kept the old source: so
+        // does the request
+        s.inner.keep_source(SourceRequest::SystemLoopback);
+        s.follow_kept_source();
+        let kept = s.last_request.lock().unwrap().as_ref().map(|r| r.source.clone());
+        assert_eq!(kept, Some(SourceRequest::SystemLoopback));
         // A start or stop under way
         *s.last_request.lock().unwrap() = Some(request());
         let control = s.control.lock().unwrap();
@@ -2457,6 +3097,49 @@ mod tests {
     }
 
     #[test]
+    fn keyboards_and_mice_are_listed_apart_and_never_saved_as_audio() {
+        let hid = |addr: &str, uuids: Vec<u16>, appearance: u16, connectable| LeScanResult {
+            uuids16: uuids,
+            appearance,
+            connectable,
+            le_audio: false,
+            ..le(addr, "Keys", None)
+        };
+        let rpa = bt_host::LeAddr { addr: [0x5A, 1, 2, 3, 4, 5], addr_type: 1 };
+        let identity = bt_host::LeAddr { addr: [0xC0, 1, 2, 3, 4, 5], addr_type: 1 };
+        let results = [
+            hid("00:A2:D0:00:00:05", vec![0x1812], 0, true),
+            // A mouse by its appearance only (0x03C2)
+            hid("00:A2:D0:00:00:06", vec![], 0x03C2, true),
+            // Not connectable, or neither: not listed
+            hid("00:A2:D0:00:00:07", vec![0x1812], 0x03C1, false),
+            hid("00:A2:D0:00:00:08", vec![0x180F], 0x0941, true),
+            // A bonded one under an RPA: by its identity
+            LeScanResult { addr: rpa, identity: Some(identity), ..hid("00:00:00:00:00:00", vec![0x1812], 0, true) },
+        ];
+        let list = hid_le_entries(&results);
+        let listed: Vec<(&str, Option<u8>, bool, bool)> =
+            list.iter().map(|e| (e.address.as_str(), e.hid_le, e.audio, e.le_audio)).collect();
+        assert_eq!(
+            listed,
+            [
+                ("00:A2:D0:00:00:05", Some(0), false, false),
+                ("00:A2:D0:00:00:06", Some(0), false, false),
+                ("C0:01:02:03:04:05", Some(1), false, false)
+            ]
+        );
+        // An LE Audio device saved under the same address: the keyboard
+        // entry is not taken as its classic side
+        let dir = std::env::temp_dir().join(format!("bluecaster-hid-twins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(crate::paths::devices_dir(&dir)).unwrap();
+        crate::devices::save_le(&dir, "00:A2:D0:00:00:05", "Buds").unwrap();
+        assert_eq!(save_twins(&dir, &list), 0);
+        assert!(crate::devices::load(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn le_scan_lists_one_member_per_new_set() {
         let results = [
             le("00:A2:D0:00:00:12", "Buds L", Some(0)),
@@ -2466,7 +3149,7 @@ mod tests {
             le("00:A2:D0:00:00:20", "Speaker 2", None),
             le("00:A2:D0:00:00:40", "Other L", Some(1)),
         ];
-        let (list, found) = le_scan_entries(&results, &[], &[]);
+        let (list, found) = le_scan_entries(&results, &[], &[], &no_sets());
         let got: Vec<_> = list.iter().map(|d| (d.address.as_str(), d.name.as_str(), d.le_audio_set)).collect();
         assert_eq!(
             got,
@@ -2480,23 +3163,98 @@ mod tests {
         assert!(list.iter().all(|d| d.le_audio && d.audio && d.class_of_device == 0));
     }
 
+    fn no_sets() -> crate::le_sets::KnownSets {
+        crate::le_sets::KnownSets::default()
+    }
+
+    /// An advertiser of a set no known SIRK resolves (never bonded)
+    fn unbonded(addr: &str, name: &str) -> LeScanResult {
+        LeScanResult { rsi: Some([9, 9, 9, 9, 9, 9]), appearance: 0x0941, ..le(addr, name, None) }
+    }
+
     #[test]
-    fn le_scan_keeps_saved_members() {
-        // The right earbud is saved: it is listed, and the left one still
-        // stands for the set
+    fn le_scan_lists_a_saved_set_once() {
+        // The right earbud is saved: the left one is the same device
         let saved = [SavedDevice { address: "00:A2:D0:00:00:13".into(), name: "R".into(), le_audio: true }];
-        let results = [le("00:A2:D0:00:00:13", "Buds R", Some(0)), le("00:A2:D0:00:00:12", "Buds L", Some(0))];
-        let (list, _) = le_scan_entries(&results, &saved, &[]);
-        assert_eq!(list.len(), 2);
-        // A third member is a duplicate of the listed set
+        let results = [le("00:A2:D0:00:00:12", "Buds L", Some(0)), le("00:A2:D0:00:00:13", "Buds R", Some(0))];
+        let (list, _) = le_scan_entries(&results, &saved, &[], &no_sets());
+        let got: Vec<_> = list.iter().map(|d| d.address.as_str()).collect();
+        assert_eq!(got, ["00:A2:D0:00:00:13"]);
+        // A third member too
         let results = [
             le("00:A2:D0:00:00:12", "Buds L", Some(0)),
             le("00:A2:D0:00:00:14", "Buds C", Some(0)),
             le("00:A2:D0:00:00:13", "Buds R", Some(0)),
         ];
-        let (list, _) = le_scan_entries(&results, &saved, &[]);
+        let (list, _) = le_scan_entries(&results, &saved, &[], &no_sets());
         let got: Vec<_> = list.iter().map(|d| d.address.as_str()).collect();
-        assert_eq!(got, ["00:A2:D0:00:00:12", "00:A2:D0:00:00:13"]);
+        assert_eq!(got, ["00:A2:D0:00:00:13"]);
+    }
+
+    #[test]
+    fn le_scan_lists_a_learned_sets_member_as_the_saved_device() {
+        let saved = [SavedDevice { address: "00:A2:D0:00:00:13".into(), name: "Buds".into(), le_audio: true }];
+        let mut sets = no_sets();
+        sets.add(["00:A2:D0:00:00:12".to_string(), "00:A2:D0:00:00:13".into()], None);
+        // Only the other earbud in range, its RSI not resolved: still the
+        // saved device, found nearby
+        let (list, _) = le_scan_entries(&[unbonded("00:A2:D0:00:00:12", "Buds")], &saved, &[], &sets);
+        let got: Vec<_> = list.iter().map(|d| (d.address.as_str(), d.le_audio_set)).collect();
+        assert_eq!(got, [("00:A2:D0:00:00:13", true)]);
+        // A member the stack resolves (set 3) under an address not learned
+        sets.add(["00:A2:D0:00:00:13".to_string()], Some(3));
+        let (list, _) = le_scan_entries(&[le("00:A2:D0:00:00:77", "Buds", Some(3))], &saved, &[], &sets);
+        let got: Vec<_> = list.iter().map(|d| d.address.as_str()).collect();
+        assert_eq!(got, ["00:A2:D0:00:00:13"]);
+        // Nothing of the set saved: listed as found
+        let (list, _) = le_scan_entries(&[unbonded("00:A2:D0:00:00:12", "Buds")], &[], &[], &sets);
+        assert_eq!(list[0].address, "00:A2:D0:00:00:12");
+    }
+
+    #[test]
+    fn a_never_bonded_pair_is_listed_once() {
+        let results = [
+            unbonded("00:A2:D0:00:00:22", "Buds"),
+            le("00:A2:D0:00:00:30", "Speaker", None),
+            unbonded("00:A2:D0:00:00:21", "Buds"),
+        ];
+        let (list, found) = le_scan_entries(&results, &[], &[], &no_sets());
+        let got: Vec<_> = list.iter().map(|d| (d.address.as_str(), d.le_audio_set)).collect();
+        assert_eq!(got, [("00:A2:D0:00:00:30", false), ("00:A2:D0:00:00:21", true)]);
+        assert_eq!(found, 3);
+        // One of them saved (added before connecting): the other is it
+        let saved = [SavedDevice { address: "00:A2:D0:00:00:22".into(), name: "Buds".into(), le_audio: true }];
+        let (list, _) = le_scan_entries(&results, &saved, &[], &no_sets());
+        let got: Vec<_> = list.iter().map(|d| d.address.as_str()).collect();
+        assert_eq!(got, ["00:A2:D0:00:00:22", "00:A2:D0:00:00:30"]);
+    }
+
+    #[test]
+    fn unbonded_advertisers_merge_only_when_nothing_else_fits() {
+        let listed = |results: &[LeScanResult]| le_scan_entries(results, &[], &[], &no_sets()).0.len();
+        // Other products of one series
+        assert_eq!(listed(&[unbonded("00:A2:D0:00:00:21", "Buds NC"), unbonded("00:A2:D0:00:00:22", "Buds SO")]), 2);
+        // Another appearance
+        let speaker = LeScanResult { appearance: 0x0841, ..unbonded("00:A2:D0:00:00:22", "Buds") };
+        assert_eq!(listed(&[unbonded("00:A2:D0:00:00:21", "Buds"), speaker]), 2);
+        // No name: nothing to compare
+        assert_eq!(listed(&[unbonded("00:A2:D0:00:00:21", ""), unbonded("00:A2:D0:00:00:22", "")]), 2);
+        // No RSI: two devices of one model, not a set
+        assert_eq!(listed(&[le("00:A2:D0:00:00:21", "Buds", None), le("00:A2:D0:00:00:22", "Buds", None)]), 2);
+        // Two pairs of one model (or a pair and a lone earbud): which two
+        // belong together is not known, all listed
+        let four: Vec<_> = (1..=4).map(|i| unbonded(&format!("00:A2:D0:00:00:2{i}"), "Buds")).collect();
+        assert_eq!(listed(&four), 4);
+        assert_eq!(listed(&four[..3]), 3);
+        // A pair already known (resolved) beside a new one of the model:
+        // each listed once
+        let results = [
+            le("00:A2:D0:00:00:11", "Buds", Some(0)),
+            le("00:A2:D0:00:00:12", "Buds", Some(0)),
+            unbonded("00:A2:D0:00:00:21", "Buds"),
+            unbonded("00:A2:D0:00:00:22", "Buds"),
+        ];
+        assert_eq!(listed(&results), 2);
     }
 
     #[test]
@@ -2510,7 +3268,7 @@ mod tests {
             appearing("00:A2:D0:00:00:54", "Earbuds", 0x0941),
             le("00:A2:D0:00:00:55", "Speaker", None),
         ];
-        let (list, found) = le_scan_entries(&results, &[], &["00:a2:d0:00:00:50".into()]);
+        let (list, found) = le_scan_entries(&results, &[], &["00:a2:d0:00:00:50".into()], &no_sets());
         let got: Vec<_> = list.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(got, ["Earbuds", "Speaker"]);
         assert_eq!(found, 2);
@@ -2538,15 +3296,19 @@ mod tests {
         };
         let c = ScannedDevice::classic(&classic);
         assert!(!c.le_audio && c.audio);
-        let (le_list, _) = le_scan_entries(&[le("00:A2:D0:00:00:12", "Buds", None)], &[], &[]);
+        let (le_list, _) = le_scan_entries(&[le("00:A2:D0:00:00:12", "Buds", None)], &[], &[], &no_sets());
         assert_eq!(le_list[0].address, c.address);
         assert!(le_list[0].le_audio);
     }
 
     #[test]
     fn an_unnamed_le_entry_takes_its_classic_name() {
-        let (mut list, _) =
-            le_scan_entries(&[le("00:A2:D0:00:00:12", "", None), le("00:A2:D0:00:00:13", "", None)], &[], &[]);
+        let (mut list, _) = le_scan_entries(
+            &[le("00:A2:D0:00:00:12", "", None), le("00:A2:D0:00:00:13", "", None)],
+            &[],
+            &[],
+            &no_sets(),
+        );
         let known = vec![("00:a2:d0:00:00:12".to_string(), "Buds".to_string())];
         fill_le_names(&mut list, &known);
         assert_eq!(list[0].name, "Buds");
@@ -2559,7 +3321,8 @@ mod tests {
         let identity = bt_host::LeAddr { addr: bt_host::parse_addr("00:A2:D0:00:00:12").unwrap(), addr_type: 0 };
         let rpa = |a| LeScanResult { identity: Some(identity), ..le(a, "", None) };
         // Two random addresses of the same earbuds, one entry
-        let (mut list, found) = le_scan_entries(&[rpa("4B:01:02:03:04:05"), rpa("5C:01:02:03:04:05")], &[], &[]);
+        let (mut list, found) =
+            le_scan_entries(&[rpa("4B:01:02:03:04:05"), rpa("5C:01:02:03:04:05")], &[], &[], &no_sets());
         assert_eq!(found, 2);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].address, "00:A2:D0:00:00:12");
@@ -2568,7 +3331,7 @@ mod tests {
         assert_eq!(list[0].name, "Buds");
         // Saved as LE Audio: it is the saved entry, not a new set member
         let saved = [SavedDevice { address: "00:A2:D0:00:00:12".into(), name: "Buds".into(), le_audio: true }];
-        let (list, _) = le_scan_entries(&[rpa("4B:01:02:03:04:05")], &saved, &[]);
+        let (list, _) = le_scan_entries(&[rpa("4B:01:02:03:04:05")], &saved, &[], &no_sets());
         assert_eq!(list[0].address, saved[0].address);
     }
 

@@ -12,10 +12,11 @@
 //! by the endpoint's mute), so mute is never read nor written here
 //! (mute_output.rs mutes it for the session).
 //!
-//! The Windows side is [`EndpointVolume`](audio_capture::EndpointVolume),
-//! which is `!Send` and bound to one device: a [`VolumeSyncer`] lives on the
-//! session thread and reopens the endpoint when the default output device
-//! changes (device choice [`EndpointChoice::Default`]). Both sides are traits
+//! The Windows side is [`OutputVolume`](session_host::volume::OutputVolume)
+//! (in this process `!Send`, or watched by the session agent), bound to one
+//! device: a [`VolumeSyncer`] lives on the session thread and reopens the
+//! endpoint when the default output device changes (device choice
+//! [`EndpointChoice::Default`]). Both sides are traits
 //! ([`Headphones`], [`EndpointProvider`]) so the logic is tested with fakes.
 //!
 //! LE Audio (experimental): the headphone side is the LE core's volume (the
@@ -91,6 +92,12 @@ pub trait Endpoint {
     fn set_muted(&self, _muted: bool) -> bool {
         false
     }
+    /// Whether a mute set here is kept by the endpoint's side itself (the
+    /// session agent mutes it again after Windows' keys and reports them,
+    /// [`session_host::volume::on_mute_key`]); false: the caller watches
+    fn keeps_mute(&self) -> bool {
+        false
+    }
 }
 
 /// Opens [`Endpoint`]s and tells which device is the default output
@@ -102,7 +109,9 @@ pub trait EndpointProvider {
     fn open(&self, device_id: &str) -> Result<Self::Endpoint, String>;
 }
 
-/// The real endpoints, through `audio-capture` (COM on the calling thread)
+/// The real endpoints, through the session host: in this process (COM on
+/// the calling thread) or in the session agent, which watches them and
+/// reports changes, so reading them on every tick asks nothing
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowsEndpoints;
 
@@ -128,15 +137,41 @@ impl Endpoint for audio_capture::EndpointVolume {
     }
 }
 
-impl EndpointProvider for WindowsEndpoints {
-    type Endpoint = audio_capture::EndpointVolume;
-
-    fn default_device(&self) -> Option<String> {
-        audio_capture::default_render_device()
+impl Endpoint for session_host::volume::OutputVolume {
+    fn device_id(&self) -> &str {
+        session_host::volume::OutputVolume::device_id(self)
     }
 
-    fn open(&self, device_id: &str) -> Result<audio_capture::EndpointVolume, String> {
-        audio_capture::EndpointVolume::open(Some(device_id)).map_err(|e| e.to_string())
+    fn volume(&self) -> Option<f32> {
+        session_host::volume::OutputVolume::volume(self)
+    }
+
+    fn set_volume(&self, scalar: f32) -> bool {
+        session_host::volume::OutputVolume::set_volume(self, scalar)
+    }
+
+    fn muted(&self) -> Option<bool> {
+        session_host::volume::OutputVolume::muted(self)
+    }
+
+    fn set_muted(&self, muted: bool) -> bool {
+        session_host::volume::OutputVolume::set_muted(self, muted)
+    }
+
+    fn keeps_mute(&self) -> bool {
+        session_host::volume::OutputVolume::keeps_mute(self)
+    }
+}
+
+impl EndpointProvider for WindowsEndpoints {
+    type Endpoint = session_host::volume::OutputVolume;
+
+    fn default_device(&self) -> Option<String> {
+        session_host::volume::default_output()
+    }
+
+    fn open(&self, device_id: &str) -> Result<session_host::volume::OutputVolume, String> {
+        session_host::volume::open_output_volume(device_id)
     }
 }
 

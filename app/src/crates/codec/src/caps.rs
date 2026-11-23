@@ -82,6 +82,8 @@ const LHDCV5_VERSION_1: u8 = 0x01;
 const LHDCV5_VERSION_MASK: u8 = 0x0F;
 const LHDCV5_FRAME_5MS: u8 = 0x10;
 const LHDCV5_CAPS_P8: u8 = LHDCV5_VERSION_1 | LHDCV5_FRAME_5MS;
+/// P9[6] Low Latency (A2DP_LHDCV5_FEATURE_LL)
+const LHDCV5_FEATURE_LL: u8 = 0x40;
 
 // Opus (Android a2dp_vendor_opus_constants.h; PipeWire OPUS_G_*): one byte,
 //   bits 2..0 channel mode 0x01 mono 0x02 stereo 0x04 dual mono,
@@ -923,6 +925,17 @@ impl RemoteCaps {
         self.lhdcv5_info[7] & LHDCV5_BITRATE_LIMITS_MASK
     }
 
+    /// The sink lists LHDC V5 low latency (P9[6])
+    pub fn lhdcv5_lists_low_latency(&self) -> bool {
+        self.lhdcv5_info[9] & LHDCV5_FEATURE_LL != 0
+    }
+
+    /// LHDC V5 low latency goes into the configuration: asked for and
+    /// listed by the sink
+    pub fn lhdcv5_low_latency(&self, asks: Asks) -> bool {
+        asks.lhdcv5_low_latency && self.lhdcv5_lists_low_latency()
+    }
+
     /// The sample rates the sink lists for `kind`, lowest first, as the
     /// codec settings offer them (issue #86); empty when it said none.
     /// aptX Adaptive lists 96 kHz only when the sink can take it
@@ -1328,23 +1341,25 @@ impl RemoteCaps {
         bits_per_sample: u8,
         vbr: bool,
     ) -> Result<Configuration, ConfigError> {
-        self.configuration_with(kind, sample_rate, channels, bits_per_sample, vbr, sbc::SbcParams::default())
+        let asks = Asks { vbr, ..Asks::default() };
+        self.configuration_with(kind, sample_rate, channels, bits_per_sample, asks, sbc::SbcParams::default())
     }
 
-    /// [`Self::configuration_vbr`] with the SBC setup a profile asks for
-    /// (SBC, SBC XQ): what the sink does not list falls back to the default,
-    /// as [`Self::sbc_params`] (the encoder takes the same)
+    /// [`Self::configuration_vbr`] with what a profile asks for: the
+    /// optional features of [`Asks`], and the SBC setup (SBC, SBC XQ). What
+    /// the sink does not list falls back to the default, as
+    /// [`Self::sbc_params`] (the encoder takes the same)
     pub fn configuration_with(
         &self,
         kind: CodecKind,
         sample_rate: u32,
         channels: u32,
         bits_per_sample: u8,
-        vbr: bool,
+        asks: Asks,
         sbc: sbc::SbcParams,
     ) -> Result<Configuration, ConfigError> {
         tracing::debug!(
-            "caps: {kind} configuration for {sample_rate} Hz, {channels} ch, {bits_per_sample} bit, vbr {vbr}, {sbc:?}"
+            "caps: {kind} configuration for {sample_rate} Hz, {channels} ch, {bits_per_sample} bit, {asks:?}, {sbc:?}"
         );
         let Some(sep) = self.sep(kind) else {
             return Err(ConfigError::NotOffered(kind));
@@ -1405,7 +1420,7 @@ impl RemoteCaps {
                     sampling_frequency: sample_rate,
                     channels: channels as u8,
                     bit_rate: if crate::dev::overrides().aac_config_bitrate0 { 0 } else { self.aac_max_bitrate() },
-                    vbr: vbr && self.aac_vbr(),
+                    vbr: asks.vbr && self.aac_vbr(),
                 }
             }
             CodecKind::Ldac => {
@@ -1490,6 +1505,12 @@ impl RemoteCaps {
                 }
                 let mut info = vendor_header(LHDCV5_VENDOR_ID, LHDCV5_CODEC_ID);
                 info.extend_from_slice(&[freq, bits | self.lhdcv5_bitrate_limits(), LHDCV5_CAPS_P8]);
+                // P9[6] Low Latency, as Android sets it when both sides list
+                // it and the profile asks for it
+                if self.lhdcv5_low_latency(asks) {
+                    info.push(LHDCV5_FEATURE_LL);
+                    tracing::info!("LHDC V5: asking for low latency (P9 0x{LHDCV5_FEATURE_LL:02x})");
+                }
                 info.resize(LHDCV5_INFO_LEN, 0);
                 ConfigRequest::Vendor(info)
             }
@@ -1592,6 +1613,16 @@ fn aptx_freq_bits(kind: CodecKind, remote_caps: u8, sample_rate: u32) -> Result<
         return Err(ConfigError::SampleRate(kind, sample_rate));
     }
     Ok(freq)
+}
+
+/// The optional features a profile asks of a configuration, each taken only
+/// where the sink lists it
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Asks {
+    /// AAC's variable bit rate
+    pub vbr: bool,
+    /// LHDC V5's low latency (P9[6]); the encoder then runs every 10 ms
+    pub lhdcv5_low_latency: bool,
 }
 
 /// SET_CONFIGURATION of a stream
@@ -1714,6 +1745,27 @@ mod tests {
         }
     }
 
+    /// Issue #543: P9[6] goes into the configuration only when the profile
+    /// asks for it and the sink lists it
+    #[test]
+    fn lhdcv5_low_latency_only_when_asked_and_listed() {
+        let mut caps = RemoteCaps { lhdcv5: Some(RemoteSep { seid: 4 }), ..Default::default() };
+        // Realme Buds Air 8 Pro's codec information
+        caps.lhdcv5_info = [0x3A, 0x05, 0x00, 0x00, 0x35, 0x4C, 0x35, 0x06, 0x11, 0xF7, 0x80];
+        let p9 = |c: &RemoteCaps, ll: bool| {
+            let asks = Asks { lhdcv5_low_latency: ll, ..Asks::default() };
+            match c.configuration_with(CodecKind::LhdcV5, 48000, 2, 24, asks, Default::default()).unwrap().request {
+                ConfigRequest::Vendor(info) => info[9],
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(p9(&caps, true), LHDCV5_FEATURE_LL);
+        assert_eq!(p9(&caps, false), 0);
+        caps.lhdcv5_info[9] &= !LHDCV5_FEATURE_LL;
+        assert!(!caps.lhdcv5_low_latency(Asks { lhdcv5_low_latency: true, ..Asks::default() }));
+        assert_eq!(p9(&caps, true), 0, "not listed: not asked");
+    }
+
     #[test]
     fn unlisted_takes_every_setting_of_the_codec_and_leaves_the_others() {
         // LHDC V5 at 48 kHz, 16-bit, at most 400 kbps; AAC 44.1 kHz at 128 kbps
@@ -1735,7 +1787,7 @@ mod tests {
         assert_eq!(lhdc.listed_sample_rates(CodecKind::LhdcV5), vec![44100, 48000, 96000, 192000]);
         assert_eq!(lhdc.listed_bit_depths(CodecKind::LhdcV5), vec![16, 24]);
         assert_eq!(lhdc.listed_max_bitrate(CodecKind::LhdcV5), 0);
-        assert!(lhdc.configuration_with(CodecKind::LhdcV5, 96000, 2, 24, false, Default::default()).is_ok());
+        assert!(lhdc.configuration_with(CodecKind::LhdcV5, 96000, 2, 24, Asks::default(), Default::default()).is_ok());
         // The other codecs as listed
         assert_eq!(lhdc.aac_caps, caps.aac_caps);
         assert_eq!(lhdc.sbc_caps, caps.sbc_caps);
@@ -1755,11 +1807,17 @@ mod tests {
     fn sbc_xq_goes_up_to_53_when_not_held_to_the_list() {
         let mut caps = RemoteCaps::default();
         caps.add_sbc_caps(1, SbcCapabilities { max_bitpool: SBC_MAX_BITPOOL, ..sbc_all() });
-        let xq_max =
-            |c: &RemoteCaps| match c.configuration_with(CodecKind::SbcXq, 48000, 2, 16, false, Default::default()) {
-                Ok(Configuration { request: ConfigRequest::Sbc { max_bitpool, .. }, .. }) => max_bitpool,
-                other => panic!("{other:?}"),
-            };
+        let xq_max = |c: &RemoteCaps| match c.configuration_with(
+            CodecKind::SbcXq,
+            48000,
+            2,
+            16,
+            Asks::default(),
+            Default::default(),
+        ) {
+            Ok(Configuration { request: ConfigRequest::Sbc { max_bitpool, .. }, .. }) => max_bitpool,
+            other => panic!("{other:?}"),
+        };
         assert_eq!(xq_max(&caps), sbc::xq_max_bitpool(48000));
         // Issue #86: "Show only options it supports" off
         assert_eq!(xq_max(&caps.unlisted(CodecKind::SbcXq)), SBC_MAX_BITPOOL);
@@ -2254,7 +2312,7 @@ mod tests {
             channel_mode: Some(ChannelMode::Stereo),
             min_bitpool: 0,
         };
-        let c = caps.configuration_with(CodecKind::Sbc, 44100, 2, 16, false, wanted).unwrap();
+        let c = caps.configuration_with(CodecKind::Sbc, 44100, 2, 16, Asks::default(), wanted).unwrap();
         assert_eq!(
             c.request,
             ConfigRequest::Sbc {
@@ -2269,13 +2327,13 @@ mod tests {
         );
         assert_eq!(caps.sbc_params(CodecKind::Sbc, wanted), (wanted, vec![]));
         // Mono input stays mono; mono asked for stereo input is mono too
-        let c = caps.configuration_with(CodecKind::Sbc, 48000, 1, 16, false, wanted).unwrap();
+        let c = caps.configuration_with(CodecKind::Sbc, 48000, 1, 16, Asks::default(), wanted).unwrap();
         assert!(matches!(c.request, ConfigRequest::Sbc { channel_mode: ChannelMode::Mono, blocks: 8, .. }));
         let mono = sbc::SbcParams { channel_mode: Some(ChannelMode::Mono), ..Default::default() };
-        let c = caps.configuration_with(CodecKind::Sbc, 48000, 2, 16, false, mono).unwrap();
+        let c = caps.configuration_with(CodecKind::Sbc, 48000, 2, 16, Asks::default(), mono).unwrap();
         assert!(matches!(c.request, ConfigRequest::Sbc { channel_mode: ChannelMode::Mono, blocks: 16, .. }));
         // SBC XQ: the frame setup, but always dual channel and its bitpool cap
-        let c = caps.configuration_with(CodecKind::SbcXq, 44100, 2, 16, false, wanted).unwrap();
+        let c = caps.configuration_with(CodecKind::SbcXq, 44100, 2, 16, Asks::default(), wanted).unwrap();
         assert_eq!(
             c.request,
             ConfigRequest::Sbc {
@@ -2291,7 +2349,7 @@ mod tests {
         // Unknown capabilities: taken as asked
         let mut unknown = RemoteCaps::default();
         unknown.add_sbc(1);
-        let c = unknown.configuration_with(CodecKind::Sbc, 44100, 2, 16, false, wanted).unwrap();
+        let c = unknown.configuration_with(CodecKind::Sbc, 44100, 2, 16, Asks::default(), wanted).unwrap();
         assert!(matches!(c.request, ConfigRequest::Sbc { blocks: 8, subbands: 4, allocation: Allocation::Snr, .. }));
     }
 
@@ -2320,7 +2378,7 @@ mod tests {
         assert!(p.is_default(), "{p:?}");
         assert_eq!(notes.len(), 4, "{notes:?}");
         assert!(notes[0].contains("4 blocks"), "{notes:?}");
-        let c = caps.configuration_with(CodecKind::Sbc, 44100, 2, 16, false, wanted).unwrap();
+        let c = caps.configuration_with(CodecKind::Sbc, 44100, 2, 16, Asks::default(), wanted).unwrap();
         assert_eq!(c.request, caps.configuration(CodecKind::Sbc, 44100, 2, 16).unwrap().request);
         // What it lists is kept
         let (p, notes) = caps
@@ -2344,7 +2402,7 @@ mod tests {
         let dual = sbc::SbcParams { channel_mode: Some(ChannelMode::DualChannel), ..Default::default() };
         let (p, notes) = all.sbc_params(CodecKind::Sbc, dual);
         assert!(p.is_default() && notes.len() == 1, "{p:?} {notes:?}");
-        let c = all.configuration_with(CodecKind::Sbc, 44100, 2, 16, false, dual).unwrap();
+        let c = all.configuration_with(CodecKind::Sbc, 44100, 2, 16, Asks::default(), dual).unwrap();
         assert!(matches!(
             c.request,
             ConfigRequest::Sbc { channel_mode: ChannelMode::JointStereo, max_bitpool: 53, .. }
@@ -2390,7 +2448,7 @@ mod tests {
     fn sbc_configuration_takes_the_profiles_minimum_bitpool() {
         let range = |caps: &RemoteCaps, kind: CodecKind, rate: u32, min: u8| {
             let p = sbc::SbcParams { min_bitpool: min, ..Default::default() };
-            let c = caps.configuration_with(kind, rate, 2, 16, false, p).unwrap();
+            let c = caps.configuration_with(kind, rate, 2, 16, Asks::default(), p).unwrap();
             let ConfigRequest::Sbc { min_bitpool, max_bitpool, .. } = c.request else { panic!() };
             (min_bitpool, max_bitpool)
         };

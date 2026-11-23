@@ -140,6 +140,8 @@ describe("device list", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].dataset.key).toBe("F4:4E:FD:00:11:22/le");
     expect(rows[0]).toHaveTextContent(t("device.tag_le_audio_set"));
+    // Both earbuds' addresses
+    expect(rows[0]).toHaveTextContent("F4:4E:FD:00:11:22, F4:4E:FD:00:11:23");
     const tags = [...rows[0].querySelectorAll(".tag")].map((x) => x.textContent);
     expect(tags).not.toContain(t("device.tag_audio"));
     const speaker = screen.getByText(/LE Audio Speaker/).closest(".device-row")!;

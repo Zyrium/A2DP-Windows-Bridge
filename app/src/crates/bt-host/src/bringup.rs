@@ -127,6 +127,10 @@ pub enum LoadError {
     },
     /// The controller rejected the image (its result code)
     Rejected(u8),
+    /// This failure left the controller in a state only a power cycle
+    /// ends: the adapter must be unplugged (a built-in one: the PC shut
+    /// down fully). The adapter start fails with that advice.
+    Replug(Box<LoadError>),
 }
 
 impl fmt::Display for LoadError {
@@ -148,6 +152,11 @@ impl fmt::Display for LoadError {
                     "the controller rejected the firmware (result 0x{result:02X}); is the file for this controller?"
                 )
             }
+            LoadError::Replug(cause) => write!(
+                f,
+                "{cause}. Unplug the adapter and plug it back in. If the adapter is built into the PC, \
+                 shut down the PC completely, then turn it back on."
+            ),
         }
     }
 }

@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config BLUECASTER_TRACE
+	bool "ISO counters on the console (UART, J-Link VCOM)"
+
+source "samples/subsys/usb/common/Kconfig.sample_usbd"
+
+source "Kconfig.zephyr"

@@ -171,17 +171,19 @@ BlueCaster で実際に使われたアダプターとヘッドホンは、コー
 | チップセット | 製品例 | 備考 |
 |:-------------|:-------|:-----|
 | Realtek | TP-Link UB500、RTL8761BU | Realtek の Windows ドライバーがインストールされていれば、そのファームウェアを使用。なければファームウェアのダウンロードが必要（上記を参照）。最も検証済み |
-| Realtek | ノート PC 内蔵の RTL8852BD（`0BDA:B853`） | linux-firmware にはこのチップのファームウェアがありません。BlueCaster は Realtek の Windows 用 Bluetooth ドライバーから `rtl8852bd_mp_chip_new.dat` を読み込むので、そのドライバーはアンインストールしないでください（またはファイルをファームウェアフォルダーに置きます）。実機では未検証 |
+| Realtek | RTL8852BD（`0BDA:B853`）、RTL8852BT、RTL8922A | BlueCaster は Realtek の Windows 用 Bluetooth ドライバーからファームウェア（例: `rtl8852bd_mp_chip_new.dat`）を読み込むので、そのドライバーはアンインストールしないでください。または、ログに示されたファイルをファームウェアフォルダーに置いてください。実機では未検証 |
 | CSR | CSR8510 汎用ドングル | 挿すだけで動作。ファームウェア不要 |
 | Barrot | Bluetooth 5.4 / 6.0 ドングル（`33FA:0010`、`33FA:0012`） | ROM のファームウェアで動作し、ファームウェアは不要。ユーザーからの報告は今のところ 1 件 |
 | Marvell | Microsoft Surface Pro / Surface Book 内蔵（88W8897） | ファームウェアファイルは不要。Wi-Fi ドライバーが Bluetooth のファームウェアも読み込むので、Wi-Fi はオンのままにしてください。実機では未検証 |
 | Actions | ATS2851 ドングル（`10D7:B012`） | ROM のファームウェアで動作し、ファームウェアは不要。このアダプターは対応していないコマンドも一覧に挙げるため、BlueCaster がそれらを隠します。実機では未検証 |
-| Broadcom | ASUS BT400 (BCM20702) | Bluetooth のクラス `E0/01/01` ではなくベンダークラス `FF/01/01` を名乗るアダプター（BCM20702 の OEM ドングル）も検出します。ROM のファームウェアで動作します。ファームウェアフォルダーに PatchRAM の `.hcd`（例: `BCM20702A1-0b05-17cb.hcd`）があれば、起動時に書き込みます（任意） |
+| Broadcom | ASUS BT400 (BCM20702)、そのほかの BCM20702 / BCM20703 / BCM43142 搭載ドングルやノート PC 内蔵モジュール | Bluetooth のクラス `E0/01/01` ではなくベンダークラス `FF/01/01` を名乗るアダプター（BCM20702 の OEM ドングル）も検出します。ROM のファームウェアで動作します。Broadcom の Windows 用 Bluetooth ドライバーが入っていれば、BlueCaster が起動時にそのドライバーのパッチを書き込みます。ファームウェアフォルダーに PatchRAM の `.hcd`（例: `BCM20702A1-0b05-17cb.hcd`）があれば、ドライバーのパッチの代わりにそのファイルを使います。ドライバーのパッチの書き込みに失敗したときは、アダプターを抜いて挿し直すよう BlueCaster が案内します。以後、BlueCaster はそのアダプターにパッチを書き込みません。ドライバーのパッチは実機では未検証 |
 | Intel | Intel 7260 / 3160 / 7265 / 3165 / 3168 / 8260 / 8265 / 9260 / AX200 / AX201 / AX210 / AX211 | ブートローダーモード（コールドブートの後など）では、linux-firmware の `intel/` にある対応する `ibt-*.sfi` と `ibt-*.ddc` をファームウェアフォルダーに置く必要があります。必要なファイル名はログに出ます（例: `ibt-0180-0041.sfi`）。7260 / 3160 / 7265 / 3165 / 3168 は ROM で動作し、ファイルは不要です。同じフォルダーに対応する `ibt-hw-*.bseq` パッチがあれば、それを適用します |
 | MediaTek | MT7925、MT7927、MT7922、MT7921、MT7902（AMD RZ717、RZ738、RZ616、RZ608 などの Wi-Fi カード） | チップごとの `BT_RAM_CODE_MT*_hdr.bin`（例: `BT_RAM_CODE_MT7925_1_1_hdr.bin`）が必要です。MediaTek の Windows 用 Bluetooth ドライバーが入っていれば、BlueCaster がそこから読み込みます。入っていなければ、linux-firmware の `mediatek/` にあるファイルをファームウェアフォルダーに置いてください。必要なファイル名はログに出ます。MT7927 は実機では未検証 |
-| Qualcomm | QCA61x4、QCA9377（ROME）、WCN6855（FastConnect 6900） | チップの rampatch と NVM（例: `AthrBT_0x00000302.dfu` と `ramps_0x00000302_48.dfu`）が必要です。Qualcomm の Windows 用 Bluetooth ドライバーが入っていれば、BlueCaster がそこから読み込みます。入っていなければ、linux-firmware の `qca/` にあるファイル（`rampatch_usb_*.bin`、`nvm_usb_*.bin`）をファームウェアフォルダーに置いてください。必要なファイル名はログに出ます。実機では未検証 |
-| MediaTek、Qualcomm | 古い MediaTek チップ（MT7663 など）、ほかの Qualcomm チップ（QCA6290、WCN785x） | 未対応。BlueCaster にないファームウェアローダーが必要です（[対応の追加に協力する](chip-support)） |
+| Qualcomm | QCA61x4、QCA9377（ROME）、WCN6855（FastConnect 6900）、WCN785x（FastConnect 7800） | チップの rampatch と NVM（例: `AthrBT_0x00000302.dfu` と `ramps_0x00000302_48.dfu`）が必要です。Qualcomm の Windows 用 Bluetooth ドライバーが入っていれば、BlueCaster がそこから読み込みます。入っていなければ、linux-firmware の `qca/` にあるファイル（`rampatch_usb_*.bin`、`nvm_usb_*.bin`）をファームウェアフォルダーに置いてください。必要なファイル名はログに出ます。実機では未検証 |
+| MediaTek | MT7663 | チップのパッチファイル（例: `mt7663_patch_e2_hdr.bin`）が必要です。MediaTek の Windows 用 Bluetooth ドライバーが入っていれば、BlueCaster がそこから読み込みます。入っていなければ、このファイルをファームウェアフォルダーに置いてください。必要なファイル名はログに出ます。実機では未検証 |
+| Qualcomm Atheros | AR3012 などの AR30xx チップ（古いノート PC の Bluetooth 4.0） | チップのパッチファイルと設定ファイル（例: `AthrBT_0x31010000.dfu` と `ramps_0x31010000_40.dfu`）が必要です。Qualcomm Atheros の Windows 用 Bluetooth ドライバーが入っていれば、BlueCaster がそこから読み込みます。入っていなければ、これらのファイルをファームウェアフォルダーに置いてください。必要なファイル名はログに出ます。実機では未検証 |
+| MediaTek、Qualcomm | 古い MediaTek チップ（MT7630、MT7650 など）、ほかの Qualcomm チップ（QCA6290） | 未対応。BlueCaster にないファームウェアローダーが必要です（[対応の追加に協力する](chip-support)） |
 
 LDAC のような高ビットレートのコーデックには、Bluetooth 5.0 以上の USB アダプターが一般に適しています。
 
-複数のアダプターに WinUSB を割り当てていると、BlueCaster は最初に見つけたアダプターを使います。WinUSB は BlueCaster で使うアダプターだけに割り当ててください。
+複数のアダプターに WinUSB を割り当てていると、BlueCaster は最初に見つけたアダプターを使います。**アダプター** 画面で別のアダプターのカードにある **このアダプターを使う** を押すと、そのアダプターを使います。使用中のアダプターには **使用中** と表示されます。

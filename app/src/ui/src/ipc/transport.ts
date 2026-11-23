@@ -7,7 +7,14 @@ export type ConnStatus =
   | { state: "connecting" }
   | { state: "connected"; server: string }
   | { state: "core_missing"; detail: string }
-  | { state: "rejected"; reason: string };
+  | { state: "rejected"; reason: string }
+  /** The service add-on is another version than this window: nothing
+   *  connects until it is updated (src-tauri/src/service.rs) */
+  | { state: "service_needs_update"; version: string; app: string }
+  /** The service add-on is newer than this window: the app needs the update */
+  | { state: "service_newer"; version: string; app: string }
+  /** The service add-on is added but stopped */
+  | { state: "service_stopped" };
 
 export type WindowKind = "main" | "flyout";
 
@@ -19,6 +26,27 @@ export type UpdatePhase =
   | { state: "waiting"; version: string }
   | { state: "installing"; version: string }
   | { state: "failed"; code: string; detail: string };
+
+/** The service add-on (src-tauri/src/service.rs Route) */
+export type ServiceState =
+  | { state: "not_added" }
+  | { state: "running"; version: string }
+  | { state: "stopped"; version: string }
+  | { state: "needs_update"; version: string }
+  /** Newer than the app: the app needs the update */
+  | { state: "app_older"; version: string };
+
+export type ServiceAction = "install" | "update" | "remove";
+
+/** How a set-up ended, and the state after it */
+export type ServiceSetupResult = (
+  | { outcome: "done" }
+  /** The user answered No on Windows' prompt */
+  | { outcome: "declined" }
+  /** The set-up tool's exit code */
+  | { outcome: "failed"; code: number }
+  | { outcome: "not_started"; detail: string }
+) & { service: ServiceState };
 
 export interface Transport {
   readonly window: WindowKind;
@@ -58,4 +86,10 @@ export interface Transport {
    *  installs it once nothing streams; the app restarts */
   updateInstall(manifestUrl: string): Promise<void>;
   onUpdatePhase(cb: (p: UpdatePhase) => void): void;
+
+  /** The service add-on's state */
+  serviceState(): Promise<ServiceState>;
+  /** Adds, updates or removes the service add-on (Windows asks for an
+   *  administrator) and waits for it; `removeData` only with "remove" */
+  serviceSetup(action: ServiceAction, removeData?: boolean): Promise<ServiceSetupResult>;
 }

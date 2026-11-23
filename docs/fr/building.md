@@ -135,6 +135,7 @@ Un codec réussit le test lorsque toutes ces conditions sont remplies :
 |:-------|:------------|
 | `--codecs sbc aac ...` | Tester uniquement ces codecs (`sbc sbcxq aac aptx aptxhd aptxll ldac lhdcv5 faststream opus opus05`) ou ces cas de négociation (fréquences d'échantillonnage, bitpools bas, configurations de trames SBC, aptX Adaptive, ... ; `-h` les liste) ; par défaut : tous |
 | `--le-audio [case ...]` | Exécuter à la place les cas LE Audio (par défaut : tous) |
+| `--auracast [case ...]` | Exécuter à la place les cas Auracast (par défaut : tous) |
 | `--scan [case ...]` | Exécuter à la place les cas de recherche d'appareils (`eir`, `name-request`) |
 | `--link [case ...]` | Exécuter à la place les cas de liaison (`disconnect`, `device-link`, `device-a2dp`, `device-stream`, `restart-on-link`) |
 | `--duration <s>` | Secondes de diffusion par codec (5 par défaut) |

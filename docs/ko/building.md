@@ -135,6 +135,7 @@ python tools/emu/run_test.py                        # every codec and negotiatio
 |:-----|:-----|
 | `--codecs sbc aac ...` | 지정한 코덱(`sbc sbcxq aac aptx aptxhd aptxll ldac lhdcv5 faststream opus opus05`)이나 협상 케이스(샘플링 속도, 낮은 비트풀, SBC 프레임 구성, aptX Adaptive, ...; `-h`로 목록 표시)만 테스트. 기본값: 전체 |
 | `--le-audio [case ...]` | 코덱 대신 LE Audio 케이스를 실행 (기본값: 전체) |
+| `--auracast [case ...]` | 코덱 대신 Auracast 케이스를 실행 (기본값: 전체) |
 | `--scan [case ...]` | 코덱 대신 장치 검색 케이스를 실행 (`eir`, `name-request`) |
 | `--link [case ...]` | 코덱 대신 링크 케이스를 실행 (`disconnect`, `device-link`, `device-a2dp`, `device-stream`, `restart-on-link`) |
 | `--duration <s>` | 코덱당 스트리밍 시간(초) (기본값 5) |

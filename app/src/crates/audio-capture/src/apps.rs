@@ -83,7 +83,8 @@ pub fn audio_apps() -> Vec<AudioApp> {
     if tracing::enabled!(tracing::Level::DEBUG) {
         tracing::debug!("audio apps: {} apps with an audio session", out.len());
         for a in &out {
-            tracing::debug!("audio apps: {} (pid {})", a.name, a.process_id);
+            // Names quoted: the session agent does not forward them
+            tracing::debug!("audio apps: \u{201C}{}\u{201D} (pid {})", a.name, a.process_id);
         }
     }
     out
@@ -115,7 +116,8 @@ pub fn find_process(exe: &str) -> Option<u32> {
     let sessions = if matches.len() > 1 { session_pids() } else { Vec::new() };
     let picked = pick_process(&matches, &sessions);
     tracing::trace!(
-        "audio apps: {exe}: {} processes {matches:?} (pid, parent), sessions {sessions:?}, picked {picked:?}",
+        "audio apps: \u{201C}{exe}\u{201D}: {} processes {matches:?} (pid, parent), sessions {sessions:?}, \
+         picked {picked:?}",
         matches.len()
     );
     picked
@@ -223,7 +225,13 @@ mod tests {
 
     #[test]
     fn find_and_watch_a_child() {
-        let mut child = std::process::Command::new("cmd").args(["/C", "ping -n 3 127.0.0.1 >NUL"]).spawn().unwrap();
+        // CREATE_NO_WINDOW: no terminal window pops up on the desktop
+        let mut child = std::os::windows::process::CommandExt::creation_flags(
+            std::process::Command::new("cmd").args(["/C", "ping -n 3 127.0.0.1 >NUL"]),
+            0x0800_0000,
+        )
+        .spawn()
+        .unwrap();
         let pid = child.id();
         // cmd.exe runs elsewhere too; ours is one of the candidates
         assert!(find_process("CMD.EXE").is_some());

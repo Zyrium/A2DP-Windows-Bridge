@@ -29,6 +29,7 @@ import {
   developerOnly,
   effectiveCodec,
   fitToCodec,
+  lowLatencyOffered,
   offeredCodecs,
   isDefaultOrder,
   fixedBitDepth,
@@ -260,6 +261,19 @@ describe("profiles", () => {
     expect(validateProfile({ ...ok, max_media_payload: 1680 }, []).packet).toBeDefined();
     expect(validateProfile({ ...ok, capture_mode: "virtual" }, []).audio_device?.key).toBe("error.no_virtual_device_selected");
     expect(validateProfile({ ...ok, capture_mode: "app", app_exe: "" }, []).app?.key).toBe("error.no_app_selected");
+  });
+
+  // Issue #543: LHDC V5's low latency is its own and is asked for only
+  // from a device that lists it (or one whose caps are not known yet)
+  it("keeps LHDC V5 low latency to LHDC V5 and the devices that list it", () => {
+    const p = { ...sampleProfile(), codec: "lhdcv5", lhdcv5_low_latency: true };
+    expect(fitToCodec(p).lhdcv5_low_latency).toBe(true);
+    expect(fitToCodec({ ...p, codec: "ldac" }).lhdcv5_low_latency).toBe(false);
+    const caps = { codec: "lhdcv5", sample_rates: [48000], bit_depths: [16, 24], max_bitrate: 0 };
+    expect(lowLatencyOffered("lhdcv5", null)).toBe(true);
+    expect(lowLatencyOffered("lhdcv5", { ...caps, lhdcv5_low_latency: true })).toBe(true);
+    expect(lowLatencyOffered("lhdcv5", { ...caps, lhdcv5_low_latency: false })).toBe(false);
+    expect(lowLatencyOffered("ldac", null)).toBe(false);
   });
 
   it("drops what the new codec cannot do", () => {

@@ -7,7 +7,7 @@ nav_order: 3.5
 
 # 添加芯片支持
 
-BlueCaster 直接驱动蓝牙适配器（通过 WinUSB），因此必须自己完成厂商的 Windows 驱动程序为让适配器工作所做的事；对许多芯片来说，这意味着每次启动时都要加载固件。目前可以使用的有 Realtek、Intel、Broadcom 和 CSR 适配器，以及 MediaTek MT7925、MT7927、MT7922、MT7921、MT7902 和 Qualcomm QCA61x4、QCA9377、WCN6855（MT7927、MT7922、MT7902 和 Qualcomm 芯片尚未在实际硬件上测试）。其他 MediaTek 芯片（较早的型号）和 Qualcomm 芯片（QCA6290、WCN785x）还无法使用，因为还没有人为它们编写加载程序。要支持其他 MediaTek 芯片，可以从 `app/src/crates/bt-host/src/mediatek.rs` 中的 MT79xx 加载程序入手。
+BlueCaster 直接驱动蓝牙适配器（通过 WinUSB），因此必须自己完成厂商的 Windows 驱动程序为让适配器工作所做的事；对许多芯片来说，这意味着每次启动时都要加载固件。目前可以使用的有 Realtek、Intel、Broadcom 和 CSR 适配器，以及 MediaTek MT7925、MT7927、MT7922、MT7921、MT7902、MT7663 和 Qualcomm QCA61x4、QCA9377、WCN6855、WCN785x、AR30xx（MT7927、MT7922、MT7902、MT7663 和 Qualcomm 芯片尚未在实际硬件上测试）。其他 MediaTek 芯片（较早的型号）和 Qualcomm 芯片（QCA6290）还无法使用，因为还没有人为它们编写加载程序。要支持其他 MediaTek 芯片，可以从 `app/src/crates/bt-host/src/mediatek.rs` 中的 MT79xx 加载程序入手。
 
 本页介绍如何添加加载程序。你需要一个使用该芯片的适配器，维护者手上没有。即使不写代码也能帮忙：完成第 1 步和第 2 步，就能得到贡献者所需的报告。
 

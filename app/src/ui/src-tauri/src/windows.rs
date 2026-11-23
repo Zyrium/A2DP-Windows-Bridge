@@ -406,7 +406,13 @@ fn main_closed(window: &tauri::Window) {
         // (and the process ends when idle)
         let Ok(snap) = ipc.request(MAIN, "state.snapshot", None).await else { return };
         if quits_on_close(&snap) {
-            let _ = ipc.request(MAIN, "app.quit", None).await;
+            // A core that runs as a service stays: app.close ends the
+            // user's session of the app instead (UI and tray)
+            if let Err(e) = ipc.request(MAIN, "app.quit", None).await
+                && e.code == ipc::access::NOT_IN_SERVICE
+            {
+                let _ = ipc.request(MAIN, "app.close", None).await;
+            }
         } else {
             let _ = ipc.request(MAIN, "app.hidden_to_tray", None).await;
         }

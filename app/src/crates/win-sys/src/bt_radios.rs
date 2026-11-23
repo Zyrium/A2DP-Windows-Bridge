@@ -13,7 +13,7 @@
 //! Bluetooth switched off) or with no BTHPORT interface at all may still
 //! have them, so they are read when the IOCTL gives nothing (issue #86).
 
-use windows::Devices::Radios::{Radio, RadioKind, RadioState};
+use windows::Devices::Radios::{Radio, RadioAccessStatus, RadioKind, RadioState};
 use windows::Win32::Devices::Bluetooth::GUID_BTHPORT_DEVICE_INTERFACE;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_Child, CM_Get_DevNode_PropertyW, CM_Get_Device_IDW, CM_Get_Parent, CM_Get_Sibling, CM_LOCATE_DEVNODE_NORMAL,
@@ -356,6 +356,60 @@ pub fn switched_on() -> Option<bool> {
         Ok(false)
     };
     radios().map_err(|e| tracing::debug!("bt_radios: GetRadiosAsync failed: {e}")).ok()
+}
+
+/// Turns Windows' Bluetooth off or on, as the switch in Settings does.
+/// Off only when exactly one Bluetooth radio is on: Windows runs one
+/// adapter at a time, so that is the adapter whose devices were connected.
+/// On turns every Bluetooth radio that is off back on. Returns whether a
+/// radio changed.
+pub fn set_switch(on: bool) -> bool {
+    crate::com::keep_mta();
+    let (from, to) = if on { (RadioState::Off, RadioState::On) } else { (RadioState::On, RadioState::Off) };
+    let word = if on { "on" } else { "off" };
+    let change = || -> windows::core::Result<bool> {
+        let access = Radio::RequestAccessAsync()?.join()?;
+        if access != RadioAccessStatus::Allowed {
+            tracing::info!("bt_radios: access to the radio switch refused ({access:?})");
+            return Ok(false);
+        }
+        let mut targets = Vec::new();
+        for r in &Radio::GetRadiosAsync()?.join()? {
+            if r.Kind()? == RadioKind::Bluetooth && r.State()? == from {
+                targets.push(r);
+            }
+        }
+        if !on && targets.len() != 1 {
+            tracing::info!("bt_radios: {} Bluetooth radios are on; the switch is left alone", targets.len());
+            return Ok(false);
+        }
+        let mut changed = false;
+        for r in &targets {
+            let status = r.SetStateAsync(to)?.join()?;
+            tracing::info!("bt_radios: Windows' Bluetooth switched {word}: {status:?}");
+            changed |= status == RadioAccessStatus::Allowed;
+        }
+        Ok(changed)
+    };
+    change().unwrap_or_else(|e| {
+        tracing::warn!("bt_radios: switching Windows' Bluetooth {word} failed: {e}");
+        false
+    })
+}
+
+/// After a restore: waits up to `limit` for Windows' Bluetooth radio to come
+/// back, then turns it on
+pub fn switch_on_when_back(limit: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        if set_switch(true) {
+            return true;
+        }
+        if switched_on() == Some(true) || started.elapsed() >= limit {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
 }
 
 /// A radio's handle, as BluetoothFindFirstRadio gives it

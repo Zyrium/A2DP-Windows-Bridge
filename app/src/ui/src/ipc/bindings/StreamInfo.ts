@@ -30,6 +30,11 @@ bitrate_capped: boolean,
  */
 hi_res_set: boolean, 
 /**
+ * LHDC V5 low latency is in the configuration in use (asked for by
+ * the profile, listed by the device; issue #543)
+ */
+low_latency: boolean, 
+/**
  * Where the audio comes from
  */
 source: SourceInfo | null, 

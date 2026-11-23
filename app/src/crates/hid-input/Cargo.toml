@@ -1,0 +1,15 @@
+[package]
+name = "hid-input"
+description = "HID host input: report descriptors parsed, input reports decoded into key and mouse events, and those events injected into Windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+win-sys.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

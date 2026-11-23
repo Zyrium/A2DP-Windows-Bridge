@@ -575,6 +575,47 @@ describe("every screen renders", () => {
   });
 });
 
+describe("while the core runs as a service", () => {
+  it("names no protected folder, and Quit closes the app instead of the core", async () => {
+    const { calls } = start("#/settings", { scenario: "service" });
+    await screen.findByRole("heading", { level: 1, name: "Settings" });
+    expect(screen.queryByRole("button", { name: t("ui.settings.open_config_folder") })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: t("ui.settings.quit") }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: t("ui.settings.quit") }));
+    // app.quit is refused there: app.close follows, and no error shows
+    await waitFor(() => expect(calls.map((c) => c.method)).toContain("app.close"));
+    expect(calls.map((c) => c.method).filter((m) => m.startsWith("app.q"))).toEqual(["app.quit"]);
+    expect(screen.queryByText(t("error.not_in_service"))).toBeNull();
+  });
+
+  it("offers no firmware folder and no log folder", async () => {
+    start("#/adapter", { scenario: "service" });
+    await screen.findByRole("heading", { level: 1, name: "Adapters" });
+    expect(screen.queryByRole("button", { name: t("firmware.open_folder") })).toBeNull();
+    cleanup();
+    mock?.dispose();
+    start("#/diagnostics", { scenario: "service" });
+    fireEvent.click(await screen.findByRole("tab", { name: "Log" }));
+    await screen.findByText(t("ui.diag.clear"));
+    expect(screen.queryByRole("button", { name: t("ui.diag.open_logs") })).toBeNull();
+  });
+
+  it("keeps the folders outside service mode", async () => {
+    start("#/settings");
+    expect(await screen.findByRole("button", { name: t("ui.settings.open_config_folder") })).toBeInTheDocument();
+    cleanup();
+    mock?.dispose();
+    start("#/adapter");
+    expect((await screen.findAllByRole("button", { name: t("firmware.open_folder") })).length).toBeGreaterThan(0);
+    cleanup();
+    mock?.dispose();
+    start("#/diagnostics");
+    fireEvent.click(await screen.findByRole("tab", { name: "Log" }));
+    expect(await screen.findByRole("button", { name: t("ui.diag.open_logs") })).toBeInTheDocument();
+  });
+});
+
 describe("update", () => {
   it("installs at once when nothing streams", async () => {
     start("#/settings", { scenario: "update" });

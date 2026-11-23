@@ -19,9 +19,13 @@ pipeline.workspace = true
 # media_eq.rs: the playback EQ's points as profiles.json keeps them
 dsp.workspace = true
 audio-capture.workspace = true
+# stream.rs, voice.rs: the render devices, through the session host
+session-host.workspace = true
 # voice.rs: headset mode's voice link (codecs, microphone render, uplink)
 voice-link.workspace = true
 win-sys.workspace = true
+input-helper.workspace = true
+hid-input.workspace = true
 # compat.rs: the 2.0.x pipe and mutex names (defined next to the new ones)
 ipc.workspace = true
 serde.workspace = true
@@ -35,8 +39,6 @@ semver = "1"
 time = { version = "0.3", features = ["local-offset"] }
 # receiver.rs: the broadcast address of every IPv4 network (discovery)
 if-addrs = "0.15"
-# le_media.rs: LE Audio MCP, the Windows media session (WinRT, safe API)
-windows = { version = "0.62", features = ["Foundation", "ApplicationModel", "Media_Control"] }
 # firmware.rs: checks the Realtek files fetched from linux-firmware
 sha2 = "0.10"
 

@@ -268,6 +268,7 @@ export function codecDetails(info: StreamInfo): string[] {
   const out = [`${info.bitrate_kbps} kbps`, `${khz(info.sample_rate)} kHz`];
   if (info.bits > 0) out.push(t(`bitdepth.${info.bits}`));
   if (info.abr) out.push(abrLabel(info));
+  if (info.low_latency) out.push("LL");
   const bp = bitpoolText(info);
   if (bp) out.push(bp);
   return out;
@@ -375,6 +376,10 @@ export function CodecBadge(props: { compact?: boolean; aside?: JSX.Element; pick
                 <span class="muted" title={t(abrTooltipKey(i()))}>
                   {abrLabel(i())}
                 </span>
+              </Show>
+              {/* LHDC V5 low latency in use (issue #543) */}
+              <Show when={i().low_latency}>
+                <span class="muted">{t("ui.codec.ll_on")}</span>
               </Show>
               {/* A line of its own: the others read the same for every codec (issue #86) */}
               <Show when={liveBitpool(i())}>
@@ -921,6 +926,19 @@ export function WinusbDialog(props: { adapter: AdapterInfo | null; mode: "assign
 /** Opens the firmware folder (the shell creates it if it is not there yet) */
 export function openFirmwareFolder(app: AppContext) {
   return app.run(() => app.core.transport.openFolder(`${app.core.state.snap!.config_dir}\\firmware`));
+}
+
+/** The button that opens the firmware folder. None while the core runs as
+ *  a service: its folder is protected, and only the download fetches files. */
+export function FirmwareFolderButton(props: { kind?: "subtle" }) {
+  const app = useApp();
+  return (
+    <Show when={!app.core.state.snap?.service_mode}>
+      <Button icon="folder_open" kind={props.kind} onClick={() => void openFirmwareFolder(app)}>
+        {t("firmware.open_folder")}
+      </Button>
+    </Show>
+  );
 }
 
 /** Fetches an adapter's Realtek files from linux-firmware once the user

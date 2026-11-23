@@ -135,6 +135,7 @@ python tools/emu/run_test.py                        # every codec and negotiatio
 |:-------|:------------|
 | `--codecs sbc aac ...` | Проверять только эти кодеки (`sbc sbcxq aac aptx aptxhd aptxll ldac lhdcv5 faststream opus opus05`) или случаи согласования (частоты дискретизации, низкие bitpool, конфигурации кадров SBC, aptX Adaptive, ...; `-h` выводит их список); по умолчанию: все |
 | `--le-audio [case ...]` | Вместо этого выполнить случаи LE Audio (по умолчанию: все) |
+| `--auracast [case ...]` | Вместо этого выполнить случаи Auracast (по умолчанию: все) |
 | `--scan [case ...]` | Вместо этого выполнить случаи поиска устройств (`eir`, `name-request`) |
 | `--link [case ...]` | Вместо этого выполнить случаи соединения (`disconnect`, `device-link`, `device-a2dp`, `device-stream`, `restart-on-link`) |
 | `--duration <s>` | Длительность передачи на кодек в секундах (по умолчанию 5) |

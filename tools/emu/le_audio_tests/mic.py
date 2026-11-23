@@ -28,6 +28,9 @@ cases tagged 'mic'. The playback direction is checked as in every case
   mic-rate-16k   stereo headset whose microphone takes 16 and 32 kHz, 16 kHz
                  chosen (--mic-rate 16000, the rate chosen with Auto-select
                  off): 16_2_2 from it instead of 32_2_2
+  mic-stereo-agent  mic-stereo with the session agent (--session-agent):
+                 the microphone decoded in the core, written to mic.wav by
+                 the agent; the same checks, the frame count exact
 """
 
 import math
@@ -48,6 +51,8 @@ CASES = [
          sink_args=['--mic', '--mic-rates', '16000'], bluecaster_args=['--le-preset', '16_2_1'], tags=('mic',)),
     Case('mic-rate-16k', 'stereo', STEREO, sink_args=['--mic'], bluecaster_args=['--mic-rate', '16000'],
          tags=('mic',)),
+    Case('mic-stereo-agent', 'stereo', STEREO, sink_args=['--mic'], bluecaster_args=['--session-agent'],
+         tags=('mic',)),
 ]
 
 # What each case's microphone is: (preset, Hz, microphone CIS)
@@ -56,7 +61,11 @@ EXPECTED = {
     'mic-earbuds': ('32_2_2', 32000, 1),
     'mic-mono-16k': ('16_2_1', 16000, 1),
     'mic-rate-16k': ('16_2_2', 16000, 1),
+    'mic-stereo-agent': ('32_2_2', 32000, 1),
 }
+# The microphone output in the session agent: the core's and the agent's lines
+AGENT_LINES = ('voice render: the microphone output runs in the session agent (32000 Hz)',
+               '[agent] render: channel opened (1 open)', '[agent] render: channel closed')
 
 PREFILL = 2            # BlueCaster's jitter buffer (pipeline le_rx PREFILL_SDUS)
 # SDUs that arrive after BlueCaster's Disable (before the source ASE left
@@ -155,6 +164,10 @@ def check(case, ctx):
         failures.append('BlueCaster did not plan the microphone ("LE Audio: microphone: LC3 ...")')
     elif (int(m.group(1)) * 1000, m.group(5), int(m.group(4))) != (rate, preset, mic_cis):
         failures.append(f'microphone planned as {m.group(0)} (expected {preset}, {rate} Hz, {mic_cis} CIS)')
+    if '--session-agent' in case.bluecaster_args:
+        failures += [f'bluecaster.log: "{line}" missing' for line in AGENT_LINES if line not in log]
+    elif 'voice render:' in log:
+        failures.append('bluecaster.log: the microphone went through a session agent without --session-agent')
     for step in ('Receiver Start Ready ASE', 'Receiver Stop Ready ASE'):
         if step not in log:
             failures.append(f'BlueCaster did not write {step.split(" ASE")[0]}')

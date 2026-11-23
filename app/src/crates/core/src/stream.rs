@@ -42,6 +42,9 @@ pub struct StreamRequest {
     pub auto_order: codec::AutoOrder,
     pub quality: Quality,
     pub abr: bool,
+    /// LHDC V5: low latency asked for (P9[6] where the device lists it, and
+    /// the encoder every 10 ms; issue #543)
+    pub lhdcv5_low_latency: bool,
     /// SBC / SBC XQ: the bitpool wanted (0 = by quality)
     pub sbc_bitpool: u8,
     /// The same for SBC XQ
@@ -232,6 +235,9 @@ pub struct StreamInfo {
     /// OPPO earbuds turned Hi-Res on for this connection, after one
     /// reconnect for it (issue #237)
     pub hi_res_set: bool,
+    /// LHDC V5 low latency is in the configuration in use (asked for by the
+    /// settings and accepted with the stream)
+    pub low_latency: bool,
     /// Where the audio comes from (sent again when an application capture
     /// starts or stops waiting for the app)
     pub source: SourceInfo,
@@ -467,6 +473,9 @@ pub struct CodecDeviceCaps {
     /// Its largest bit rate in bps (0 = not said)
     #[serde(default)]
     pub max_bitrate: u32,
+    /// LHDC V5: it lists low latency (P9[6], issue #543)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lhdcv5_low_latency: bool,
 }
 
 /// What each codec a device offered lists
@@ -479,6 +488,7 @@ pub fn codec_device_caps(remote: &caps::RemoteCaps) -> Vec<CodecDeviceCaps> {
             sample_rates: remote.listed_sample_rates(k),
             bit_depths: remote.listed_bit_depths(k),
             max_bitrate: remote.listed_max_bitrate(k),
+            lhdcv5_low_latency: k == CodecKind::LhdcV5 && remote.lhdcv5_lists_low_latency(),
         })
         .collect()
 }
@@ -549,24 +559,25 @@ struct AppSource {
 
 impl AppSource {
     fn attach(&mut self, input: &SharedInput) -> bool {
-        let Some(pid) = audio_capture::find_process(&self.exe) else {
-            tracing::trace!("app capture: {} not found", self.exe);
+        let Some(pid) = session_host::activity::find_process(&self.exe) else {
+            tracing::trace!("app capture: {} not found", crate::diag::log_name(&self.exe));
             return false;
         };
-        tracing::debug!("app capture: attaching to {} (PID {pid}) at {} Hz", self.exe, self.sample_rate);
+        let exe = crate::diag::log_name(&self.exe);
+        tracing::debug!("app capture: attaching to {exe} (PID {pid}) at {} Hz", self.sample_rate);
         let options = CaptureOptions { preferred_rate: Some(self.sample_rate), fill_silence: true };
         let started = Capture::open(&Source::Application { process_id: pid }, &options)
             .and_then(|c| c.start(Box::new(input.clone())));
         match started {
             Ok(r) => {
-                tracing::info!("capturing app {} (PID {pid})", self.exe);
+                tracing::info!("capturing app {exe} (PID {pid})");
                 self.running = Some(r);
                 self.process_id = pid;
                 true
             }
             Err(e) => {
                 if self.failed_pid != pid {
-                    tracing::warn!("cannot capture {} (PID {pid}): {e}", self.exe);
+                    tracing::warn!("cannot capture {exe} (PID {pid}): {e}");
                 }
                 self.failed_pid = pid;
                 false
@@ -576,7 +587,8 @@ impl AppSource {
 
     fn exited(&self) -> bool {
         self.running.is_some()
-            && (audio_capture::process_exited(self.process_id) || self.running.as_ref().is_some_and(|r| r.ended()))
+            && (session_host::activity::process_exited(self.process_id)
+                || self.running.as_ref().is_some_and(|r| r.ended()))
     }
 
     fn detach(&mut self) {
@@ -808,9 +820,8 @@ impl DefaultDeviceGuard {
     fn follow(&mut self, source: &SourceRequest) {
         match source.default_switch_device() {
             Some((id, name)) => {
-                let restore = self.0.take();
-                *self = DefaultDeviceGuard::switch_to(id, name);
-                self.0 = restore.or(self.0.take());
+                let keep = self.0.take();
+                *self = DefaultDeviceGuard::switch_keeping(id, name, keep);
             }
             None => *self = DefaultDeviceGuard(None),
         }
@@ -820,16 +831,34 @@ impl DefaultDeviceGuard {
     /// at the end even when the switch failed: Windows may have switched
     /// one role (Console, Multimedia) before the other failed.
     pub(crate) fn switch_to(id: &str, name: &str) -> DefaultDeviceGuard {
+        DefaultDeviceGuard::switch_keeping(id, name, None)
+    }
+
+    /// [`DefaultDeviceGuard::switch_to`], restoring `keep` at the end when
+    /// it is a device to restore already. The device to restore is held by
+    /// the session agent too (restored if the core goes away).
+    fn switch_keeping(id: &str, name: &str, keep: Option<String>) -> DefaultDeviceGuard {
         // The session before kept it switched for this one: its device to
-        // restore is this one's
-        let handed = handover().restore.take();
-        let before = audio_capture::default_render_device();
-        let name = crate::diag::quoted(name);
-        tracing::debug!("default output: switching to {name} ({id}), was {before:?}, handed over {handed:?}");
-        if let Err(e) = audio_capture::set_default_render_device(id) {
+        // restore is this one's. So is a restore the session agent did not
+        // get (it was lost).
+        let handed = handover().restore.take().or_else(session_host::default_device::take_lost_restore);
+        let before = session_host::devices::default_render_device();
+        let name = crate::diag::quoted(crate::diag::log_name(name));
+        if crate::paths::service_mode() {
+            // The service's log: no device IDs
+            tracing::debug!(
+                "default output: switching (one before: {}, handed over: {})",
+                before.is_some(),
+                handed.is_some()
+            );
+        } else {
+            tracing::debug!("default output: switching to {name} ({id}), was {before:?}, handed over {handed:?}");
+        }
+        let restore = keep.or(handed).or_else(|| restore_target(before, id));
+        if let Err(e) = session_host::default_device::switch_render_default(id, restore.as_deref()) {
             tracing::warn!("failed to make {name} the default output device: {e}");
         }
-        DefaultDeviceGuard(handed.or_else(|| restore_target(before, id)))
+        DefaultDeviceGuard(restore)
     }
 }
 
@@ -893,8 +922,8 @@ pub(crate) fn restore_unclaimed_default() {
 }
 
 fn restore_default(id: &str) {
-    tracing::debug!("default output: restoring {id}");
-    if let Err(e) = audio_capture::set_default_render_device(id) {
+    tracing::debug!("default output: restoring {}", crate::diag::log_name(id));
+    if let Err(e) = session_host::default_device::restore_render_default(id) {
         tracing::warn!("could not restore the default output device: {e}");
     }
 }
@@ -939,7 +968,7 @@ impl Drop for DefaultDeviceGuard {
     fn drop(&mut self) {
         if let Some(id) = self.0.take() {
             let mut h = handover();
-            let current = h.next.is_some().then(audio_capture::default_render_device).flatten();
+            let current = h.next.is_some().then(session_host::devices::default_render_device).flatten();
             let now = h.end(current.as_deref(), id);
             drop(h);
             match now {
@@ -956,6 +985,25 @@ const ADAPTER_STOPPED: &str = "the Bluetooth adapter stopped working";
 
 /// The capture rate a profile's Auto sample rate asks for (issue #86)
 const AUTO_SAMPLE_RATE: u32 = 48000;
+
+/// How long a packet may wait in the send queue with LHDC V5 low latency
+/// (20 packets of 5 ms; normal waits stay under 30 ms; issue #543): a
+/// backed-up link costs a short gap instead of ~300 ms of delay that stays
+const LL_QUEUE_MAX_WAIT_MS: u32 = 100;
+
+/// Sets how long a packet may wait in the send queue for an encoder set up
+/// with `peer`: developer mode's limit, else LL_QUEUE_MAX_WAIT_MS with LHDC
+/// V5 low latency, else the queue's default (0)
+fn set_queue_max_wait(host: &BtHost, peer: &PeerParams) {
+    let dev = codec::dev::overrides().queue_max_wait_ms;
+    let wait = if dev == 0 && peer.lhdcv5_low_latency { LL_QUEUE_MAX_WAIT_MS } else { dev };
+    host.stats().queue_max_wait_ms.store(wait, std::sync::atomic::Ordering::Relaxed);
+    if dev > 0 {
+        tracing::info!("send queue: packets dropped after {wait} ms (developer mode)");
+    } else if wait > 0 {
+        tracing::info!("send queue: packets dropped after {wait} ms (LHDC V5 low latency)");
+    }
+}
 
 /// A new stack (sleep, a stopped adapter): the adapter may take a while to
 /// come back
@@ -1206,6 +1254,8 @@ fn peer_params(remote: &RemoteCaps, kind: CodecKind, channels: u32, req: &Stream
         opus_max_bitrate,
         aac_max_bitrate,
         aptxad_r2: kind == CodecKind::AptxAdaptive && remote.aptxad_r2(),
+        // As the SET_CONFIGURATION asked for it (configuration_with)
+        lhdcv5_low_latency: kind == CodecKind::LhdcV5 && remote.lhdcv5_low_latency(asks(req, kind, remote)),
     }
 }
 
@@ -1226,11 +1276,11 @@ fn configure_stream(
     sample_rate: u32,
     channels: u32,
     bits: u8,
-    vbr: bool,
+    asks: caps::Asks,
     sbc: codec::sbc::SbcParams,
 ) -> Result<(Configuration, u16), ConfigFailure> {
     let config =
-        remote.configuration_with(kind, sample_rate, channels, bits, vbr, sbc).map_err(ConfigFailure::Build)?;
+        remote.configuration_with(kind, sample_rate, channels, bits, asks, sbc).map_err(ConfigFailure::Build)?;
     let mtu = host.configure(&config).map_err(ConfigFailure::Host)?;
     Ok((config, mtu))
 }
@@ -1288,6 +1338,17 @@ fn as_asked(remote: RemoteCaps, forced: Option<CodecKind>, unlisted: Option<Code
     }
 }
 
+/// What the profile asks of the configuration of a `kind` stream
+/// (configuration_with; peer_params takes the same)
+fn asks(req: &StreamRequest, kind: CodecKind, remote: &RemoteCaps) -> caps::Asks {
+    caps::Asks {
+        // AAC with variable bit rate: asked for by name, and the sink lists it
+        vbr: req.abr && req.codec == Some(CodecKind::Aac) && kind == CodecKind::Aac && remote.aac_vbr(),
+        // Issue #543: LHDC V5's card setting (P9[6] where the sink lists it)
+        lhdcv5_low_latency: req.lhdcv5_low_latency && kind == CodecKind::LhdcV5,
+    }
+}
+
 /// SBC / SBC XQ adaptive bitpool: only when the profile asks for that codec
 /// itself with ABR on. A profile's ABR was LDAC's and LHDC V5's: Auto, or a
 /// fallback from LDAC, landing on SBC keeps today's fixed bitpool.
@@ -1300,9 +1361,9 @@ fn sbc_abr(req: &StreamRequest, kind: CodecKind) -> bool {
 /// cannot be read
 fn source_mix(source: &SourceRequest) -> Option<audio_capture::MixFormat> {
     match source {
-        SourceRequest::SystemLoopback | SourceRequest::Application { .. } => audio_capture::mix_format(None),
+        SourceRequest::SystemLoopback | SourceRequest::Application { .. } => session_host::devices::mix_format(None),
         SourceRequest::VirtualDevice { id, .. } | SourceRequest::OutputDevice { id, .. } if !id.is_empty() => {
-            audio_capture::mix_format(Some(id))
+            session_host::devices::mix_format(Some(id))
         }
         _ => None,
     }
@@ -1317,7 +1378,8 @@ fn start_pipeline(
     sink: MediaSink,
     host: &BtHost,
 ) -> (Pipeline, CaptureInput) {
-    let abr = encoder.abr_active();
+    // The queue guard takes the queue depth as ABR does
+    let abr = encoder.abr_active() || encoder.queue_guard_active();
     let hold = codec::dev::overrides().encode_at_send;
     if hold {
         tracing::info!("encode at send time: audio waits unencoded while the send queue is backed up (developer mode)");
@@ -1813,8 +1875,8 @@ pub(crate) fn run(inner: &Arc<Inner>, req: StreamRequest) {
         _ => 16,
     };
 
-    // AAC with variable bit rate: asked for by name, and the sink lists it
-    let vbr = req.abr && req.codec == Some(CodecKind::Aac) && kind == CodecKind::Aac && remote.aac_vbr();
+    let asks = asks(&req, kind, &remote);
+    let vbr = asks.vbr;
     tracing::debug!(
         "codec: {bits}-bit (profile {:?}), aac vbr {vbr} (abr {}, device vbr {})",
         req.bit_depth,
@@ -1825,7 +1887,7 @@ pub(crate) fn run(inner: &Arc<Inner>, req: StreamRequest) {
     // ---- stream configuration ----
     let t = Instant::now();
     let mut configured =
-        configure_stream(&host, &remote, kind, format.sample_rate, channels, bits, vbr, req.sbc_params(kind));
+        configure_stream(&host, &remote, kind, format.sample_rate, channels, bits, asks, req.sbc_params(kind));
     if let Err(failure) = &configured {
         tracing::debug!("configure: {} failed after {} ms: {failure:?}", kind.name(), t.elapsed().as_millis());
     }
@@ -1853,7 +1915,7 @@ pub(crate) fn run(inner: &Arc<Inner>, req: StreamRequest) {
             replaced = Some((CodecKind::SbcXq, Unavailable::NotSupported));
         }
         configured =
-            configure_stream(&host, &remote, kind, format.sample_rate, channels, bits, vbr, req.sbc_params(kind));
+            configure_stream(&host, &remote, kind, format.sample_rate, channels, bits, asks, req.sbc_params(kind));
         if let Err(failure) = &configured {
             tracing::debug!("configure: SBC after SBC XQ failed: {failure:?}");
         }
@@ -1893,7 +1955,7 @@ pub(crate) fn run(inner: &Arc<Inner>, req: StreamRequest) {
     let keeps = |on: bool| {
         let u = (on && req.codec == Some(kind)).then_some(kind);
         as_asked(listed_remote.clone(), None, u)
-            .configuration_with(kind, format.sample_rate, channels, bits, vbr, req.sbc_params(kind))
+            .configuration_with(kind, format.sample_rate, channels, bits, asks, req.sbc_params(kind))
             .is_ok_and(|c| c == config)
     };
     inner.set_unlisted_keeps([keeps(false), keeps(true)]);
@@ -1968,6 +2030,7 @@ pub(crate) fn run(inner: &Arc<Inner>, req: StreamRequest) {
         abr,
         bitrate_capped,
         hi_res_set,
+        low_latency: encoder_config.peer.lhdcv5_low_latency,
         source: source.info(),
         details: Some(Box::new(codec_details(kind, &config, &remote, &*encoder, mtu, format.sample_rate))),
     };
@@ -2003,7 +2066,7 @@ pub(crate) fn run(inner: &Arc<Inner>, req: StreamRequest) {
         format.sample_rate,
         channels,
         bits,
-        vbr,
+        asks,
         req.sbc_params(kind),
     ) {
         Ok(c) => Some(c),
@@ -2025,13 +2088,7 @@ pub(crate) fn run(inner: &Arc<Inner>, req: StreamRequest) {
     let mut reopen_ticks = 0u32;
     let mut lost_for_good = false;
     let mut discontinuities = DiscontinuityLog::default();
-    // Developer mode: another limit on how long a packet waits in the send
-    // queue (0 = the default)
-    let queue_wait = codec::dev::overrides().queue_max_wait_ms;
-    host.stats().queue_max_wait_ms.store(queue_wait, std::sync::atomic::Ordering::Relaxed);
-    if queue_wait > 0 {
-        tracing::info!("send queue: packets dropped after {queue_wait} ms (developer mode)");
-    }
+    set_queue_max_wait(&host, &encoder_config.peer);
     let mut health = StreamHealth::start(host.stats().clone(), format.sample_rate, active.health());
     // Headset mode (developer mode): the voice link instead of A2DP
     let mut headset = crate::voice::HeadsetMode::new(req.headset_mic, req.mic_output.clone(), req.voice_codec)
@@ -2559,6 +2616,8 @@ pub(crate) fn run(inner: &Arc<Inner>, req: StreamRequest) {
             info.bitrate_kbps = encoder.bitrate_kbps();
             info.bitrate_capped = encoder.bitrate_capped();
             info.abr = encoder.abr_active() || vbr;
+            info.low_latency = encoder_config.peer.lhdcv5_low_latency;
+            set_queue_max_wait(&host, &encoder_config.peer);
             info.details =
                 Some(Box::new(codec_details(kind, &config, &r.remote, &*encoder, r.mtu, format.sample_rate)));
             let (p, new_input) = start_pipeline(encoder, input_format, channels, r.mtu, sink, &host);

@@ -7,7 +7,7 @@ nav_order: 3.5
 
 # チップ対応の追加
 
-BlueCaster は Bluetooth アダプターを（WinUSB を通して）直接動かします。そのため、アダプターを使えるようにするためにメーカーの Windows ドライバーが行っている処理を、BlueCaster 自身が行う必要があります。多くのチップでは、起動のたびにファームウェアを読み込ませる処理です。Realtek、Intel、Broadcom、CSR のアダプターはすでに使えます。MediaTek の MT7925、MT7927、MT7922、MT7921、MT7902 と、Qualcomm の QCA61x4、QCA9377、WCN6855 も使えます（MT7927、MT7922、MT7902 と Qualcomm のチップは実機では未検証）。ほかの MediaTek チップ（古いもの）と Qualcomm チップ（QCA6290、WCN785x）は、ローダーをまだ誰も書いていないため使えません。ほかの MediaTek チップに取り組むときは、`app/src/crates/bt-host/src/mediatek.rs` にある MT79xx 用のローダーを土台にしてください。
+BlueCaster は Bluetooth アダプターを（WinUSB を通して）直接動かします。そのため、アダプターを使えるようにするためにメーカーの Windows ドライバーが行っている処理を、BlueCaster 自身が行う必要があります。多くのチップでは、起動のたびにファームウェアを読み込ませる処理です。Realtek、Intel、Broadcom、CSR のアダプターはすでに使えます。MediaTek の MT7925、MT7927、MT7922、MT7921、MT7902、MT7663 と、Qualcomm の QCA61x4、QCA9377、WCN6855、WCN785x、AR30xx も使えます（MT7927、MT7922、MT7902、MT7663 と Qualcomm のチップは実機では未検証）。ほかの MediaTek チップ（古いもの）と Qualcomm チップ（QCA6290）は、ローダーをまだ誰も書いていないため使えません。ほかの MediaTek チップに取り組むときは、`app/src/crates/bt-host/src/mediatek.rs` にある MT79xx 用のローダーを土台にしてください。
 
 このページでは、ローダーを追加する手順を説明します。作業には、そのチップを積んだアダプターが必要です（メンテナーは持っていません）。コードを書かなくても協力できます。手順 1 と 2 を行えば、コントリビューターに必要なレポートを作成できます。
 

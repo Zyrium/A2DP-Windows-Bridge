@@ -256,6 +256,8 @@ fn sco_device_gone(e: Win32Error) -> bool {
 
 /// VID and PID of the adapter opened last (what a stack runs on)
 static LAST_OPENED: Mutex<Option<(u16, u16)>> = Mutex::new(None);
+/// Its Windows device instance ID
+static LAST_OPENED_INSTANCE: Mutex<Option<String>> = Mutex::new(None);
 
 /// ACL / ISO OUT writes since [`take_acl_out_timing`] last ran: the
 /// longest from submit to completion (µs) and the most in flight at once
@@ -348,6 +350,12 @@ pub fn take_acl_out_timing() -> (Duration, usize) {
 /// the first open
 pub fn last_opened() -> Option<(u16, u16)> {
     *LAST_OPENED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The Windows device instance ID of the adapter a [`UsbTransport`] opened
+/// last; None before the first open
+pub fn last_opened_instance() -> Option<String> {
+    LAST_OPENED_INSTANCE.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Which adapter to open
@@ -1293,6 +1301,8 @@ impl HciBackend for UsbTransport {
         };
         let (vid, pid) = (info.vendor_id(), info.product_id());
         *LAST_OPENED.lock().unwrap_or_else(|e| e.into_inner()) = Some((vid, pid));
+        *LAST_OPENED_INSTANCE.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(info.instance_id().to_string_lossy().into_owned());
         let mut event_in = interface.endpoint::<Interrupt, In>(event_addr).map_err(|e| e.to_string())?;
         let mut acl_in = interface.endpoint::<Bulk, In>(acl_in_addr).map_err(|e| e.to_string())?;
         let mut acl_out = interface.endpoint::<Bulk, Out>(acl_out_addr).map_err(|e| e.to_string())?;

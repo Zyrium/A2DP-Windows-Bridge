@@ -29,6 +29,19 @@ between the two controllers of a LocalLink. LeEmuController adds that:
     come up; with --cis-up-after they come up that much later, on the
     central's side only (the sink has released its ASEs by then and would
     not accept them).
+  - with --reencrypt-fail the central's controller fails its first
+    re-encryption with the stored key once: the sink ends the link (drop)
+    or has no key (key-missing).
+  - with --iso-buffers N the "BlueCaster" controller reports N ISO buffers
+    (a Realtek adapter has 20).
+  - with --completion-delay-ms MS Number Of Completed Packets for an SDU of
+    BlueCaster's goes back MS after its delivery (a controller that holds an
+    unacknowledged PDU until its flush point), and LE CIS Established
+    reports the flush timeout that matches.
+  - with --withhold-completions N the Nth CIS of LE Create CIS (0: the
+    first) never gets Number Of Completed Packets while it is up (a CIS the
+    controller stopped serving); its SDUs are still delivered, and the
+    buffers come back just before it disconnects.
 
 PacketLoggerSnooper also writes ISO data (PacketLogger types 0x0c / 0x0d),
 which bluecaster_decode --le-audio reads.
@@ -84,8 +97,8 @@ CIS_PARAMS = {}
 LATE_INTERVALS = 3
 LATE_US = 30000      # the same tolerance in time for shorter SDU intervals
 # An SDU that reaches this controller more than HOST_LATE_MS after the start
-# of its SDU interval would have missed it on a real controller (whose queue,
-# 2 SDUs per CIS from BlueCaster, ran empty): logged as "late SDU" (run_test.py
+# of its SDU interval would have missed it on a real controller (whose queue
+# ran empty): logged as "late SDU" (run_test.py
 # fails the case). The time this emulation's own event loop was stalled in
 # between is not counted (see LeEmuController._heartbeat).
 HOST_LATE_MS = 2.0
@@ -97,6 +110,21 @@ NO_ISO_BUFFERS = set()
 # --refuse-cis / --cis-up-after: (index of the refused CIS in LE Create CIS,
 # seconds until the others are up or None for the usual way), or None
 REFUSE_CIS = None
+# --reencrypt-fail: what the "BlueCaster" controller makes of the first
+# re-encryption with a stored key (its second LE Enable Encryption, the first
+# being the pairing's): 'drop' the sink ends the link instead (0x13),
+# 'key-missing' the sink has no key (Encryption Change 0x06, encryption off,
+# as a controller reports LL_REJECT_EXT_IND with PIN or Key Missing); None:
+# every encryption succeeds
+REENCRYPT_FAIL = None
+# --iso-buffers: Total_Num_ISO_Data_Packets of BlueCaster's controller, or None
+ISO_BUFFERS = None
+# --completion-delay-ms: seconds between an SDU's delivery and its Number Of
+# Completed Packets on BlueCaster's controller
+COMPLETION_DELAY_S = 0.0
+# --withhold-completions: index in LE Create CIS of the CIS without
+# completions, or None
+WITHHOLD_CIS = None
 
 
 class LeEmuController(EmuController):
@@ -113,6 +141,9 @@ class LeEmuController(EmuController):
         self.stalls = []           # (from, to) loop times this event loop did not run (recent ones)
         self.heartbeat = None
         self.heartbeat_due = 0.0
+        self.encryptions = 0       # LE Enable Encryption commands (--reencrypt-fail)
+        self.iso_delayed = {}      # CIS handle -> [TimerHandle] of delayed completions
+        self.withheld = {}         # CIS handle -> completions withheld (--withhold-completions)
 
     def _heartbeat(self, due):
         """Every HEARTBEAT_S while ISO data flows: when this timer fires more
@@ -167,6 +198,31 @@ class LeEmuController(EmuController):
                 num_hci_command_packets=1, command_opcode=command.op_code, return_parameters=result))
         return None
 
+    def on_hci_le_enable_encryption_command(self, command):
+        if self.name != 'BlueCaster' or REENCRYPT_FAIL is None:
+            return super().on_hci_le_enable_encryption_command(command)
+        self.encryptions += 1
+        connection = self.find_le_connection_by_handle(command.connection_handle)
+        if self.encryptions != 2 or connection is None:
+            return super().on_hci_le_enable_encryption_command(command)
+        self._send_hci_command_status(hci.HCI_COMMAND_STATUS_PENDING, command.op_code)
+        if REENCRYPT_FAIL == 'drop':
+            def fail():
+                if self.le_connections.get(connection.peer_address) is not connection:
+                    return
+                log.info('%s: the sink ends the link during re-encryption (--reencrypt-fail drop)', self.name)
+                reason = hci.HCI_ErrorCode.REMOTE_USER_TERMINATED_CONNECTION_ERROR
+                connection.send_ll_control_pdu(ll.TerminateInd(reason))
+                self.on_le_disconnected(connection, reason)
+        else:
+            def fail():
+                log.info('%s: the sink has no key for the re-encryption (--reencrypt-fail key-missing)', self.name)
+                self.send_hci_packet(hci.HCI_Encryption_Change_Event(
+                    status=hci.HCI_ErrorCode.PIN_OR_KEY_MISSING_ERROR, connection_handle=connection.handle,
+                    encryption_enabled=0))
+        asyncio.get_running_loop().call_later(0.05, fail)
+        return None
+
     def on_hci_set_afh_host_channel_classification_command(self, _command):
         # Vol 4 Part E 7.3.46: Command Complete with the status only. The
         # channel map does not matter on the virtual link.
@@ -177,6 +233,8 @@ class LeEmuController(EmuController):
         if self.name in NO_ISO_BUFFERS:
             result.iso_data_packet_length = 0
             result.total_num_iso_data_packets = 0
+        elif ISO_BUFFERS is not None and self.name == 'BlueCaster':
+            result.total_num_iso_data_packets = ISO_BUFFERS
         return result
 
     def on_hci_le_set_cig_parameters_command(self, command):
@@ -195,6 +253,10 @@ class LeEmuController(EmuController):
 
     def on_hci_le_create_cis_command(self, command):
         handles = list(command.cis_connection_handle)
+        if WITHHOLD_CIS is not None and WITHHOLD_CIS < len(handles):
+            self.withheld[handles[WITHHOLD_CIS]] = 0
+            log.info('withholding Number Of Completed Packets of CIS 0x%04x (--withhold-completions)',
+                     handles[WITHHOLD_CIS])
         if REFUSE_CIS is None or REFUSE_CIS[0] >= len(handles):
             return super().on_hci_le_create_cis_command(command)
         refused, up_after = REFUSE_CIS
@@ -253,7 +315,8 @@ class LeEmuController(EmuController):
                 nse=min(p['rtn'] + 1, 31),
                 bn_c_to_p=1 if p['max_sdu_c_to_p'] else 0,
                 bn_p_to_c=1 if p['max_sdu_p_to_c'] else 0,
-                ft_c_to_p=1,
+                # An SDU completes up to FT ISO intervals after its first event
+                ft_c_to_p=max(1, math.ceil(COMPLETION_DELAY_S * 1e6 / (max(p['sdu_interval'] // 1250, 4) * 1250))),
                 ft_p_to_c=1,
                 max_pdu_c_to_p=p['max_sdu_c_to_p'],
                 max_pdu_p_to_c=p['max_sdu_p_to_c'],
@@ -273,8 +336,37 @@ class LeEmuController(EmuController):
         return peer, peer_link
 
     def iso_completed(self, handle):
+        if handle in self.withheld:
+            self.withheld[handle] += 1
+            return
+        if COMPLETION_DELAY_S > 0 and handle in self.central_cis_links:
+            loop = asyncio.get_running_loop()
+            timers = self.iso_delayed.setdefault(handle, [])
+            entry = []
+
+            def fire():
+                if entry and entry[0] in timers:
+                    timers.remove(entry[0])
+                self.send_completed(handle, 1)
+            entry.append(loop.call_later(COMPLETION_DELAY_S, fire))
+            timers.append(entry[0])
+            return
+        self.send_completed(handle, 1)
+
+    def send_completed(self, handle, count):
         self.send_hci_packet(hci.HCI_Number_Of_Completed_Packets_Event(
-            connection_handles=[handle], num_completed_packets=[1]))
+            connection_handles=[handle], num_completed_packets=[count]))
+
+    def return_withheld(self, handle):
+        """Completions held back (delayed or withheld) go back at once, before
+        the CIS disconnects, as a controller frees its buffers then."""
+        timers = self.iso_delayed.pop(handle, [])
+        for timer in timers:
+            timer.cancel()
+        count = len(timers) + self.withheld.pop(handle, 0)
+        if count:
+            log.info('CIS 0x%04x: %d completion(s) held back returned', handle, count)
+            self.send_completed(handle, count)
 
     def on_hci_iso_data_packet(self, packet):
         handle = packet.connection_handle
@@ -318,9 +410,9 @@ class LeEmuController(EmuController):
         # event loop was stalled (such stalls happen, 60-90 ms): meanwhile,
         # as it delays reading the SDU as much, and while the last completion
         # on the CIS was held up, as the host can only send when its queue
-        # has room. More than HOST_LATE_MS is logged as a late SDU (with 2
-        # SDUs queued per CIS, as BlueCaster does, the host has 2 intervals after
-        # a completion). Only when the host is late by more than
+        # has room. More than HOST_LATE_MS is logged as a late SDU (BlueCaster
+        # sends 2 intervals ahead, so it has that long). Only when the host is
+        # late by more than
         # LATE_INTERVALS does the SDU move to a later interval (a real
         # controller would have flushed it): that is in time, not intervals,
         # at least LATE_US (4 intervals of 7.5 ms, 3 of 10 ms), and as a real
@@ -387,6 +479,7 @@ class LeEmuController(EmuController):
                 deliver()
             self.iso_pending.pop(handle, None)
             self.iso_next_slot.pop(handle, None)
+            self.return_withheld(handle)
 
     def on_le_disconnected(self, connection, reason):
         # The CISes of an ACL go down with it, each with its own Disconnection

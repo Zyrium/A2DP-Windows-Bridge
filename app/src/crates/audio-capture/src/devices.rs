@@ -26,7 +26,7 @@ fn com() -> Result<ComApartment, CaptureError> {
 }
 
 /// An active render endpoint
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceInfo {
     /// WASAPI endpoint ID (IMMDevice::GetId)
     pub id: String,
@@ -230,7 +230,7 @@ pub fn mix_rate(device_id: Option<&str>) -> Option<u32> {
 /// A render device's shared-mode format, for the profile editor's "capture
 /// device" line and its warning when a profile asks for another rate or bit
 /// depth (v1 capture.device_format)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MixFormat {
     /// The mix rate: what a loopback capture delivers without resampling
     pub rate: u32,

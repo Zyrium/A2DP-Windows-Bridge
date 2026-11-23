@@ -318,6 +318,75 @@ pub fn cis_can_send_now(packet: &[u8]) -> Option<CisCanSendNow> {
     })
 }
 
+/// HCI LE CIS Established (v1, or v2 with more fields after these): what
+/// the controller chose for a CIS (Vol 4 Part E 7.7.65.25)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LeCisEstablished {
+    pub status: u8,
+    pub cis_handle: u16,
+    /// Microseconds
+    pub transport_latency_c_to_p: u32,
+    pub transport_latency_p_to_c: u32,
+    /// 1: 1M, 2: 2M, 3: Coded
+    pub phy_c_to_p: u8,
+    pub phy_p_to_c: u8,
+    pub nse: u8,
+    pub bn_c_to_p: u8,
+    pub bn_p_to_c: u8,
+    /// Flush timeout in ISO intervals
+    pub ft_c_to_p: u8,
+    pub ft_p_to_c: u8,
+    pub max_pdu_c_to_p: u16,
+    pub max_pdu_p_to_c: u16,
+    /// 1.25 ms units
+    pub iso_interval: u16,
+}
+
+/// LE CIS Established subevent codes: v1, v2 (Core 5.4)
+const HCI_SUBEVENT_LE_CIS_ESTABLISHED: u8 = 0x19;
+const HCI_SUBEVENT_LE_CIS_ESTABLISHED_V2: u8 = 0x2A;
+
+pub fn le_cis_established(packet: &[u8]) -> Option<LeCisEstablished> {
+    if !event_is(packet, HCI_EVENT_LE_META) {
+        return None;
+    }
+    if !matches!(packet.get(2), Some(&(HCI_SUBEVENT_LE_CIS_ESTABLISHED | HCI_SUBEVENT_LE_CIS_ESTABLISHED_V2))) {
+        return None;
+    }
+    let u24 = |i: usize| -> Option<u32> {
+        Some(u32::from_le_bytes([*packet.get(i)?, *packet.get(i + 1)?, *packet.get(i + 2)?, 0]))
+    };
+    Some(LeCisEstablished {
+        status: *packet.get(3)?,
+        cis_handle: u16_at(packet, 4)? & 0x0FFF,
+        transport_latency_c_to_p: u24(12)?,
+        transport_latency_p_to_c: u24(15)?,
+        phy_c_to_p: *packet.get(18)?,
+        phy_p_to_c: *packet.get(19)?,
+        nse: *packet.get(20)?,
+        bn_c_to_p: *packet.get(21)?,
+        bn_p_to_c: *packet.get(22)?,
+        ft_c_to_p: *packet.get(23)?,
+        ft_p_to_c: *packet.get(24)?,
+        max_pdu_c_to_p: u16_at(packet, 25)?,
+        max_pdu_p_to_c: u16_at(packet, 27)?,
+        iso_interval: u16_at(packet, 29)?,
+    })
+}
+
+/// HCI Number Of Completed Packets: (handle, packets) per entry
+pub fn completed_packets(packet: &[u8]) -> impl Iterator<Item = (u16, u16)> + '_ {
+    let n = if event_is(packet, HCI_EVENT_NUMBER_OF_COMPLETED_PACKETS) {
+        packet.get(2).copied().unwrap_or(0) as usize
+    } else {
+        0
+    };
+    (0..n).filter_map(move |i| {
+        let at = 3 + 4 * i;
+        Some((u16_at(packet, at)? & 0x0FFF, u16_at(packet, at + 2)?))
+    })
+}
+
 /// HCI_EVENT_BIS_CAN_SEND_NOW (to the ISO handler): one per BIS of the
 /// BIG, in BIS order, once every BIS has room. BTstack 1.8.1 emits it
 /// with a length of 4: the BIS handle it stores after the index is cut off
@@ -538,6 +607,17 @@ pub fn gatt_value_update(packet: &[u8]) -> Option<ValueUpdate<'_>> {
         value: packet.get(12..12 + len)?,
         indication,
     })
+}
+
+/// GATT_EVENT_CHARACTERISTIC_VALUE_QUERY_RESULT (a result of
+/// [`crate::Stack::gatt_read_by_type`]): (connection, attribute handle,
+/// value)
+pub fn gatt_characteristic_value_query_result(packet: &[u8]) -> Option<(u16, u16, &[u8])> {
+    if !event_is(packet, GATT_EVENT_CHARACTERISTIC_VALUE_QUERY_RESULT) {
+        return None;
+    }
+    let len = u16_at(packet, 10)? as usize;
+    Some((u16_at(packet, 2)?, u16_at(packet, 8)?, packet.get(12..12 + len)?))
 }
 
 /// GATT_EVENT_QUERY_COMPLETE: (connection, ATT status)

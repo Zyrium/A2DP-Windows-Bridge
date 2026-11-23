@@ -16,6 +16,14 @@
 //! Only an installed copy with an updater key updates itself. The portable
 //! copy (no unins000.exe next to it) and builds without a key show the
 //! release page instead (Phase::Unavailable).
+//!
+//! A window connected to the service add-on updates the user's own install
+//! as well: the service runs its own copy of the core from Program Files,
+//! so nothing of the user's install is in use but this program. The
+//! service refuses `app.quit_for_update` (Windows starts and stops it):
+//! there is no core of the user's to wait for, and this process just
+//! closes for the installer. The next start finds the service at the old
+//! version and offers its update (service.rs).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -210,6 +218,9 @@ async fn install(app: &AppHandle, updates: &Updates, ipc: &Ipc) -> Result<bool, 
             ipc.set_updating(false);
             return Ok(true);
         }
+        // The service add-on's core: it stays, and its files are not the
+        // installer's. Streaming does not stop for this either.
+        Err(e) if e.code == ipc::access::NOT_IN_SERVICE => {}
         // Not running (or gone while answering): nothing to stop
         Err(e) if e.code.starts_with("ipc.") => {}
         Err(e) => return Err(("update.core", e.code)),

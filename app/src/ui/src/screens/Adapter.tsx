@@ -18,9 +18,9 @@ import { useApp } from "../app/context";
 import { saveSettings } from "../app/settings";
 import { Banner, Button, Field, Section, Segmented, Select, Toggle } from "../components/controls";
 import { Icon } from "../components/Icon";
-import { ErrorPanel, FirmwareDownload, openFirmwareFolder, WinusbDialog } from "../components/stream";
+import { ErrorPanel, FirmwareDownload, FirmwareFolderButton, WinusbDialog } from "../components/stream";
 import { t, tm } from "../i18n";
-import type { AdapterInfo, DriverKind, FirmwareFile, ProbeResult } from "../ipc/types";
+import type { AdapterInfo, AdapterState, DriverKind, FirmwareFile, ProbeResult } from "../ipc/types";
 import {
   adapterFirmwareTag,
   buildChipOptions,
@@ -44,6 +44,39 @@ export function usableFirst(list: readonly AdapterInfo[]): AdapterInfo[] {
 }
 
 const hex4 = (n: number) => n.toString(16).toUpperCase().padStart(4, "0");
+
+/** The adapter BlueCaster has open (AdapterState::active, which the core
+ *  takes from this list): the listed one with its VID:PID on WinUSB */
+export function isActiveAdapter(
+  a: Pick<AdapterInfo, "vid" | "pid" | "driver">,
+  active: AdapterState["active"],
+): boolean {
+  return !!active && a.vid === active.vid && a.pid === active.pid && a.driver === "winusb";
+}
+
+/** Settings::adapter_id names this adapter (any case) */
+export function isChosenAdapter(a: Pick<AdapterInfo, "instance_id">, chosen: string): boolean {
+  return chosen.trim() !== "" && a.instance_id.toLowerCase() === chosen.trim().toLowerCase();
+}
+
+/** The adapter button on a card on WinUSB: "auto" on the chosen one (back
+ *  to the first one found), "use" on the others but the one in use while
+ *  none is chosen, none on the rest */
+export function adapterUseButton(
+  a: Pick<AdapterInfo, "instance_id" | "vid" | "pid" | "driver">,
+  chosen: string,
+  active: AdapterState["active"],
+): "use" | "auto" | null {
+  if (a.driver !== "winusb") return null;
+  if (isChosenAdapter(a, chosen)) return "auto";
+  if (chosen.trim() === "" && isActiveAdapter(a, active)) return null;
+  return "use";
+}
+
+/** A chosen adapter that is not on WinUSB (unplugged, or its driver changed) */
+export function chosenMissing(list: readonly AdapterInfo[], chosen: string): boolean {
+  return chosen.trim() !== "" && !list.some((a) => a.driver === "winusb" && isChosenAdapter(a, chosen));
+}
 
 /** "Realtek Bluetooth 5.3 Adapter (RTL8761BU)": the name Device Manager
  *  gives it with the chip (issue #86); before Windows' Bluetooth ever ran
@@ -115,6 +148,12 @@ export function Adapter() {
   const adapter = () => snap().adapter;
   // The order shown; the chip section goes with its adapter in it
   const sorted = () => usableFirst(adapter().adapters);
+  // The adapter to use (Settings::adapter_id): a button on each card, once
+  // two are on WinUSB or while one is chosen
+  const chosen = () => snap().settings.adapter_id ?? "";
+  const showChoice = () =>
+    adapter().adapters.filter((a) => a.driver === "winusb").length > 1 || chosen().trim() !== "";
+  const choose = (adapter_id: string) => void saveSettings(app, { adapter_id });
   // The card the chip choice goes in; none for an adapter BlueCaster cannot
   // use, the choice then stands on its own below the cards
   const chipCard = () => {
@@ -210,7 +249,27 @@ export function Adapter() {
       <p class={`status-line st-${adapter().status}`} role="status">
         <span class="dot" aria-hidden="true" />
         {t("ui.adapter.stack")}: {t(`ui.adapter.status_${adapter().status}`)}
+        {/* Which adapter it has open */}
+        <Show when={adapter().active}>
+          {(a) => (
+            <>
+              {" · "}
+              {t("ui.adapter.active_line", a().windows_name || a().display_name)}
+            </>
+          )}
+        </Show>
       </p>
+      <Show when={chosenMissing(adapter().adapters, chosen())}>
+        <Banner
+          kind="warn"
+          title={t("ui.adapter.use_missing")}
+          actions={
+            <Button icon="arrow_reset" onClick={() => choose("")}>
+              {t("ui.adapter.use_auto")}
+            </Button>
+          }
+        />
+      </Show>
       {/* A firmware loader while the adapter starts (Intel's download), and
           how it ended: "ready" and its steps in developer mode only */}
       <Show when={adapter().loader && (developer() || adapter().loader!.ok !== true) && adapter().loader}>
@@ -267,18 +326,60 @@ export function Adapter() {
             const driverHead = createUniqueId();
             const firmwareHead = createUniqueId();
             return (
-              <section class="card adapter-card" aria-label={adapterName(a)}>
+              <section
+                class="card adapter-card"
+                classList={{ "adapter-active": isActiveAdapter(a, adapter().active) }}
+                aria-label={adapterName(a)}
+              >
                 <div class="adapter-head">
                   <Icon name="usb_stick" />
                   <div>
                     {/* Device Manager's name; the USB device's own on hover */}
                     <h2 title={a.device_name}>
                       {adapterName(a)}
+                      <Show when={isActiveAdapter(a, adapter().active)}>
+                        {" "}
+                        <span class="tag st-good">{t("ui.adapter.active")}</span>
+                      </Show>
+                      <Show when={isChosenAdapter(a, chosen()) && !isActiveAdapter(a, adapter().active)}>
+                        {" "}
+                        <span class="tag st-warn" title={t("ui.adapter.chosen_hint")}>
+                          {t("ui.adapter.chosen")}
+                        </span>
+                      </Show>
                     </h2>
                     <span class="muted mono" title={adapterIdsHint(a)}>
                       {adapterIds(a)}
                     </span>
                   </div>
+                  {/* Which adapter BlueCaster opens */}
+                  <Show when={showChoice() && adapterUseButton(a, chosen(), adapter().active)}>
+                    {(b) => (
+                      <div class="adapter-use">
+                        <Show
+                          when={b() === "use"}
+                          fallback={
+                            <Button
+                              icon="arrow_reset"
+                              title={t("ui.adapter.use_auto_hint")}
+                              onClick={() => choose("")}
+                            >
+                              {t("ui.adapter.use_auto")}
+                            </Button>
+                          }
+                        >
+                          <Button
+                            kind="strong"
+                            icon="checkmark"
+                            title={t("ui.adapter.use_hint")}
+                            onClick={() => choose(a.instance_id)}
+                          >
+                            {t("ui.adapter.use")}
+                          </Button>
+                        </Show>
+                      </div>
+                    )}
+                  </Show>
                 </div>
                 <div class="adapter-boxes">
                   <div class="adapter-box" role="group" aria-labelledby={driverHead}>
@@ -454,9 +555,7 @@ function ChipSection(props: { files: FirmwareFile[]; onChanged: () => Promise<vo
         <Show when={props.adapter?.firmware_download && props.adapter}>
           {(a) => <FirmwareDownload files={a().firmware_files} kind={a().firmware_present ? undefined : "strong"} />}
         </Show>
-        <Button icon="folder_open" kind="subtle" onClick={() => void openFirmwareFolder(app)}>
-          {t("firmware.open_folder")}
-        </Button>
+        <FirmwareFolderButton kind="subtle" />
         <Button icon="open" kind="subtle" onClick={() => app.core.transport.openUrl(LINKS.setupGuide)}>
           {t("ui.setup.guide")}
         </Button>
@@ -497,9 +596,7 @@ function VendorFirmwareBox(props: { adapter: AdapterInfo }) {
           </Button>
         )}
       </Show>
-      <Button icon="folder_open" kind="subtle" onClick={() => void openFirmwareFolder(app)}>
-        {t("firmware.open_folder")}
-      </Button>
+      <FirmwareFolderButton kind="subtle" />
       <Show when={guide}>
         <Button icon="open" kind="subtle" onClick={() => app.core.transport.openUrl(LINKS.setupGuide)}>
           {t("ui.setup.guide")}

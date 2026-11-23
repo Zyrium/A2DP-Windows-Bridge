@@ -31,8 +31,8 @@ use crate::rfcomm::{Rfcomm, TIMER_RFCOMM};
 use crate::sdp_services::SdpServices;
 use crate::shared::Shared;
 use crate::stats::LinkStats;
-use crate::{AfhClassification, ConnectFailure, Controls, DiscoveredDevice, HostEvent, InitFailure, MediaKey};
-use crate::{intel, mediatek, qualcomm, realtek_btnic};
+use crate::{AfhClassification, Button, ConnectFailure, Controls, DiscoveredDevice, HostEvent, InitFailure, MediaKey};
+use crate::{atheros, broadcom, intel, mediatek, qualcomm, realtek_btnic};
 
 pub(crate) type Job = Box<dyn FnOnce(&mut HostApp, &Stack) + Send>;
 
@@ -48,6 +48,8 @@ const TIMER_LINK_COMMAND: u32 = 8;
 const TIMER_ESCO_WATCH: u32 = 9;
 /// Packets waiting on a stream that takes none (crate::stall_watch)
 const TIMER_STALL_WATCH: u32 = 10;
+/// The keyboards' lights follow Windows' lock keys (crate::hid)
+const TIMER_HID_LEDS: u32 = 11;
 const RTK_VERIFY_RETRY_MS: u32 = 100;
 const RTK_VERIFY_TRIES: u8 = 20;
 /// Each L2CAP packet starts with a 4-byte header
@@ -76,6 +78,8 @@ pub(crate) struct Setup {
     /// HostConfig::realtek_firmware_file
     pub realtek_firmware_file: Option<PathBuf>,
     pub broadcom_ids: Vec<(u16, u16)>,
+    /// HostConfig::broadcom_marks
+    pub broadcom_marks: Option<std::sync::Arc<dyn broadcom::PatchMarks>>,
     /// HFP audio gateway for the headphones' battery level
     pub battery: bool,
     /// The HFP audio gateway also offers the audio connection
@@ -89,6 +93,10 @@ pub(crate) struct Setup {
     pub local_name: String,
     /// HostConfig::le_keys
     pub le_keys: Option<crate::LeKeysConfig>,
+    /// HostConfig::hid
+    pub hid: Option<crate::HidConfig>,
+    /// What classic and LE keyboards and mice share (the LE core has it too)
+    pub hid_engine: crate::hid::SharedHid,
 }
 
 /// LMP subversions Realtek chips report while running their ROM code,
@@ -144,6 +152,8 @@ pub(crate) struct HostApp {
     pub hfp_acl: Option<u16>,
     /// The HFP audio connection (headset microphone)
     pub voice: crate::voice::Voice,
+    /// Keyboards and mice (experimental, HostConfig::hid)
+    pub hid: crate::hid::HidHost,
     pub streaming: bool,
     /// Codec of the configured stream (RTP or not)
     pub stream_codec: Option<CodecKind>,
@@ -250,6 +260,7 @@ impl HostApp {
         afh: Option<Box<dyn crate::AfhSource>>,
         le: Option<LeCore>,
     ) -> HostApp {
+        let hid = crate::hid::HidHost::new(setup.hid_engine.clone());
         HostApp {
             shared,
             controls,
@@ -270,6 +281,7 @@ impl HostApp {
             remote_addr: None,
             hfp_acl: None,
             voice: Default::default(),
+            hid,
             streaming: false,
             stream_codec: None,
             endpoints: HashMap::new(),
@@ -372,6 +384,18 @@ impl HostApp {
         self.start_loader(stack, Box::new(loader));
     }
 
+    /// The Qualcomm Atheros AR30xx patch and system configuration download
+    /// (crate::atheros), then HCI init: the firmware folder first, then
+    /// Qualcomm Atheros' Windows driver
+    pub fn start_atheros_loader(&mut self, stack: &Stack) {
+        let dir = self.setup.firmware_dir.clone();
+        tracing::info!("Qualcomm Atheros adapter: checking its firmware, folder {}", dir.display());
+        let loader = atheros::Loader::new(Box::new(move |name| {
+            read_firmware_file(&dir, "qca", name).or_else(|| atheros::from_windows_driver(name))
+        }));
+        self.start_loader(stack, Box::new(loader));
+    }
+
     /// The download of a Realtek chip whose firmware only Realtek's Windows
     /// driver has (crate::realtek_btnic), then HCI init: the firmware folder
     /// first, then the driver
@@ -385,6 +409,30 @@ impl HostApp {
             chip,
             file,
         );
+        self.start_loader(stack, Box::new(loader));
+    }
+
+    /// The patch of Broadcom's Windows driver (crate::broadcom), then HCI
+    /// init: the firmware folder first, then the driver. A .hcd in the
+    /// firmware folder for the adapter goes BTstack's way instead, during
+    /// HCI init (the transport is installed already).
+    pub fn start_broadcom_loader(&mut self, stack: &Stack) {
+        let dir = self.setup.firmware_dir.clone();
+        if find_bcm_hcd(&dir, &self.setup.broadcom_ids).is_some() {
+            tracing::info!("Broadcom adapter: the firmware folder's .hcd is used instead of Broadcom's driver's patch");
+            self.setup_hci_and_power_on(stack, None);
+            return;
+        }
+        tracing::info!("Broadcom adapter: checking its patch");
+        // No .hcd in the folder: BTstack's PatchRAM check after Read Local
+        // Version has nothing to do
+        self.bcm_checked = true;
+        let mut loader = broadcom::Loader::new(Box::new(move |name| {
+            read_firmware_file(&dir, "brcm", name).or_else(|| broadcom::from_windows_driver(name))
+        }));
+        if let Some(marks) = self.setup.broadcom_marks.clone() {
+            loader = loader.with_marks(marks, env!("CARGO_PKG_VERSION"));
+        }
         self.start_loader(stack, Box::new(loader));
     }
 
@@ -531,7 +579,13 @@ impl HostApp {
                     e => e.to_string(),
                 };
                 self.show_loader_done(vendor, said, false);
-                self.init_failed(InitFailure::Failed);
+                // The adapter's start fails with the advice to replug it
+                let failure = if matches!(e, bringup::LoadError::Replug(_)) {
+                    InitFailure::NeedsReplug
+                } else {
+                    InitFailure::Failed
+                };
+                self.init_failed(failure);
             }
         }
     }
@@ -606,6 +660,11 @@ impl HostApp {
         if self.setup.battery || self.setup.voice {
             stack.hfp_ag_init(self.setup.voice);
             self.voice.on_ag_init();
+        }
+        // Keyboards and mice (experimental, developer mode; issue #413)
+        if self.setup.hid.is_some() {
+            self.hid.stack_init(stack);
+            stack.timer_start(TIMER_HID_LEDS, crate::hid::LEDS_TICK_MS);
         }
         // LE Audio (developer mode): SM, GATT client / server, ISO. Without
         // it only SM and the bonds file, for the LE keys of classic devices
@@ -1388,10 +1447,29 @@ impl HostApp {
                 }
             }
             HCI_EVENT_PIN_CODE_REQUEST => {
+                let Some(addr) = addr_at(p, 2) else { return };
+                // A keyboard being added (legacy pairing): a PIN of
+                // BlueCaster's, shown to the user, who types it on the
+                // keyboard. Neither address nor PIN in the log.
+                let pin = crate::hid::Passkey::random();
+                if self.setup.hid_engine.borrow_mut().passkey_shown(&[addr], pin) {
+                    tracing::info!("hid: legacy pairing of the new device, answering with the number shown");
+                    stack.pin_code_response(&addr, &pin.digits());
+                    return;
+                }
                 // Legacy pairing: the default PIN
-                if let Some(addr) = addr_at(p, 2) {
-                    tracing::info!("PIN code requested by {} (legacy pairing), answering 0000", addr_str(&addr));
-                    stack.pin_code_response(&addr, "0000");
+                tracing::info!("PIN code requested by {} (legacy pairing), answering 0000", addr_str(&addr));
+                stack.pin_code_response(&addr, "0000");
+            }
+            HCI_EVENT_USER_PASSKEY_NOTIFICATION => {
+                // The device types the number (only the device being added
+                // as a keyboard is answered as a display, see shim.c)
+                let (Some(addr), Some(value)) = (addr_at(p, 2), p.get(8..12)) else { return };
+                let mut v = [0u8; 4];
+                v.copy_from_slice(value);
+                let passkey = crate::hid::Passkey::new(u32::from_le_bytes(v));
+                if !self.setup.hid_engine.borrow_mut().passkey_shown(&[addr], passkey) {
+                    tracing::warn!("pairing: a device asks for a number to be typed on it, which is not shown");
                 }
             }
             // Security steps, logged so that an authentication failure
@@ -1405,6 +1483,8 @@ impl HostApp {
                 // The key itself (bytes 8..24) is never logged
                 if let (Some(addr), Some(kind)) = (addr_at(p, 2), u8_at(p, 24)) {
                     tracing::info!("new link key from pairing with {} (type {kind})", addr_str(&addr));
+                    // A keyboard being added paired (legacy pairing ends here)
+                    self.setup.hid_engine.borrow_mut().pairing_end(stack, Some(&addr), None);
                 }
             }
             HCI_EVENT_IO_CAPABILITY_RESPONSE => {
@@ -1428,6 +1508,9 @@ impl HostApp {
                             hci_error_string(status)
                         );
                     }
+                    // A keyboard being added: its number goes away, and
+                    // pairing is as usual again
+                    self.setup.hid_engine.borrow_mut().pairing_end(stack, Some(&addr), None);
                 }
             }
             HCI_EVENT_AUTHENTICATION_COMPLETE => {
@@ -2439,6 +2522,11 @@ impl HostApp {
     }
 
     fn on_button(&mut self, stack: &Stack, op: u8, pressed: bool) {
+        // The IPC clients get every known button, press and release, also
+        // with the media keys off
+        if let Some(button) = avrcp_button(op) {
+            let _ = self.events.send(HostEvent::Button { button, pressed, le_audio: false });
+        }
         // A button sends a press and then a release; act on the press
         if !pressed {
             return;
@@ -2700,6 +2788,24 @@ impl HostApp {
             _ => {}
         }
     }
+
+    /// Windows' lock keys read; every keyboard that shows other lights is
+    /// sent them (also one connected since the last tick whose report could
+    /// not go out yet)
+    fn hid_leds_tick(&mut self, stack: &Stack) {
+        let any = {
+            let mut engine = self.setup.hid_engine.borrow_mut();
+            engine.poll_leds();
+            engine.leds().is_some() && !engine.connected().is_empty()
+        };
+        if !any {
+            return;
+        }
+        self.hid.sync_leds(stack);
+        if let Some(le) = self.le.as_mut().filter(|le| le.initialized()) {
+            le.run(stack, crate::le::modules::hogp::HogpModule::sync_leds);
+        }
+    }
 }
 
 impl App for HostApp {
@@ -2748,6 +2854,11 @@ impl App for HostApp {
             }
             Source::SdpClient => self.rfcomm.on_sdp(stack, packet),
             Source::SdpServices => self.sdp_services.on_event(packet),
+            Source::Hid => {
+                if event_type(packet) == Some(HCI_EVENT_HID_META) {
+                    self.hid.on_event(stack, packet)
+                }
+            }
             Source::Rfcomm | Source::Sco => {}
             Source::Avrcp | Source::AvrcpController | Source::AvrcpTarget => {
                 if event_type(packet) == Some(HCI_EVENT_AVRCP_META) {
@@ -2803,6 +2914,10 @@ impl App for HostApp {
             TIMER_LINK_COMMAND => self.link_command_timeout(stack),
             TIMER_ESCO_WATCH => self.esco_tick(stack),
             TIMER_STALL_WATCH => self.stall_tick(stack),
+            TIMER_HID_LEDS => {
+                self.hid_leds_tick(stack);
+                stack.timer_start(TIMER_HID_LEDS, crate::hid::LEDS_TICK_MS);
+            }
             TIMER_LOADER => {
                 if let Some(loader) = self.loader.as_mut() {
                     let actions = loader.on_timeout();
@@ -2838,6 +2953,8 @@ impl App for HostApp {
         tracing::debug!("run loop exit (a2dp cid 0x{:04X}, avrcp cid 0x{:04X})", self.a2dp_cid, self.avrcp_cid);
         self.set_streaming(false);
         self.rfcomm.stop();
+        // Nothing may stay pressed in Windows
+        self.hid.stop();
         if let Some(le) = self.le.as_mut() {
             le.stack_deinit(stack);
         }
@@ -2936,6 +3053,24 @@ fn completed_counts(p: &[u8]) -> Vec<(u16, u16)> {
         .collect()
 }
 
+/// The button of an AVRCP pass-through operation; None for one that has
+/// no name in the IPC (numbers, channels, menus)
+fn avrcp_button(op: u8) -> Option<Button> {
+    Some(match op {
+        AVRCP_OPERATION_ID_PLAY => Button::Play,
+        AVRCP_OPERATION_ID_PAUSE => Button::Pause,
+        AVRCP_OPERATION_ID_STOP => Button::Stop,
+        AVRCP_OPERATION_ID_FORWARD => Button::Next,
+        AVRCP_OPERATION_ID_BACKWARD => Button::Previous,
+        AVRCP_OPERATION_ID_FAST_FORWARD => Button::FastForward,
+        AVRCP_OPERATION_ID_REWIND => Button::Rewind,
+        AVRCP_OPERATION_ID_VOLUME_UP => Button::VolumeUp,
+        AVRCP_OPERATION_ID_VOLUME_DOWN => Button::VolumeDown,
+        AVRCP_OPERATION_ID_MUTE => Button::Mute,
+        _ => return None,
+    })
+}
+
 /// A debug command's return parameters as hex bytes for the log, the
 /// controller's own address (little-endian, as HCI carries it) replaced:
 /// the diagnostics mask only addresses written as addresses
@@ -2958,8 +3093,23 @@ fn return_bytes(bytes: &[u8], local_address: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectFailure, completed_counts, missing_loader_warning, remove_alias, return_bytes, signaling_failure,
+        ConnectFailure, avrcp_button, completed_counts, missing_loader_warning, remove_alias, return_bytes,
+        signaling_failure,
     };
+    use crate::Button;
+    use btstack_sys::consts::*;
+
+    #[test]
+    fn avrcp_operations_name_their_buttons() {
+        assert_eq!(avrcp_button(AVRCP_OPERATION_ID_PLAY), Some(Button::Play));
+        assert_eq!(avrcp_button(AVRCP_OPERATION_ID_PAUSE), Some(Button::Pause));
+        assert_eq!(avrcp_button(AVRCP_OPERATION_ID_FORWARD), Some(Button::Next));
+        assert_eq!(avrcp_button(AVRCP_OPERATION_ID_BACKWARD), Some(Button::Previous));
+        assert_eq!(avrcp_button(AVRCP_OPERATION_ID_FAST_FORWARD), Some(Button::FastForward));
+        assert_eq!(avrcp_button(AVRCP_OPERATION_ID_VOLUME_DOWN), Some(Button::VolumeDown));
+        // A number key
+        assert_eq!(avrcp_button(0x20), None);
+    }
 
     #[test]
     fn counts_completed_packets_by_handle() {

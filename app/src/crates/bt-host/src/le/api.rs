@@ -35,6 +35,8 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(3);
 const START_TIMEOUT: Duration = Duration::from_secs(45);
 const STOP_TIMEOUT: Duration = Duration::from_secs(8);
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// [`BtHost::le_connect_within`]: the link did not come up
+pub const LE_NO_LINK: &str = "no answer at that address";
 /// Waits look at the cancel this often
 const POLL: Duration = Duration::from_millis(50);
 const FIND_POLL: Duration = Duration::from_millis(100);
@@ -69,7 +71,13 @@ impl BtHost {
     /// LE Audio usable: configured, the LE core initialized and HCI working
     /// (v1 Core::ready)
     pub fn le_ready(&self) -> bool {
-        self.le_on && self.le.initialized.load(Ordering::Acquire) && self.le.hci_working.load(Ordering::Acquire)
+        self.le_on && self.le_core_ready()
+    }
+
+    /// The LE core runs and HCI works: LE Audio, or keyboards and mice
+    /// without it (an LE scan for them works then)
+    pub fn le_core_ready(&self) -> bool {
+        self.le_core_on && self.le.initialized.load(Ordering::Acquire) && self.le.hci_working.load(Ordering::Acquire)
     }
 
     /// ISO buffers of the controller (LE Read Buffer Size v2):
@@ -133,13 +141,13 @@ impl BtHost {
 
     /// Starts an LE scan that runs beside a classic one
     /// ([`BtHost::scan_with`]) until [`BtHost::le_scan_stop`]: half the time
-    /// on air, the rest left to the inquiry and name requests. False when LE
-    /// Audio is not ready.
+    /// on air, the rest left to the inquiry and name requests. False when
+    /// the LE core is not ready (LE Audio, or keyboards and mice).
     pub fn le_scan_start(&self) -> bool {
-        if !self.le_ready() {
+        if !self.le_core_ready() {
             return false;
         }
-        tracing::info!("LE Audio: scanning beside the classic scan");
+        tracing::info!("{}: scanning beside the classic scan", if self.le_on { "LE Audio" } else { "LE" });
         self.le_run(RUN_TIMEOUT, |ctx| ctx.start_scan_with(SHARED_SCAN_INTERVAL, SHARED_SCAN_WINDOW)).is_some()
     }
 
@@ -159,22 +167,49 @@ impl BtHost {
     /// the result's `addr` is the address it advertises now (connect with
     /// that). None on timeout / cancel.
     pub fn le_find(&self, addr: [u8; 6], timeout: Duration) -> Option<LeScanResult> {
-        if !self.le_ready() {
+        self.le_find_any(&[addr], timeout).map(|(_, r)| r)
+    }
+
+    /// [`BtHost::le_find`] for the first of several devices to show up (the
+    /// members of a coordinated set: whichever earbud is out of its case):
+    /// its index in `addrs` and what was found. None on timeout / cancel or
+    /// when `addrs` is empty.
+    pub fn le_find_any(&self, addrs: &[[u8; 6]], timeout: Duration) -> Option<(usize, LeScanResult)> {
+        self.find_any(addrs, timeout, false)
+    }
+
+    /// [`BtHost::le_find_any`] with a scan that leaves the radio to a
+    /// running stream most of the time (a short window every
+    /// 200 ms, [`QUIET_SCAN_INTERVAL`](super::core::QUIET_SCAN_INTERVAL)): the other earbud of a set looked for while
+    /// one plays
+    pub fn le_find_any_quietly(&self, addrs: &[[u8; 6]], timeout: Duration) -> Option<(usize, LeScanResult)> {
+        self.find_any(addrs, timeout, true)
+    }
+
+    fn find_any(&self, addrs: &[[u8; 6]], timeout: Duration, quiet: bool) -> Option<(usize, LeScanResult)> {
+        if !self.le_ready() || addrs.is_empty() {
             return None;
         }
         self.le_fresh_operation();
-        let want = LeAddr { addr, addr_type: LeAddr::RANDOM };
-        self.le_run(RUN_TIMEOUT, move |ctx| ctx.start_find(want));
+        let wants: Vec<LeAddr> = addrs.iter().map(|&addr| LeAddr { addr, addr_type: LeAddr::RANDOM }).collect();
+        let w = wants.clone();
+        self.le_run(RUN_TIMEOUT, move |ctx| ctx.start_find(&w, quiet));
         let end = Instant::now() + timeout;
         let mut found = None;
-        tracing::debug!("LE Audio: find {want} for {} ms", timeout.as_millis());
+        let shown = wants.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+        tracing::debug!("LE Audio: find {shown} for {} ms", timeout.as_millis());
         while found.is_none() && Instant::now() < end && !self.le_cancelled() {
             std::thread::sleep(FIND_POLL);
-            found = self.le_run(RUN_TIMEOUT, move |ctx| ctx.find_match(want)).flatten();
+            let w = wants.clone();
+            found = self
+                .le_run(RUN_TIMEOUT, move |ctx| {
+                    w.iter().enumerate().find_map(|(i, &want)| Some((i, ctx.find_match(want)?)))
+                })
+                .flatten();
         }
         tracing::debug!(
-            "LE Audio: find {want}: {}",
-            found.as_ref().map_or("not found".to_string(), |r| format!("{} (type {})", r.addr, r.addr.addr_type))
+            "LE Audio: find {shown}: {}",
+            found.as_ref().map_or("not found".to_string(), |(_, r)| format!("{} (type {})", r.addr, r.addr.addr_type))
         );
         self.le_run(RUN_TIMEOUT, |ctx| {
             ctx.stop_scan();
@@ -188,7 +223,21 @@ impl BtHost {
     /// once. `addr` may be an RPA or the identity of a bonded device: the id
     /// is the same for both. Err: why, for the log.
     pub fn le_connect(&self, addr: LeAddr, name: &str, timeout: Duration) -> Result<LeDeviceId, String> {
-        self.le_connect_as(addr, name, timeout, false)
+        self.le_connect_within(addr, name, timeout, timeout)
+    }
+
+    /// [`BtHost::le_connect`] that gives up ([`LE_NO_LINK`]) when the link
+    /// is not up after `link`: the private address of an earbud seen a moment
+    /// ago may be gone already (a WF-1000XM6 gave no answer for 30 s). To be
+    /// looked for again then.
+    pub fn le_connect_within(
+        &self,
+        addr: LeAddr,
+        name: &str,
+        link: Duration,
+        timeout: Duration,
+    ) -> Result<LeDeviceId, String> {
+        self.le_connect_inner(addr, name, link, timeout, false)
     }
 
     /// Connects for GATT only: no pairing, no encryption request, no
@@ -197,7 +246,7 @@ impl BtHost {
     /// For peripherals with their own control channel that is open without
     /// bonding. [`BtHost::le_disconnect`] ends it.
     pub fn le_connect_plain(&self, addr: LeAddr, name: &str, timeout: Duration) -> Result<LeDeviceId, String> {
-        self.le_connect_as(addr, name, timeout, true)
+        self.le_connect_inner(addr, name, timeout, timeout, true)
     }
 
     /// le_connect_plain that takes the GATT cache of an earlier link
@@ -222,10 +271,17 @@ impl BtHost {
         if set.is_none() {
             return Err("LE Audio is not running".into());
         }
-        self.le_connect_as(addr, name, timeout, true)
+        self.le_connect_inner(addr, name, timeout, timeout, true)
     }
 
-    fn le_connect_as(&self, addr: LeAddr, name: &str, timeout: Duration, plain: bool) -> Result<LeDeviceId, String> {
+    fn le_connect_inner(
+        &self,
+        addr: LeAddr,
+        name: &str,
+        link: Duration,
+        timeout: Duration,
+        plain: bool,
+    ) -> Result<LeDeviceId, String> {
         if !self.le_ready() {
             return Err("LE Audio is not running".into());
         }
@@ -236,9 +292,23 @@ impl BtHost {
         );
         let result = Arc::new(Mutex::new(ConnectResult::default()));
         let (r, name) = (result.clone(), name.to_string());
-        let ok = self.le_wait(timeout, true, move |ctx, done| {
-            if plain { ctx.start_connect_plain(addr, name, r, done) } else { ctx.start_connect(addr, name, r, done) }
-        });
+        let up = || {
+            let r = result.clone();
+            self.le_run(RUN_TIMEOUT, move |ctx| {
+                let id = r.lock().unwrap_or_else(|e| e.into_inner()).id;
+                id.is_some_and(|i| ctx.device(LeDeviceId(i)).is_some_and(|d| d.connected()))
+            })
+            .unwrap_or(false)
+        };
+        let mut no_link = false;
+        let ok = self.le_wait_link(
+            timeout,
+            true,
+            move |ctx, done| {
+                if plain { ctx.start_connect_plain(addr, name, r, done) } else { ctx.start_connect(addr, name, r, done) }
+            },
+            Some((link, &up, &mut no_link)),
+        );
         let (id, error) = {
             let r = result.lock().unwrap_or_else(|e| e.into_inner());
             (r.id, r.error.clone())
@@ -253,6 +323,8 @@ impl BtHost {
                     error
                 } else if self.le_cancelled() {
                     "cancelled".into()
+                } else if no_link {
+                    LE_NO_LINK.into()
                 } else {
                     "no answer (timeout)".into()
                 };
@@ -465,6 +537,7 @@ impl BtHost {
         }
         self.le.stream_lost.store(false, Ordering::Release);
         self.le.set_members_missing.store(0, Ordering::Release);
+        self.le.stream_dropped.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let hooks = self.le.hooks();
         let cancelled = || self.le_cancelled();
         for h in &hooks {
@@ -509,6 +582,8 @@ impl BtHost {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .configure(queue_depth(iso_count, sending).max(1), silence(&plan));
+        // Those the plan streams to (one gone meanwhile is left out)
+        devices.retain(|d| plan.cis.iter().any(|c| c.device_id == d.0));
         let status = LeStreamStatus { active: false, plan: plan.clone(), devices, summary: plan.describe() };
 
         // The microphone's SDUs: a lock-free ring from the BTstack thread
@@ -596,6 +671,9 @@ impl BtHost {
         if !self.le_ready() {
             return Err("LE Audio is not running".into());
         }
+        // A user operation: the cancel of the last stop would end its wait
+        // at the first poll (several BIGs take longer than that to come up)
+        self.le_fresh_operation();
         let (iso_len, iso_count) = self.le_iso_buffers();
         if iso_len == 0 || iso_count == 0 {
             let why = "adapter does not support LE Audio (no ISO buffers)";
@@ -603,8 +681,8 @@ impl BtHost {
             return Err(why.into());
         }
         let plan = le_audio::broadcast::plan(&config);
-        if usize::from(plan.preset.octets) + 4 > usize::from(iso_len) {
-            let why = format!("SDUs of {} octets do not fit the adapter's ISO packets", plan.preset.octets);
+        if usize::from(plan.max_octets()) + 4 > usize::from(iso_len) {
+            let why = format!("SDUs of {} octets do not fit the adapter's ISO packets", plan.max_octets());
             tracing::error!("Auracast: cannot broadcast: {why}");
             return Err(why);
         }
@@ -632,10 +710,12 @@ impl BtHost {
             return Err(reason);
         }
         let plan = self.le_run(RUN_TIMEOUT, |ctx| ctx.broadcast_plan()).flatten().unwrap_or(plan);
+        let groups = le_audio::broadcast::groups(&config);
+        let names: Vec<String> =
+            groups.iter().map(|g| format!("\"{}\" (Broadcast ID 0x{:06X})", g.name, g.broadcast_id)).collect();
         tracing::info!(
-            "Auracast: broadcasting \"{}\", Broadcast ID 0x{:06X}, {}: {summary}",
-            config.name,
-            config.broadcast_id,
+            "Auracast: broadcasting {}, {}: {summary}",
+            names.join(" + "),
             if config.code.is_some() { "encrypted" } else { "open" }
         );
         let status = LeStreamStatus { active: true, plan, devices: Vec::new(), summary };
@@ -663,10 +743,29 @@ impl BtHost {
         self.le.stream_lost.swap(false, Ordering::AcqRel)
     }
 
+    /// Devices of the running stream that went away while the others play
+    /// on (an earbud put in its case), and one that ended the stream with
+    /// its ASE; cleared when a stream starts
+    pub fn le_stream_dropped(&self) -> Vec<LeDeviceId> {
+        self.le.stream_dropped.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Members of the last stream's coordinated sets left out (not found,
     /// or down): it plays on the others, e.g. one earbud of two
     pub fn le_set_members_missing(&self) -> u32 {
         self.le.set_members_missing.load(Ordering::Acquire)
+    }
+
+    /// How long the stream set-ups from now on look for the members of a
+    /// coordinated set that are not connected: None, CSIP's own 10 s; zero,
+    /// not at all (the stream goes to the members connected). Per BtHost.
+    pub fn le_set_member_wait(&self, wait: Option<Duration>) {
+        tracing::debug!("LE Audio: look for missing set members: {wait:?}");
+        *self.le.set_member_wait.lock().unwrap_or_else(|e| e.into_inner()) = wait;
+    }
+
+    pub(crate) fn le_member_wait(&self) -> Option<Duration> {
+        *self.le.set_member_wait.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// CSIP: `n` members of a set are left out of the stream being set up
@@ -682,6 +781,13 @@ impl BtHost {
     /// The devices the LE core knows
     pub fn le_devices(&self) -> Vec<LeDeviceInfo> {
         self.le_run(RUN_TIMEOUT, |ctx| ctx.device_infos()).unwrap_or_default()
+    }
+
+    /// The coordinated sets the CSIP module knows: (the set's
+    /// `LeScanResult::set_id`, the identity addresses of its bonded and
+    /// connected members). Empty without LE Audio.
+    pub fn le_known_sets(&self) -> Vec<(u32, Vec<[u8; 6]>)> {
+        self.le_run(RUN_TIMEOUT, super::modules::csip::known_sets).unwrap_or_default()
     }
 
     /// Headset volume through the modules (VCP), 0-127, None while unknown;
@@ -719,7 +825,7 @@ impl BtHost {
         timeout: Duration,
         f: impl FnOnce(&mut LeCtx<'_>) -> R + Send + 'static,
     ) -> Option<R> {
-        if !self.le_on {
+        if !self.le_core_on {
             return None;
         }
         self.call(timeout, move |app, stack| app.le.as_mut().filter(|le| le.initialized()).map(|le| le.run(stack, f)))
@@ -741,9 +847,22 @@ impl BtHost {
         cancellable: bool,
         f: impl FnOnce(&mut LeCtx<'_>, LeDone) + Send + 'static,
     ) -> bool {
-        if !self.le_on {
+        self.le_wait_link(timeout, cancellable, f, None)
+    }
+
+    /// [`BtHost::le_wait`] that ends early, noting it, when `link`'s check
+    /// is false after its time
+    fn le_wait_link(
+        &self,
+        timeout: Duration,
+        cancellable: bool,
+        f: impl FnOnce(&mut LeCtx<'_>, LeDone) + Send + 'static,
+        mut link: Option<(Duration, &dyn Fn() -> bool, &mut bool)>,
+    ) -> bool {
+        if !self.le_core_on {
             return false;
         }
+        let start = Instant::now();
         let signal = Arc::new(Signal::default());
         let s = signal.clone();
         let done: LeDone = Box::new(move |ok| s.set(ok));
@@ -759,6 +878,13 @@ impl BtHost {
             }
             if cancellable && self.le_cancelled() {
                 tracing::debug!("LE Audio: wait cancelled");
+                return false;
+            }
+            if let Some((_, up, none)) = link.take_if(|(after, ..)| *after < timeout && start.elapsed() >= *after)
+                && !up()
+            {
+                tracing::debug!("LE Audio: no link within {} ms", start.elapsed().as_millis());
+                *none = true;
                 return false;
             }
             if Instant::now() >= deadline {

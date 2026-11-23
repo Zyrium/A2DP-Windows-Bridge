@@ -11,20 +11,13 @@ use std::sync::Arc;
 
 use ipc::{ErrorInfo, Msg};
 use serde_json::Value;
+use session_host::elevation::ElevatedError;
 use win_sys::bt_radios::WindowsRadio;
-use win_sys::elevation::{self, ElevationError};
 
 use crate::state::CoreState;
 
 fn err(code: &str, key: &str) -> ErrorInfo {
     ErrorInfo { code: code.into(), message: Msg::new(key) }
-}
-
-fn helper() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("bluecaster-driver.exe")))
-        .unwrap_or_else(|| "bluecaster-driver.exe".into())
 }
 
 /// File of the assignment record of an adapter
@@ -34,7 +27,7 @@ fn record_path(state: &CoreState, instance_id: &str) -> PathBuf {
 
 pub(crate) fn run(config: &Path, args: &[&str]) -> Result<(u32, Value), ErrorInfo> {
     run_with(config, args, |e| match e {
-        ElevationError::Cancelled => err("adapter.uac_cancelled", "error.uac_cancelled"),
+        ElevatedError::Cancelled => err("adapter.uac_cancelled", "error.uac_cancelled"),
         _ => {
             tracing::error!("driver helper: {e}");
             err("adapter.driver_failed", "error.driver_failed")
@@ -42,32 +35,27 @@ pub(crate) fn run(config: &Path, args: &[&str]) -> Result<(u32, Value), ErrorInf
     })
 }
 
-/// `run` with the caller's errors for a failed start (UAC cancelled, ...)
+/// `run` with the caller's errors for a failed start (UAC cancelled, ...).
+/// The session host runs the helper (in the agent when it does the
+/// session's work: a service shows no UAC prompt) and adds its `--out`.
 pub(crate) fn run_with(
     config: &Path,
     args: &[&str],
-    start_failed: impl FnOnce(ElevationError) -> ErrorInfo,
+    start_failed: impl FnOnce(ElevatedError) -> ErrorInfo,
 ) -> Result<(u32, Value), ErrorInfo> {
-    let out = std::env::temp_dir().join(format!("bluecaster-driver-{}.json", std::process::id()));
-    let _ = std::fs::remove_file(&out);
-    let mut all: Vec<&str> = args.to_vec();
-    let out_s = out.to_string_lossy().into_owned();
-    all.extend(["--out", &out_s]);
+    let mut all: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     // The elevated run's log next to the core's (the helper appends to it,
     // in a folder that must exist)
     let log = bluecaster_core::paths::driver_log_file(config, &bluecaster_core::paths::today());
     if let Some(dir) = log.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let log_s = log.to_string_lossy().into_owned();
-    all.extend(["--log", &log_s]);
+    all.extend(["--log".to_string(), log.to_string_lossy().into_owned()]);
     if crate::logging::verbose_now().is_some() {
-        all.push("--verbose");
+        all.push("--verbose".into());
     }
-    let code = elevation::run_elevated(&helper(), &all).map_err(start_failed)?;
-    let json: Option<Value> =
-        std::fs::read_to_string(&out).ok().and_then(|t| serde_json::from_str(t.trim_start_matches('\u{feff}')).ok());
-    let _ = std::fs::remove_file(&out);
+    let run = session_host::elevation::driver_helper(&all).map_err(start_failed)?;
+    let (code, json) = (run.code, run.result);
     // windows-keys and restore give link keys back: not for the log
     let shown = json.as_ref().map(without_keys);
     tracing::info!("driver helper {} -> exit {code}: {shown:?}", shown_args(args));

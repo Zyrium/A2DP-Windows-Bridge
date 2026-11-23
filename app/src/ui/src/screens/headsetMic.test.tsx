@@ -496,7 +496,7 @@ describe("Input Source on Audio Devices", () => {
     ).toBe(false);
   });
 
-  it("warns of call quality only for a classic device", async () => {
+  it("warns of call quality for classic and LE Audio devices alike", async () => {
     start("#/devices", "voice");
     const wh = await deviceEntry(/WH-1000XM5/);
     await waitFor(() => expect(mode(wh, "on")).toBeChecked());
@@ -505,15 +505,16 @@ describe("Input Source on Audio Devices", () => {
         new RegExp(t("ui.headset_mic_quality").replace(/[.]/g, "\\.")),
       ),
     ).toBeInTheDocument();
+    // Listed although no stack checked the adapter yet, as on Home
     const le = [
       ...document.querySelectorAll<HTMLElement>("main .device-entry"),
     ].find((e) => /Galaxy Buds2 Pro/.test(e.textContent ?? "") && micModes(e));
-    if (le)
-      expect(
-        within(le).queryByText(
-          new RegExp(t("ui.headset_mic_quality").replace(/[.]/g, "\\.")),
-        ),
-      ).toBeNull();
+    expect(le).toBeDefined();
+    expect(
+      within(le!).getByText(
+        new RegExp(t("ui.headset_mic_quality").replace(/[.]/g, "\\.")),
+      ),
+    ).toBeInTheDocument();
   });
 });
 

@@ -3,7 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { ConnStatus, Transport, UpdatePhase, WindowKind } from "./transport";
+import type { ConnStatus, ServiceSetupResult, ServiceState, Transport, UpdatePhase, WindowKind } from "./transport";
 import type { ServerMessage } from "./types";
 
 interface UiInfo {
@@ -49,6 +49,9 @@ export async function createTauriTransport(): Promise<Transport> {
     onUpdatePhase(cb) {
       void listen<UpdatePhase>("update://phase", (e) => cb(e.payload));
     },
+    serviceState: () => invoke<ServiceState>("service_state"),
+    serviceSetup: (action, removeData) =>
+      invoke<ServiceSetupResult>("service_setup", { action, removeData: removeData ?? false }),
     onMinimized(cb) {
       void (async () => {
         const { getCurrentWindow } = await import("@tauri-apps/api/window");

@@ -9,10 +9,14 @@ publish.workspace = true
 [dependencies]
 wasapi = "0.26.0"
 win-sys.workspace = true
+# remote.rs: the capture agent's audio link and control frames
+pcm-link.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tracing-subscriber.workspace = true
 
 [lints]

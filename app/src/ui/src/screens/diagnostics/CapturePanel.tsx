@@ -7,6 +7,7 @@
 import { createMemo, Show } from "solid-js";
 import { useApp } from "../../app/context";
 import { TimeChart } from "../../components/charts";
+import { formatText } from "../../components/DeviceSettings";
 import { currentProfile, sourceText } from "../../components/stream";
 import { t } from "../../i18n";
 import type { LossStats } from "../../lib/linkstats";
@@ -47,7 +48,7 @@ export function CapturePanel() {
   };
   const format = () => {
     const i = stream().info;
-    return streaming() && i && i.source_sample_rate > 0 ? t("capture.device_format", i.source_sample_rate, i.source_bits) : "";
+    return streaming() && i && i.source_sample_rate > 0 ? formatText(i.source_sample_rate, i.source_bits) : "";
   };
 
   return (
@@ -80,10 +81,10 @@ export function CapturePanel() {
         <section class="card lq-group" aria-label={t("capture.mode")}>
           <dl class="lq-rows">
             <Row label={t("capture.mode")} value={source()} />
+            <Show when={format()}>
+              <Row label={t("ui.diag.source_format")} value={format()} />
+            </Show>
           </dl>
-          <Show when={format()}>
-            <p class="hint">{format()}</p>
-          </Show>
         </section>
 
         <LossCard

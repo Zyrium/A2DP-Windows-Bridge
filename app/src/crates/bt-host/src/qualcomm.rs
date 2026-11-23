@@ -1,7 +1,8 @@
 //! Qualcomm (Atheros) USB rampatch and NVM download
 //!
 //! A Qualcomm USB Bluetooth chip (QCA61x4 / QCA9377 "ROME", WCN6855
-//! "FastConnect 6900") runs its ROM after power-up. Before it is used, the
+//! "FastConnect 6900", WCN785x "FastConnect 7800") runs its ROM after
+//! power-up. Before it is used, the
 //! host sends it a patch for that ROM (the rampatch) and its board settings
 //! (the NVM). All of it goes over USB, not HCI:
 //!
@@ -12,7 +13,7 @@
 //!   platform IDs name its board), 4 reserved bytes (the second 0x23 on a
 //!   "TF" ROME, which has files of its own)
 //! - a download is one file: its first bytes (the header: 28 on ROME, 40 on
-//!   the WCN6855, 4 for an NVM) in vendor request 0x01 (OUT), the rest on
+//!   the WCN6855 and WCN785x, 4 for an NVM) in vendor request 0x01 (OUT), the rest on
 //!   the bulk OUT pipe (the ACL data pipe): three transfers of 320 bytes,
 //!   10 ms apart, then the rest. The status byte then tells whether the chip
 //!   took it. The bulk parts go out with [`Action::BulkCommand`], which
@@ -28,9 +29,18 @@
 //! What runs: both status bits set means the firmware is in already (the
 //! chip keeps it until it loses power), and nothing is sent.
 //!
+//! The WCN785x (ROM 0x00190200) goes through the same steps in the same
+//! driver code as the WCN6855: its rampatch header is 40 bytes, and its NVM
+//! is named the same way. Two Surface adapters (045E:0C9E, 045E:00EB) get
+//! the NVM their INF names (NvmFileName). The driver can also take the NVM's
+//! name from the laptop's ACPI firmware, and patch NVM entries from UEFI
+//! variables; the loader cannot read either, and sends the files as they
+//! are.
+//!
 //! Read from Qualcomm's Windows driver packages (BtFilter.sys and the files
-//! they ship: 10.0.0.1272 for ROME, 2.0.0.1400 and 2.0.0.1292 for the
-//! WCN6855); written without vendor or GPL source. The driver sends its
+//! they ship: 10.0.0.1272 for ROME, 2.0.0.1400, 2.0.0.1292 and 1.0.0.1858
+//! for the WCN6855, 3.1.0.1314 to 3.1.0.1794 for the WCN785x); written
+//! without vendor or GPL source. The driver sends its
 //! vendor requests to the endpoint recipient; Linux's btusb, which loads
 //! the same files, to the device. The chip ignores it: the loader uses the
 //! device recipient, which WinUSB passes as it is.
@@ -94,14 +104,16 @@ struct Rom {
 }
 
 /// The ROMs whose files Qualcomm's Windows drivers ship: ROME 2.0, 3.0,
-/// 3.2 (QCA61x4, QCA9377) and the WCN6855 2.0 and 2.1. ROME 1.x (another
-/// layout) and the WCN785x (no Windows files seen) are refused.
+/// 3.2 (QCA61x4, QCA9377), the WCN6855 2.0 and 2.1 and the WCN785x 2.0.
+/// ROME 1.x (another layout) is refused, and so are the other ROMs the
+/// driver knows but ships no files for (0x00190100, 0x001B0100, ...).
 const ROMS: &[Rom] = &[
     Rom { version: 0x0000_0200, rampatch_header: 28, rome: true },
     Rom { version: 0x0000_0300, rampatch_header: 28, rome: true },
     Rom { version: 0x0000_0302, rampatch_header: 28, rome: true },
     Rom { version: 0x0013_0200, rampatch_header: 40, rome: false },
     Rom { version: 0x0013_0201, rampatch_header: 40, rome: false },
+    Rom { version: 0x0019_0200, rampatch_header: 40, rome: false },
 ];
 
 /// The version the chip reports (request 0x09)
@@ -163,7 +175,13 @@ impl Version {
 
 /// Adapters whose NVM Qualcomm's driver picks by board (DetectBoardId in
 /// its INF)
-const BOARD_ID_ADAPTERS: &[(u16, u16)] = &[(0x0CF3, 0xE600), (0x2C7C, 0x0137), (0x28DE, 0x1401)];
+const BOARD_ID_ADAPTERS: &[(u16, u16)] =
+    &[(0x0CF3, 0xE600), (0x2C7C, 0x0137), (0x28DE, 0x1401), (0x0CF3, 0xEA00), (0x0CF3, 0xE700)];
+
+/// Adapters whose INF names their NVM (NvmFileName): that file instead of
+/// the name the driver would build, which stays the fallback
+const ADAPTER_NVM_FILE: &[(u16, u16, &str)] =
+    &[(0x045E, 0x0C9E, "ramps_0x00190200_1b3b_LEHP.dfu"), (0x045E, 0x00EB, "ramps_0x00190200_1b3b_LEHP.dfu")];
 
 /// Adapters with an NVM of their own in Qualcomm's driver (its suffix)
 const ADAPTER_NVM: &[(u16, u16, &str)] = &[
@@ -189,7 +207,8 @@ pub fn rampatch_names(v: &Version) -> Vec<String> {
 /// The NVM files of a chip, first choice first. Qualcomm's driver names it
 /// `ramps_[TF_]0x<ROM>[_gf]`, then the crystal (when the flag is 0) or the
 /// board (for the adapters it detects it on), then the adapter's own
-/// suffix; without that file, the one with neither. Then linux-firmware's:
+/// suffix; without that file, the one with neither. An adapter whose INF
+/// names its NVM gets that file first. Then linux-firmware's:
 /// `nvm_usb_<ROM>[_gf][_<board>].bin`.
 pub fn nvm_names(v: &Version, usb: Option<(u16, u16)>) -> Vec<String> {
     let tf = if v.tf { "TF_" } else { "" };
@@ -207,8 +226,9 @@ pub fn nvm_names(v: &Version, usb: Option<(u16, u16)>) -> Vec<String> {
     if let Some(&(_, _, suffix)) = usb.and_then(|(vid, pid)| ADAPTER_NVM.iter().find(|a| (a.0, a.1) == (vid, pid))) {
         full.push_str(suffix);
     }
-    let mut names = vec![format!("{full}.dfu")];
-    if full != base {
+    let named = usb.and_then(|(vid, pid)| ADAPTER_NVM_FILE.iter().find(|a| (a.0, a.1) == (vid, pid)));
+    let mut names = vec![named.map_or_else(|| format!("{full}.dfu"), |a| a.2.to_string())];
+    if named.is_some() || full != base {
         names.push(format!("{base}.dfu"));
     }
     if !v.tf {
@@ -831,6 +851,125 @@ mod tests {
         assert_eq!(headers(&r), [40, 4]);
     }
 
+    /// A WCN785x as its version read might show it (no probe report yet):
+    /// the board in the flag word
+    const WCN785X: Version =
+        Version { rom: 0x0019_0200, patch: 0, ram: 0, chip_id: 1, platform_id: 0x12, flag: 0x8000, tf: false };
+
+    fn wcn785x_files() -> HashMap<String, Vec<u8>> {
+        HashMap::from([
+            ("AthrBT_0x00190200.dfu".to_owned(), rampatch(0x0019_0200, 0x9360, 3000)),
+            ("ramps_0x00190200.dfu".to_owned(), nvm(700)),
+        ])
+    }
+
+    #[test]
+    fn loads_the_wcn785x() {
+        let mut chip = Chip { usb: Ok((0x0489, 0xE0F3)), ..Chip::new(WCN785X) };
+        let r = run(&mut chip, wcn785x_files());
+        assert_eq!(r.result, Ok(Outcome::Loaded { firmware: "ramps_0x00190200.dfu".into(), detail: None }));
+        let files = wcn785x_files();
+        assert_eq!(chip.received, [files["AthrBT_0x00190200.dfu"].clone(), files["ramps_0x00190200.dfu"].clone()]);
+        // A 40-byte rampatch header, then 3 x 320 bytes and the rest
+        assert_eq!(headers(&r), [40, 4]);
+        assert_eq!(chip.transfers, [320, 320, 320, 3000 - 960, 320, 320, 60]);
+        assert!(r.commands.iter().all(|c| c.bulk));
+        // Status, version, descriptor; per file: header and status reads
+        let requests: Vec<u8> = r.controls.iter().map(|c| c.request).collect();
+        assert_eq!(requests[..3], [REQUEST_STATUS, REQUEST_VERSION, 0x06]);
+        assert_eq!(r.timers[..2], [VERSION_WAIT_MS, CHUNK_GAP_MS]);
+    }
+
+    #[test]
+    fn the_wcn785x_nvm_by_adapter() {
+        // The board only where the INF asks for it, the adapter's own
+        // suffix, and the file a Surface adapter's INF names
+        assert_eq!(
+            nvm_names(&WCN785X, Some((0x0CF3, 0xE700)))[..2],
+            ["ramps_0x00190200_0112.dfu", "ramps_0x00190200.dfu"]
+        );
+        assert_eq!(nvm_names(&WCN785X, Some((0x0489, 0xE0F3)))[0], "ramps_0x00190200.dfu");
+        assert_eq!(
+            nvm_names(&WCN785X, Some((0x0489, 0xE11F)))[..2],
+            ["ramps_0x00190200_010e.dfu", "ramps_0x00190200.dfu"]
+        );
+        assert_eq!(
+            nvm_names(&WCN785X, Some((0x045E, 0x0C9E)))[..2],
+            ["ramps_0x00190200_1b3b_LEHP.dfu", "ramps_0x00190200.dfu"]
+        );
+        assert_eq!(rampatch_names(&WCN785X)[0], "AthrBT_0x00190200.dfu");
+        let mut files = wcn785x_files();
+        files.insert("ramps_0x00190200_1b3b_LEHP.dfu".into(), nvm(800));
+        let mut chip = Chip { usb: Ok((0x045E, 0x00EB)), ..Chip::new(WCN785X) };
+        let r = run(&mut chip, files.clone());
+        assert_eq!(r.result, Ok(Outcome::Loaded { firmware: "ramps_0x00190200_1b3b_LEHP.dfu".into(), detail: None }));
+        // Without it, the chip's own
+        files.remove("ramps_0x00190200_1b3b_LEHP.dfu");
+        let r = run(&mut Chip { usb: Ok((0x045E, 0x00EB)), ..Chip::new(WCN785X) }, files);
+        assert_eq!(r.result, Ok(Outcome::Loaded { firmware: "ramps_0x00190200.dfu".into(), detail: None }));
+    }
+
+    #[test]
+    fn a_running_wcn785x_is_left_alone() {
+        let mut chip = Chip { status: STATUS_PATCHED | STATUS_NVM, ..Chip::new(WCN785X) };
+        let r = run(&mut chip, wcn785x_files());
+        assert_eq!(r.result, Ok(Outcome::AlreadyRunning));
+        assert!(headers(&r).is_empty() && r.commands.is_empty());
+        // Its rampatch already as new as the file's: the NVM only
+        let r = run(&mut Chip::new(Version { patch: 0x9360, ..WCN785X }), wcn785x_files());
+        assert!(r.result.is_ok(), "{:?}", r.result);
+        assert_eq!(headers(&r), [4]);
+    }
+
+    #[test]
+    fn a_bad_wcn785x_file_sends_nothing() {
+        // Missing NVM, missing rampatch
+        for missing in ["ramps_0x00190200.dfu", "AthrBT_0x00190200.dfu"] {
+            let mut files = wcn785x_files();
+            files.remove(missing);
+            let r = run(&mut Chip::new(WCN785X), files);
+            assert_eq!(r.result, Err(LoadError::MissingFile(missing.into())));
+            assert!(headers(&r).is_empty() && r.commands.is_empty());
+        }
+        // A WCN6855 rampatch under its name, one cut short, an NVM in its
+        // place, a broken NVM
+        let cut = rampatch(0x0019_0200, 0x9360, 3000)[..2000].to_vec();
+        for (name, bad) in [
+            ("AthrBT_0x00190200.dfu", rampatch(0x0013_0201, 0x9360, 3000)),
+            ("AthrBT_0x00190200.dfu", cut),
+            ("AthrBT_0x00190200.dfu", nvm(3000)),
+            ("ramps_0x00190200.dfu", rampatch(0x0019_0200, 1, 10)),
+            ("ramps_0x00190200.dfu", nvm(700)[..300].to_vec()),
+        ] {
+            let mut files = wcn785x_files();
+            files.insert(name.into(), bad);
+            let r = run(&mut Chip::new(WCN785X), files);
+            assert!(matches!(r.result, Err(LoadError::BadFile { .. })), "{name}: {:?}", r.result);
+            assert!(headers(&r).is_empty() && r.commands.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_wcn785x_that_does_not_take_a_file_fails() {
+        // Takes neither: the rampatch's status reads time out
+        let r = run(&mut Chip { ignores: true, ..Chip::new(WCN785X) }, wcn785x_files());
+        assert_eq!(r.result, Err(LoadError::Timeout("rampatch")));
+        assert_eq!(headers(&r), [40], "the NVM not sent after it");
+        let reads = r.controls.iter().filter(|c| c.request == REQUEST_STATUS).count();
+        assert_eq!(reads as u32, 1 + MAX_POLLS);
+        // Rampatch in already: the NVM's status reads time out
+        let mut chip = Chip { status: STATUS_PATCHED, ignores: true, ..Chip::new(WCN785X) };
+        let r = run(&mut chip, wcn785x_files());
+        assert_eq!(r.result, Err(LoadError::Timeout("NVM")));
+        // A state the driver refuses, a header the chip stalls
+        let r = run(&mut Chip { status: 0x0C, ..Chip::new(WCN785X) }, wcn785x_files());
+        assert!(matches!(r.result, Err(LoadError::Unsupported(_))), "{:?}", r.result);
+        assert_eq!(r.controls.len(), 1);
+        let r = run(&mut Chip { fail_header: true, ..Chip::new(WCN785X) }, wcn785x_files());
+        assert!(matches!(r.result, Err(LoadError::Host(_))), "{:?}", r.result);
+        assert!(r.commands.is_empty());
+    }
+
     #[test]
     fn names_the_nvm_as_qualcomms_driver() {
         let gf_board = Version {
@@ -908,7 +1047,8 @@ mod tests {
 
     #[test]
     fn an_unknown_rom_is_left_alone() {
-        for rom in [0x0000_0101, 0x0019_0200, 0x3101_0000] {
+        // ROME 1.x, ROMs Qualcomm's driver knows but ships no files for
+        for rom in [0x0000_0101, 0x0019_0100, 0x001B_0100, 0x0022_0100, 0x3101_0000] {
             let r = run(&mut Chip::new(Version { rom, ..ROME }), rome_files());
             assert!(matches!(r.result, Err(LoadError::Unsupported(_))), "{rom:08X}: {:?}", r.result);
             assert!(headers(&r).is_empty() && r.commands.is_empty(), "nothing sent to it");
@@ -1023,19 +1163,50 @@ mod tests {
         for id in [(0x0CF3, 0xE300), (0x0CF3, 0xE360), (0x0CF3, 0xE600), (0x0489, 0xE0C7), (0x13D3, 0x3491)] {
             assert!(ids.contains(&id), "{id:04X?}");
         }
+        // The WCN785x: every ID of Qualcomm's driver 3.1.0.1794
+        for id in [
+            (0x0CF3, 0xE700),
+            (0x0489, 0xE0F3),
+            (0x0489, 0xE0FC),
+            (0x0489, 0xE100),
+            (0x0489, 0xE103),
+            (0x0489, 0xE10A),
+            (0x0489, 0xE10D),
+            (0x0489, 0xE11B),
+            (0x0489, 0xE11C),
+            (0x0489, 0xE11F),
+            (0x0489, 0xE141),
+            (0x0489, 0xE14A),
+            (0x0489, 0xE14B),
+            (0x0489, 0xE14D),
+            (0x2C7C, 0x0130),
+            (0x2C7C, 0x0131),
+            (0x2C7C, 0x0132),
+            (0x2C7C, 0x013A),
+            (0x2C7C, 0x013B),
+            (0x13D3, 0x3623),
+            (0x13D3, 0x3624),
+            (0x045E, 0x0C9E),
+            (0x045E, 0x00EB),
+        ] {
+            assert!(ids.contains(&id), "{id:04X?}");
+        }
         for (vid, pid) in ids {
             assert_eq!(vendor_for_usb(vid, pid, None), ChipVendor::Qualcomm, "{vid:04X}:{pid:04X}");
         }
         // The adapters with their own NVM or a board ID are listed
-        for &(vid, pid) in BOARD_ID_ADAPTERS.iter().chain(&[(0x0CF3, 0xE302), (0x0CF3, 0xE303)]) {
+        let own_nvm = ADAPTER_NVM.iter().chain(ADAPTER_NVM_FILE).map(|a| (a.0, a.1));
+        for (vid, pid) in BOARD_ID_ADAPTERS.iter().copied().chain(own_nvm) {
             assert!(LOADER_CHIPS.contains(&(ChipVendor::Qualcomm, vid, pid)), "{vid:04X}:{pid:04X}");
         }
+        // Microsoft's VID: only those two
+        assert_eq!(vendor_for_usb(0x045E, 0x0C9F, None), ChipVendor::Unknown);
     }
 
     #[test]
     fn reads_the_header_of_real_files() {
-        // The first 0x16 bytes of AthrBT_0x00000302.dfu (10.0.0.1272) and
-        // AthrBT_0x00130201.dfu (2.0.0.1400)
+        // The first 0x16 bytes of AthrBT_0x00000302.dfu (10.0.0.1272),
+        // AthrBT_0x00130201.dfu (2.0.0.1400) and the WCN785x's below
         let rome = [
             0x01, 0x60, 0x0E, 0x01, 0x60, 0x0D, 0x01, 0x00, 0x48, 0x0D, 0x01, 0x00, 0x01, 0x02, 0x00, 0x00, 0x08, 0x00,
             0x02, 0x03, 0xE8, 0x03,
@@ -1046,6 +1217,15 @@ mod tests {
         ];
         assert_eq!(rampatch_version(&rome, &ROMS[2]), Some((0x302, 0x3E8)));
         assert_eq!(rampatch_version(&hsp, &ROMS[4]), Some((0x0013_0201, 0x3A98)));
+        // AthrBT_0x00190200.dfu (3.1.0.1794, WCN785x)
+        let fc7800 = [
+            0x01, 0xF8, 0x29, 0x04, 0xD8, 0x29, 0x04, 0x00, 0xB4, 0x29, 0x04, 0x00, 0x01, 0x00, 0x03, 0x00, 0x19, 0x00,
+            0x00, 0x02, 0x60, 0x93,
+        ];
+        assert_eq!(rampatch_version(&fc7800, &ROMS[5]), Some((0x0019_0200, 0x9360)));
+        let mut file = fc7800.to_vec();
+        file.resize(0x429F8 + 4, 0);
+        assert_eq!(check_tlv(&file, TYPE_RAMPATCH, 40), Ok(()));
         let mut file = rome.to_vec();
         file.resize(0x10E60 + 4, 0);
         assert_eq!(check_tlv(&file, TYPE_RAMPATCH, 28), Ok(()));
@@ -1069,6 +1249,7 @@ mod tests {
             (0x0013_0200, 0, 1, 0x8000, false),
             (0x0013_0201, 0, 1, 0x8000, false),
             (0x0013_0201, 0x400C_1211, 1, 0x8000, false),
+            (0x0019_0200, 0, 1, 0x8000, false),
         ];
         let mut loaded = 0;
         for (rom, ram, chip_id, flag, tf) in cases {

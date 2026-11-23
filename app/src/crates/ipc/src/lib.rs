@@ -12,7 +12,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod access;
 pub mod protocol;
+pub mod service_state;
 
 pub use protocol::*;
 
@@ -68,6 +70,14 @@ pub fn pipe_name(user_sid: &str) -> String {
 /// serves (clients fall back to it when [`pipe_name`] does not exist)
 pub fn old_pipe_name(user_sid: &str) -> String {
     format!(r"\\.\pipe\{OLD_PIPE_PREFIX}-{user_sid}{}", instance_suffix())
+}
+
+/// Service mode: the core's one pipe for every user (no SID in the name;
+/// the DACL lets interactive users connect, win_sys::pipe_peer). Clients
+/// try it before [`pipe_name`] and check its server first
+/// ([`access::server_trusted`]).
+pub fn service_pipe_name() -> String {
+    format!(r"\\.\pipe\bluecaster-service{}", instance_suffix())
 }
 
 /// The mutex the resident core holds while it runs (per logon session)
@@ -184,5 +194,8 @@ mod tests {
         KeysComparison::export_all(&cfg).unwrap();
         WindowsPairedDevice::export_all(&cfg).unwrap();
         VoiceRxCounters::export_all(&cfg).unwrap();
+        HidStatus::export_all(&cfg).unwrap();
+        HidCode::export_all(&cfg).unwrap();
+        AuracastMixState::export_all(&cfg).unwrap();
     }
 }

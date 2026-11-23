@@ -1,11 +1,13 @@
 //! The settings folder and its layout: the one place that knows where each
 //! file lives. `%APPDATA%\BlueCaster`, or BLUECASTER_CONFIG_DIR (development
 //! and tests: tools/emu pairs with virtual devices and must not touch the
-//! user's real link keys).
+//! user's real link keys). In service mode ([`set_service_data`]) the
+//! core's folder is the service's data folder instead, with the same
+//! layout (crate::service_data says what lives there).
 //!
 //! ```text
 //! BlueCaster\
-//!   settings.json  profiles.json
+//!   settings.json  profiles.json  auracast_mix.json
 //!   devices\    devices.txt  le_audio_devices.txt  device_codecs.json  device_services.json
 //!   pairing\    link_keys.txt  le_audio_bonds.tlv   (the secrets: never in a bundle)
 //!   adapters\   adapter_caps.json  driver\<instance id>.json
@@ -60,7 +62,52 @@ fn old_app_runs() -> bool {
     OLD_APP_RUNS.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|check| check())
 }
 
+/// The service's data folder, once set: service mode ([`set_service_data`])
+static SERVICE_DATA: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Service mode: the core's data root is `dir` (the service passes
+/// `%ProgramData%\BlueCaster`, tests a temp folder) instead of the user's
+/// folder. Called once by `--headless --service-data <dir>`, before
+/// anything reads a path; a second call is ignored.
+pub fn set_service_data(dir: PathBuf) {
+    let _ = SERVICE_DATA.set(dir);
+}
+
+/// Whether the core runs in service mode ([`set_service_data`])
+pub fn service_mode() -> bool {
+    SERVICE_DATA.get().is_some()
+}
+
+/// The service's data folder (None outside service mode)
+pub fn service_data_dir() -> Option<&'static Path> {
+    SERVICE_DATA.get().map(PathBuf::as_path)
+}
+
+/// The data root: in service mode the service's data folder, else the
+/// user's folder ([`user_config_dir`])
 pub fn config_dir() -> PathBuf {
+    if let Some(dir) = SERVICE_DATA.get() {
+        let _ = std::fs::create_dir_all(dir);
+        return dir.clone();
+    }
+    user_config_dir()
+}
+
+/// Where [`user_config_dir`] is, without creating or moving anything (the
+/// session agent: it only reads from there); None without APPDATA
+pub fn user_config_location() -> Option<PathBuf> {
+    std::env::var_os("BLUECASTER_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os(OLD_CONFIG_DIR_VAR).filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join(FOLDER_NAME)))
+}
+
+/// The signed-in user's folder (`%APPDATA%\BlueCaster` or
+/// BLUECASTER_CONFIG_DIR), whatever the mode: the window's own files, and
+/// what the session agent reads for the one-time move into the service's
+/// folder
+pub fn user_config_dir() -> PathBuf {
     let var = std::env::var_os("BLUECASTER_CONFIG_DIR")
         .filter(|v| !v.is_empty())
         .or_else(|| std::env::var_os(OLD_CONFIG_DIR_VAR).filter(|v| !v.is_empty()));
@@ -248,6 +295,11 @@ pub fn profiles_file(config: &Path) -> PathBuf {
     config.join("profiles.json")
 }
 
+/// The Auracast matrix mixer and its presets (developer mode)
+pub fn auracast_mix_file(config: &Path) -> PathBuf {
+    config.join("auracast_mix.json")
+}
+
 /// A capture started by hand (diagnostics): `hci_<stamp>.pklg` at the top
 /// of the folder (it keeps the pairing keys, so it is never in a bundle)
 pub fn capture_file(config: &Path, stamp: &str) -> PathBuf {
@@ -267,6 +319,11 @@ pub fn devices_file(config: &Path) -> PathBuf {
 
 pub fn le_devices_file(config: &Path) -> PathBuf {
     devices_dir(config).join("le_audio_devices.txt")
+}
+
+/// The coordinated sets of the saved LE Audio devices (member addresses)
+pub fn le_sets_file(config: &Path) -> PathBuf {
+    devices_dir(config).join("le_audio_sets.txt")
 }
 
 pub fn device_codecs_file(config: &Path) -> PathBuf {

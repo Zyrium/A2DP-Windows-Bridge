@@ -45,6 +45,14 @@ pub trait LeModule: Any {
     /// Log name ("CSIP", "VCP", ...)
     fn name(&self) -> &'static str;
 
+    /// This module serves keyboards and mice (HID over GATT): the device
+    /// hooks (connected, encrypted, GATT ready, disconnected) of a device on
+    /// the HID list go to such modules only, those of every other device to
+    /// the others
+    fn for_hid(&self) -> bool {
+        false
+    }
+
     /// A BTstack session with LE Audio starts: SM, GATT client and the core
     /// are up, HCI is not powered on yet.
     fn on_stack_init(&mut self, _ctx: &mut LeCtx<'_>) {}
@@ -157,6 +165,10 @@ pub struct LeModuleSetup {
     pub events: std::sync::mpsc::Sender<crate::HostEvent>,
     /// The battery level setting (HostConfig::battery)
     pub battery: bool,
+    /// LE Audio is on (its profile modules are created)
+    pub audio: bool,
+    /// Keyboards and mice (HID over GATT is created)
+    pub hid: Option<crate::hid::SharedHid>,
 }
 
 /// One registered module

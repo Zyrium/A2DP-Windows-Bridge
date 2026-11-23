@@ -134,6 +134,7 @@ A codec passes when all of these hold:
 |:-------|:------------|
 | `--codecs sbc aac ...` | Test only these codecs (`sbc sbcxq aac aptx aptxhd aptxll ldac lhdcv5 faststream opus opus05`) or negotiation cases (sample rates, low bitpools, SBC frame setups, aptX Adaptive, ...; `-h` lists them); default: all |
 | `--le-audio [case ...]` | Run the LE Audio cases instead (default: all of them) |
+| `--auracast [case ...]` | Run the Auracast cases instead (default: all of them) |
 | `--scan [case ...]` | Run the device scan cases instead (`eir`, `name-request`) |
 | `--link [case ...]` | Run the link cases instead (`disconnect`, `device-link`, `device-a2dp`, `device-stream`, `restart-on-link`) |
 | `--duration <s>` | Seconds of streaming per codec (default 5) |

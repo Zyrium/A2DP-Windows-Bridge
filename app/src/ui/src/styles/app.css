@@ -206,6 +206,18 @@ p {
   white-space: nowrap;
   min-width: 0;
 }
+/* A name on up to two lines, ellipsized beyond (two devices
+   whose names differ at the end looked the same); a name without spaces
+   breaks anywhere */
+.clamp-2 {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
 .sr-only {
   position: absolute;
   width: 1px;
@@ -697,6 +709,71 @@ option {
 .switch.small {
   width: 2rem;
   height: 1rem;
+}
+
+/* The Auracast matrix mixer: outputs (rows) from source speakers (columns) */
+.pair-row-controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--s2);
+}
+.mix-scroll {
+  overflow-x: auto;
+  padding: var(--s2) 0;
+}
+.mix-grid {
+  border-collapse: collapse;
+  font-size: var(--fs-12);
+}
+.mix-grid th,
+.mix-grid td {
+  padding: 2px;
+  text-align: center;
+  font-weight: normal;
+}
+.mix-grid thead th {
+  color: var(--text-2);
+}
+.mix-grid .input.mix-cell {
+  width: 4.2rem;
+  padding: 2px 4px;
+  text-align: right;
+}
+.mix-grid td.mix-on .input.mix-cell {
+  border-color: var(--accent-fill);
+}
+.mix-grid .input.mix-cell[readonly] {
+  background: var(--surface-2);
+}
+.mix-grid .input.mix-delay {
+  width: 5.5rem;
+  padding: 2px 4px;
+  text-align: right;
+}
+.mix-grid .mix-absent,
+.mix-grid tr.mix-absent {
+  opacity: 0.4;
+}
+.mix-levels {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s4);
+  padding: var(--s2) 0;
+}
+.mix-level {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+  font-size: var(--fs-14);
+}
+.mix-level .input {
+  width: 5rem;
+}
+.mix-preset-save .input {
+  flex: 1;
+  min-width: 0;
 }
 .switch.small::after {
   left: 0.15rem;
@@ -2327,6 +2404,8 @@ option {
 }
 .device-row-name {
   font-weight: 600;
+  /* The full name, on as many lines as it takes */
+  overflow-wrap: anywhere;
 }
 /* The row's buttons above its full-size radio input, so they get the clicks */
 .device-row-actions {
@@ -3445,6 +3524,16 @@ option {
   gap: var(--s3);
   padding: var(--s4);
 }
+/* "Use this adapter" at the card's right */
+.adapter-head > .adapter-use {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+/* The adapter BlueCaster has open */
+.adapter-card.adapter-active {
+  border-color: var(--accent-fill);
+  box-shadow: inset 3px 0 0 var(--accent-fill);
+}
 .adapter-head {
   display: flex;
   gap: var(--s3);
@@ -3997,11 +4086,94 @@ html.win-flyout body {
   min-width: 0;
   line-height: 1.3;
 }
-.check-item-text > .ellipsis {
+.check-item-text > .device-name-text {
   font-weight: 600;
 }
 .check-item-text > .mono {
   font-size: var(--fs-12);
+}
+
+/* Keyboards and mice through BlueCaster (experimental, issue #413) */
+.hid-enable,
+.hid-devices,
+.hid-code-box {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+}
+.hid-code-box {
+  gap: var(--s2);
+  margin-top: var(--s2);
+}
+.hid-lead {
+  margin: 0;
+  font-weight: 600;
+}
+.hid-risks {
+  margin: 0;
+  padding-left: var(--s5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+}
+.hid-enable .check-item {
+  align-items: flex-start;
+  padding-left: 0;
+}
+.hid-enable .check-item input {
+  margin-top: 0.2em;
+}
+/* Read and typed, never copied */
+.hid-code {
+  font-size: var(--fs-28);
+  font-weight: 600;
+  letter-spacing: 0.3em;
+  user-select: none;
+}
+.hid-code-input {
+  width: 10ch;
+  letter-spacing: 0.2em;
+}
+.hid-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+}
+.hid-device {
+  gap: var(--s3);
+  padding: var(--s2) var(--s3);
+}
+.hid-device + .hid-device {
+  border-top: 1px solid var(--border);
+}
+.hid-device > .icon {
+  flex-shrink: 0;
+  color: var(--text-2);
+}
+.hid-device-actions {
+  margin-left: auto;
+  display: flex;
+  gap: var(--s2);
+}
+.hid-counts {
+  margin: 0;
+}
+/* The number to type on a keyboard being added */
+.hid-passkey {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  padding: var(--s3);
+  border: 1px solid var(--accent-fill);
+  border-radius: var(--r);
+}
+.hid-passkey-number {
+  font-family: var(--mono);
+  font-size: var(--fs-28);
+  font-weight: 600;
+  letter-spacing: 0.3em;
 }
 
 /* Diagnostics > Radio: the 2.4 GHz band */

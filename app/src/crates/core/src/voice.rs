@@ -18,13 +18,14 @@
 //!
 //! [`HeadsetMic::Auto`] opens the voice link only while an application
 //! records from the microphone output's capture side (the cable's "CABLE
-//! Output"; [`audio_capture::mic_capture_active`], polled once a second) and
+//! Output"; [`session_host::activity::mic_capture_active`], polled once a second) and
 //! goes back to A2DP once nobody has recorded for [`AUTO_IDLE`].
 //!
 //! Where the microphone goes is decided here for both kinds of device:
 //! [`resolve_mic_output`] (a render endpoint by id or name, a WAV file, the
 //! default output), [`mic_conflict`] (the feedback-loop refusal) and
-//! [`MicOutput`] (the [`Renderer`] or the [`WavSink`]); the LE Audio session
+//! [`MicOutput`] (`voice_link`'s renderer or WAV writer, in this process or
+//! in the session agent: [`session_host::render::open_voice`]); the LE Audio session
 //! ([`crate::le_stream`]) uses them for its microphone too.
 
 use std::path::PathBuf;
@@ -35,9 +36,11 @@ use std::time::{Duration, Instant};
 use audio_capture::{Capture, CaptureOptions, Running, Source};
 use bt_host::{BtHost, HostError, LinkStats, VoiceEvent, VoiceRx, VoiceTx};
 use voice_link::{
-    MicDsp, MicTap, PcmConsumer, PcmProducer, Renderer, UplinkConsumer, UplinkSink, UplinkStats, VoiceCodec,
-    VoiceDecoder, VoiceEncoder, WavSink,
+    MicDsp, MicTap, PcmConsumer, PcmProducer, UplinkConsumer, UplinkSink, UplinkStats, VoiceCodec, VoiceDecoder,
+    VoiceEncoder,
 };
+
+use session_host::render::{RenderTarget, VoiceOutput};
 
 use crate::messages::Msg;
 use crate::service::{Inner, VoiceChange};
@@ -93,7 +96,8 @@ impl std::fmt::Debug for Waker {
 
 /// Auto's watcher thread: looks at the capture side every
 /// [`AUTO_WATCH_EVERY`] (the endpoints looked up once,
-/// `audio_policy::CaptureSessions`), applies [`AutoWatch::seen`]'s
+/// [`session_host::activity::watch_recording`]: in the session agent, which
+/// reports changes), applies [`AutoWatch::seen`]'s
 /// hysteresis and wakes the session when the answer changes, so the voice
 /// link opens and closes without waiting for the session's tick
 #[derive(Debug)]
@@ -112,11 +116,8 @@ impl Watcher {
         let thread = std::thread::Builder::new()
             .name("mic-auto-watch".into())
             .spawn(move || {
-                let Ok(_com) = win_sys::audio_policy::ComApartment::init_mta() else {
-                    tracing::warn!("voice: auto: the watcher cannot use COM");
-                    return;
-                };
-                let sessions = match win_sys::audio_policy::CaptureSessions::open(&id) {
+                // Through the session agent: watched there, read here
+                let sessions = match session_host::activity::watch_recording(&id, AUTO_WATCH_EVERY) {
                     Ok(Some(s)) => s,
                     Ok(None) => {
                         tracing::warn!(
@@ -214,7 +215,7 @@ impl AutoWatch {
                 return false;
             }
         };
-        match audio_capture::mic_capture_active(id) {
+        match session_host::activity::mic_capture_active(id) {
             Ok(Some(on)) => on,
             Ok(None) => {
                 if !std::mem::replace(&mut self.warned, true) {
@@ -257,7 +258,7 @@ impl AutoWatch {
         };
         if after != before {
             let who = match &target {
-                Some(MicTarget::Device { id, .. }) if after => audio_capture::mic_recorders(id).join(", "),
+                Some(MicTarget::Device { id, .. }) if after => session_host::activity::mic_recorders(id).join(", "),
                 _ => String::new(),
             };
             let what = target.map_or(String::new(), |t| t.to_string());
@@ -343,7 +344,7 @@ pub fn resolve_mic_output(spec: Option<&str>) -> Option<MicTarget> {
     if spec.to_ascii_lowercase().ends_with(".wav") {
         return Some(MicTarget::Wav(PathBuf::from(spec)));
     }
-    let devices = audio_capture::render_devices().unwrap_or_else(|e| {
+    let devices = session_host::devices::render_devices().unwrap_or_else(|e| {
         tracing::warn!("voice: cannot list the output devices: {e}");
         Vec::new()
     });
@@ -369,7 +370,7 @@ pub fn resolve_mic_output(spec: Option<&str>) -> Option<MicTarget> {
 pub fn mic_conflict(target: &MicTarget, source: &SourceRequest) -> Option<&'static str> {
     match target {
         MicTarget::Device { id, .. } => {
-            let default = audio_capture::default_render_device().unwrap_or_default();
+            let default = session_host::devices::default_render_device().unwrap_or_default();
             crate::profiles::mic_output_conflicts(source, id, &default)
         }
         MicTarget::Wav(_) | MicTarget::Test => None,
@@ -387,7 +388,7 @@ fn uplink_source(source: &SourceRequest) -> Option<(Source, bool)> {
         }
         SourceRequest::VirtualDevice { .. } | SourceRequest::OutputDevice { .. } => (Source::SystemLoopback, true),
         SourceRequest::Application { exe } => {
-            (Source::Application { process_id: audio_capture::find_process(exe)? }, true)
+            (Source::Application { process_id: session_host::activity::find_process(exe)? }, true)
         }
     })
 }
@@ -537,8 +538,8 @@ pub fn apply_mic_processing(dsp: &MicDsp, p: &ipc::MicProcessing) {
 /// through its [`PcmProducer`]
 pub enum MicOutput {
     /// Rendered (40 ms prefill, drift control)
-    Device(Renderer),
-    Wav(WavSink),
+    Device(VoiceOutput),
+    Wav(VoiceOutput),
     /// Nowhere ([`MicTarget::Test`]): the queue is never read
     Test(Option<PcmProducer>, PcmConsumer),
 }
@@ -548,10 +549,11 @@ impl MicOutput {
     pub fn open(target: &MicTarget, rate: u32) -> Result<MicOutput, String> {
         match target {
             MicTarget::Device { id, .. } => {
-                Renderer::open(id, rate, RENDER_PREFILL_MS).map(MicOutput::Device).map_err(|e| e.to_string())
+                let target = RenderTarget::Endpoint { device_id: id.clone(), prefill_ms: RENDER_PREFILL_MS };
+                session_host::render::open_voice(&target, rate).map(MicOutput::Device)
             }
             MicTarget::Wav(path) => {
-                WavSink::create(path, rate).map(MicOutput::Wav).map_err(|e| format!("{}: {e}", path.display()))
+                session_host::render::open_voice(&RenderTarget::Wav { path: path.clone() }, rate).map(MicOutput::Wav)
             }
             MicTarget::Test => {
                 let (p, c) = voice_link::pcm_channel(rate as usize / 10);
@@ -563,8 +565,7 @@ impl MicOutput {
     /// Its producer (once)
     pub fn producer(&mut self) -> Option<PcmProducer> {
         match self {
-            MicOutput::Device(r) => Some(r.producer()),
-            MicOutput::Wav(w) => w.producer(),
+            MicOutput::Device(o) | MicOutput::Wav(o) => o.producer(),
             MicOutput::Test(p, _) => p.take(),
         }
     }
@@ -572,16 +573,16 @@ impl MicOutput {
     /// The render device went away or failed: why
     pub fn ended(&self) -> Option<String> {
         match self {
-            MicOutput::Device(r) if r.ended() => Some(r.end_error().unwrap_or("ended").to_string()),
-            _ => None,
+            MicOutput::Device(o) | MicOutput::Wav(o) => o.ended(),
+            MicOutput::Test(..) => None,
         }
     }
 
     /// The render's counters, for a summary line
     pub fn describe(&self) -> String {
         match self {
-            MicOutput::Device(r) => {
-                let s = r.stats();
+            MicOutput::Device(o) => {
+                let s = o.stats().unwrap_or_default();
                 format!(
                     "render {} frames, {} underruns, {} overflow, {} dropped / {} repeated",
                     s.frames_written, s.underruns, s.overflow, s.dropped, s.duplicated
@@ -755,7 +756,7 @@ impl VoiceLink {
             return;
         }
         self.app_checked = now;
-        let exited = self.uplink_pid.is_some_and(audio_capture::process_exited);
+        let exited = self.uplink_pid.is_some_and(session_host::activity::process_exited);
         if self.capture.as_ref().is_some_and(|r| !r.ended()) && !exited {
             return;
         }
@@ -765,13 +766,25 @@ impl VoiceLink {
             self.uplink_pid = None;
         }
         let SourceRequest::Application { exe } = source else { return };
-        match audio_capture::find_process(exe) {
+        match session_host::activity::find_process(exe) {
             Some(pid) if self.app_failed_pid != Some(pid) => {
                 tracing::info!("voice: {source} runs (PID {pid}), capturing it for the headphones");
                 self.change_source(source);
             }
             _ => {}
         }
+    }
+
+    /// The uplink's capture was lost with the session agent: captured again
+    /// through the next one (at most once a second; the microphone's output
+    /// opens again by itself, `session_host::render`)
+    fn recheck_uplink_agent(&mut self, source: &SourceRequest) {
+        let lost = self.capture.as_ref().is_some_and(|r| r.end_reason() == Some(audio_capture::EndReason::AgentLost));
+        if !lost || self.codec.is_none() || self.app_checked.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        tracing::info!("voice: the uplink capture was lost with the session agent, capturing again");
+        self.change_source(source);
     }
 
     /// Another microphone output chosen: only the output changes
@@ -1065,6 +1078,7 @@ impl HeadsetMode {
         if let Some(link) = self.link.as_mut() {
             link.summary();
             link.recheck_app(source);
+            link.recheck_uplink_agent(source);
             if let Some(why) = link.output.as_ref().and_then(MicOutput::ended) {
                 tracing::warn!("voice: the microphone output ended ({why}), back to A2DP");
                 self.held_off = true;

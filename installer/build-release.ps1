@@ -26,6 +26,15 @@ key. Without them the build still works, but its in-app update stays off
 (the update check only shows the release page, as the portable version).
 Neither key is part of the repository.
 
+Code signing (Authenticode, see installer/README.md):
+BLUECASTER_SIGN_THUMBPRINT (the SHA-1 thumbprint of a code signing
+certificate in the current user's certificate store) and
+BLUECASTER_SIGN_TIMESTAMP_URL (an RFC 3161 time-stamp server) sign every
+program in the package with that one certificate. The script then checks
+each signature. A signed set-up tool of the service add-on copies only files
+signed with the tool's own certificate; an unsigned build skips that check.
+signtool.exe comes from the Windows SDK (or $env:SIGNTOOL).
+
 Needs: Rust (with the target), pnpm, the UI's node_modules (pnpm install),
 the submodules under extern/, cargo-about (cargo install cargo-about), and
 Inno Setup 7.1.0 (winget install JRSoftware.InnoSetup.7 --version 7.1.0; ISCC.exe is found in
@@ -83,6 +92,34 @@ if ($signing -and -not $pubkey) {
 if (-not $signing) {
     Write-Warning 'TAURI_SIGNING_PRIVATE_KEY is not set: no updater signature, and the in-app update of this build stays off'
     $pubkey = ''
+}
+
+# --- Code signing (Authenticode): one certificate for every program ---
+$codeSignThumb = ($env:BLUECASTER_SIGN_THUMBPRINT ?? '') -replace '\s', ''
+$timestampUrl = $env:BLUECASTER_SIGN_TIMESTAMP_URL
+$signtool = $null
+if ($codeSignThumb) {
+    # Without a time stamp the signatures stop being valid when the
+    # certificate expires, and the set-up tool then refuses the files
+    if (-not $timestampUrl) {
+        throw 'BLUECASTER_SIGN_THUMBPRINT is set but BLUECASTER_SIGN_TIMESTAMP_URL is not: the signatures need a time stamp'
+    }
+    $cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $codeSignThumb } | Select-Object -First 1
+    if (-not $cert -or -not $cert.HasPrivateKey) {
+        throw "no certificate with a private key and thumbprint $codeSignThumb in Cert:\CurrentUser\My"
+    }
+    $signtool = @(
+        $env:SIGNTOOL
+        (Get-Command signtool.exe -ErrorAction SilentlyContinue)?.Source
+        Get-ChildItem (Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin/*/x64/signtool.exe') -ErrorAction SilentlyContinue |
+            Sort-Object { $v = $null; if ([version]::TryParse($_.Directory.Parent.Name, [ref]$v)) { $v } else { [version]'0.0' } } -Descending |
+            ForEach-Object FullName
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+    if (-not $signtool) {
+        throw 'signtool.exe not found: install the Windows SDK''s signing tools (or set $env:SIGNTOOL)'
+    }
+} else {
+    Write-Warning 'BLUECASTER_SIGN_THUMBPRINT is not set: the programs stay unsigned, and the service add-on''s set-up tool cannot check the files it copies'
 }
 
 # --- ARM64 on an x64 machine: ring (rustls) builds its assembly with clang ---
@@ -231,6 +268,24 @@ $pkgDir = Join-Path $stage $pkgName
 New-Item -ItemType Directory -Force $pkgDir | Out-Null
 foreach ($name in 'bluecaster', 'bluecaster-core', 'bluecaster-driver') {
     Copy-Item (Join-Path $release "$name.exe") $pkgDir
+}
+# Sign the programs before the zip and the installer pick them up. The
+# service add-on's set-up tool (bluecaster-core.exe --service-setup) copies
+# only files signed with the tool's own certificate, and the agent checks
+# the window it starts the same way. All three programs therefore need the
+# same certificate, or the add-on refuses the release.
+if ($signtool) {
+    $programs = Get-ChildItem -LiteralPath $pkgDir -Filter '*.exe' | ForEach-Object FullName
+    Invoke-Checked 'signtool sign' {
+        & $signtool sign /sha1 $codeSignThumb /fd SHA256 /tr $timestampUrl /td SHA256 /q @programs
+    }
+    foreach ($program in $programs) {
+        $sig = Get-AuthenticodeSignature -LiteralPath $program
+        if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Thumbprint -ne $codeSignThumb -or -not $sig.TimeStamperCertificate) {
+            throw "$program is not signed by $codeSignThumb with a time stamp ($($sig.Status))"
+        }
+    }
+    Write-Host "Signed: $(($programs | ForEach-Object { Split-Path $_ -Leaf }) -join ', ')"
 }
 Copy-Item -Recurse (Join-Path $docDir '*') $pkgDir
 New-Item -ItemType Directory -Force $OutDir | Out-Null

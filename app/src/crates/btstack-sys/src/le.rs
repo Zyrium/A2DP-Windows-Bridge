@@ -69,9 +69,15 @@ pub struct CigParams {
     pub cis: Vec<CisParams>,
 }
 
+/// Broadcasts (advertising set + BIG) the shim holds at once
+/// (BLUECASTER_BROADCASTS in shim.c); a broadcast's slot is its BIG handle
+pub const BROADCAST_SLOTS: u8 = 4;
+
 /// LE Create BIG (le_audio_big_params_t; packing sequential)
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BigParams {
+    /// Also the broadcast slot (0..[`BROADCAST_SLOTS`]) whose advertising
+    /// set the BIG goes on
     pub big_handle: u8,
     /// 1..=2 (MAX_NR_BIS)
     pub num_bis: u8,
@@ -126,6 +132,28 @@ impl Stack {
     /// during HCI init, also while LE is hidden. None before that answer.
     pub fn controller_iso(&self) -> Option<bool> {
         transport::controller_iso()
+    }
+
+    /// Hides the controller's address resolution from BTstack (the default
+    /// of every run; see crate::transport): off, BTstack keeps the
+    /// controller's resolving list with the IRKs of the LE bonds and turns
+    /// address resolution on, when the controller has it. Takes effect only
+    /// before [`Stack::hci_init`] / [`Stack::install_transport`]: false
+    /// afterwards.
+    pub fn set_address_resolution_hidden(&self, hidden: bool) -> bool {
+        let ok = transport::set_resolution_hidden(hidden);
+        if !ok {
+            tracing::warn!(target: "hci", "address resolution hidden: can only be changed before hci_init");
+        }
+        ok
+    }
+
+    /// Whether BTstack uses the controller's address resolution in this run:
+    /// not hidden, and the controller lists LE Set Address Resolution Enable
+    /// (an adapter known to list it wrongly does not count). None before the
+    /// controller's answer during HCI init.
+    pub fn controller_address_resolution(&self) -> Option<bool> {
+        transport::controller_resolution().map(|r| r && !transport::resolution_hidden())
     }
 
     /// After hci_init (and l2cap_init): LE bonds in the TLV `store`
@@ -219,6 +247,40 @@ impl Stack {
         let status = unsafe { ffi::gap_connect_cancel() };
         tracing::debug!(target: "le", "LE connect cancel: 0x{status:02X}");
         status
+    }
+
+    /// The controller connects by itself to a device of the accept list as
+    /// soon as that device advertises (keyboards and mice, issue #413);
+    /// ends with GAP_SUBEVENT_LE_CONNECTION_COMPLETE (no attempt of
+    /// [`Stack::le_connect`] in progress). Refused while one is. The address
+    /// is not logged: it is a keyboard's or mouse's.
+    pub fn le_auto_connect_start(&self, addr: &[u8; 6], addr_type: u8) -> u8 {
+        // SAFETY: on the BTstack thread; addr is 6 bytes (copied).
+        let status = unsafe { ffi::bluecaster_gap_auto_connection_start(addr_type, addr.as_ptr()) };
+        tracing::debug!(target: "le", "background connection: one device added (type {addr_type}): 0x{status:02X}");
+        status
+    }
+
+    /// Empties the accept list and ends the background connection
+    pub fn le_auto_connect_stop_all(&self) -> u8 {
+        // SAFETY: on the BTstack thread.
+        let status = unsafe { ffi::bluecaster_gap_auto_connection_stop_all() };
+        tracing::debug!(target: "le", "background connection stopped: 0x{status:02X}");
+        status
+    }
+
+    /// The scan interval and window of the next connection attempt (0.625
+    /// ms units)
+    pub fn le_connection_scan(&self, interval: u16, window: u16) {
+        // SAFETY: on the BTstack thread.
+        unsafe { ffi::bluecaster_gap_connection_scan(interval, window) }
+    }
+
+    /// The controller has LE (false while LE is hidden, and before HCI
+    /// init read its features)
+    pub fn le_supported(&self) -> bool {
+        // SAFETY: on the BTstack thread; reads hci.c's state.
+        !transport::le_hidden() && unsafe { ffi::bluecaster_le_supported() } != 0
     }
 
     pub fn connection_type(&self, con: u16) -> ConnectionType {
@@ -435,6 +497,20 @@ impl Stack {
         // SAFETY: as above.
         let status = unsafe { ffi::bluecaster_gatt_read_long_value(con, value_handle) };
         tracing::debug!(target: "le", "GATT read 0x{value_handle:04X} on 0x{con:04X}: 0x{status:02X}");
+        status
+    }
+
+    /// Every attribute of type `uuid16` between `start_handle` and
+    /// `end_handle` (ATT Read By Type; descriptors too): one
+    /// GATT_EVENT_CHARACTERISTIC_VALUE_QUERY_RESULT each, then
+    /// GATT_EVENT_QUERY_COMPLETE (ATT error 0x0A: there is none)
+    pub fn gatt_read_by_type(&self, con: u16, start_handle: u16, end_handle: u16, uuid16: u16) -> u8 {
+        if !self.le_initialized() {
+            return ERROR_CODE_COMMAND_DISALLOWED;
+        }
+        // SAFETY: on the BTstack thread after le_init.
+        let status = unsafe { ffi::bluecaster_gatt_read_by_type(con, start_handle, end_handle, uuid16) };
+        tracing::debug!(target: "le", "GATT read by type 0x{uuid16:04X} in 0x{start_handle:04X}-0x{end_handle:04X} on 0x{con:04X}: 0x{status:02X}");
         status
     }
 
@@ -819,7 +895,9 @@ impl Stack {
     }
 
     /// One complete SDU as an HCI ISO data packet (no time stamp), at most
-    /// [`ISO_SDU_MAX`] bytes; call it on CIS can-send-now
+    /// [`ISO_SDU_MAX`] bytes. The caller keeps within the controller's ISO
+    /// buffers; [`crate::consts::BTSTACK_ACL_BUFFERS_FULL`]: BTstack's
+    /// packet buffer is taken, nothing was sent
     pub fn iso_send(&self, cis_handle: u16, sequence_number: u16, sdu: &[u8]) -> u8 {
         if !self.le_initialized() {
             return ERROR_CODE_COMMAND_DISALLOWED;
@@ -838,11 +916,13 @@ impl Stack {
     // ---- Broadcast: advertising and BIG (after le_init) ----
 
     /// Starts extended advertising (non-connectable, non-scannable, `adv`)
-    /// with periodic advertising (`pa`, the BASE) on one advertising set;
-    /// intervals in 0.625 ms (extended) / 1.25 ms (periodic) units. One set
-    /// at a time. Ok: the advertising handle.
+    /// with periodic advertising (`pa`, the BASE) on the advertising set of
+    /// broadcast slot `slot` (0..[`BROADCAST_SLOTS`], the handle of the BIG
+    /// [`Stack::big_create`] then puts on it); intervals in 0.625 ms
+    /// (extended) / 1.25 ms (periodic) units. Ok: the advertising handle.
     pub fn broadcast_advertise(
         &self,
+        slot: u8,
         sid: u8,
         adv_interval: (u16, u16),
         pa_interval: (u16, u16),
@@ -860,6 +940,7 @@ impl Stack {
         // data into its static buffers.
         let status = unsafe {
             ffi::bluecaster_broadcast_advertise(
+                slot,
                 sid,
                 adv_interval.0,
                 adv_interval.1,
@@ -872,19 +953,19 @@ impl Stack {
                 &mut handle,
             )
         };
-        tracing::debug!(target: "le", "broadcast advertising (SID {sid}, adv {adv:02X?}, periodic {pa:02X?}): 0x{status:02X}, handle {handle}");
+        tracing::debug!(target: "le", "broadcast advertising (slot {slot}, SID {sid}, adv {adv:02X?}, periodic {pa:02X?}): 0x{status:02X}, handle {handle}");
         if status == ERROR_CODE_SUCCESS { Ok(handle) } else { Err(status) }
     }
 
-    /// Stops the advertising of [`Stack::broadcast_advertise`] and removes
-    /// its set
-    pub fn broadcast_advertise_stop(&self) -> u8 {
+    /// Stops the advertising of [`Stack::broadcast_advertise`] in `slot` and
+    /// removes its set
+    pub fn broadcast_advertise_stop(&self, slot: u8) -> u8 {
         if !self.le_initialized() {
             return ERROR_CODE_COMMAND_DISALLOWED;
         }
         // SAFETY: on the BTstack thread after le_init.
-        let status = unsafe { ffi::bluecaster_broadcast_advertise_stop() };
-        tracing::debug!(target: "le", "broadcast advertising stop: 0x{status:02X}");
+        let status = unsafe { ffi::bluecaster_broadcast_advertise_stop(slot) };
+        tracing::debug!(target: "le", "broadcast advertising stop (slot {slot}): 0x{status:02X}");
         status
     }
 
@@ -919,7 +1000,8 @@ impl Stack {
                 code,
             )
         };
-        tracing::debug!(target: "le", "BIG create {} BIS, SDU {} us / {} bytes, latency {} ms, RTN {}, PHY {}, framing {}, encrypted {}: 0x{status:02X}",
+        tracing::debug!(target: "le", "BIG create {}: {} BIS, SDU {} us / {} bytes, latency {} ms, RTN {}, PHY {}, framing {}, encrypted {}: 0x{status:02X}",
+            params.big_handle,
             params.num_bis,
             params.sdu_interval_us,
             params.max_sdu,

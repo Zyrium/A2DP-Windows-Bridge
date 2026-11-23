@@ -75,6 +75,73 @@ not secret; once it is final it may also be committed as `plugins.updater.pubkey
 `tauri.conf.json`. Without `TAURI_SIGNING_PRIVATE_KEY` the build still works, but writes no
 `.sig` and no `latest.json`, and its in-app update stays off.
 
+## Code signing (Authenticode)
+
+Signed releases let the keyboard and mouse service check its files. The service is an add-on:
+the set-up tool (`bluecaster-core.exe --service-setup`, see
+[docs/hid-host-dev.md](../docs/hid-host-dev.md)) copies its programs to
+`Program Files\BlueCaster Service`. A signed set-up tool copies a file only if the file carries a
+valid signature from the same certificate (the same SHA-256 thumbprint). The session agent checks
+the window it starts the same way. An unsigned tool copies without checking. A release therefore
+needs:
+
+- **One certificate for every program, with a time stamp**: `bluecaster.exe`,
+  `bluecaster-core.exe` and `bluecaster-driver.exe`. Without a time stamp, the signatures stop
+  being valid when the certificate expires, and the set-up tool then refuses the files.
+- **The certificate chains to a root that Windows trusts.** A self-signed certificate fails
+  on every PC that does not trust it.
+- **One build for all files.** The service's copy and the app must have the same version
+  (`version` in `Cargo.toml`, written into each program's version resource). If the versions
+  differ, the window reports that the service needs an update.
+- **The uninstall entry names the folder.** The agent finds the user's `bluecaster.exe`
+  through Setup's `InstallLocation` value. Inno Setup writes that value, so keep the AppId
+  unchanged.
+
+The set-up tool copies these files from the per-user folder:
+
+| File | Role in the service folder |
+| --- | --- |
+| `bluecaster-core.exe` | The service, the session agent, the input helper and the elevated helper |
+| `bluecaster-driver.exe` | The driver helper (WinUSB assignment, VB-CABLE setup) |
+| `licenses\` | The licence files; data, so compared but not signed |
+
+`bluecaster.exe` (the window) stays in the per-user folder only. The list is
+`SERVICE_PROGRAMS` and `SERVICE_DIRS` in `app/src/core/src/service_setup.rs`; a new program the
+service runs must be added there and signed here.
+
+To sign, set these before running `build-release.ps1`:
+
+```powershell
+$env:BLUECASTER_SIGN_THUMBPRINT = '<SHA-1 thumbprint of the certificate in Cert:\CurrentUser\My>'
+$env:BLUECASTER_SIGN_TIMESTAMP_URL = '<RFC 3161 time-stamp server of the certificate authority>'
+```
+
+The script signs the three programs with `signtool` (Windows SDK, or `$env:SIGNTOOL`) before it
+builds the zip and the installer. It then checks that each program is valid, signed by that
+certificate and time-stamped. Without `BLUECASTER_SIGN_THUMBPRINT` it warns and builds unsigned
+programs, as releases up to 3.0.3 were. The installer itself and its uninstaller stay unsigned.
+
+### Release check for the add-on
+
+Before publishing, run these checks on a test PC or virtual machine with a spare adapter, a USB
+keyboard and a USB mouse. The detailed steps are in [docs/hid-host-dev.md](../docs/hid-host-dev.md),
+"Test plan".
+
+- [ ] **Signatures**: in the zip, the three programs show the same signer under **Properties >
+      Digital Signatures**, with a time stamp.
+- [ ] **Add**: install the previous release, add the service (developer mode, **Developer >
+      Bluetooth keyboards and mice > Add**). One UAC prompt; `sc qc BlueCaster` names
+      `Program Files\BlueCaster Service\bluecaster-core.exe`.
+- [ ] **Update from the previous version**: run the new setup. It asks for no administrator
+      rights, the service keeps running, and the window says that the service needs an update.
+      Click **Update**: one UAC prompt, then playback works. The service folder's core has the
+      new version.
+- [ ] **Remove**: click **Remove** in the app. One UAC prompt; the service and its folder are
+      gone, and the app plays through its own core again.
+- [ ] **Uninstall with the service**: add the service again, then uninstall. **No** in the UAC prompt
+      stops the uninstall with nothing removed; **Yes** removes the service, its folder and the
+      app.
+
 ## How updates find a release
 
 - The resident core checks GitHub once a day (`crates/core/src/update.rs`): the latest release,
@@ -181,6 +248,26 @@ earlier versions first, and the app takes their settings over at its first start
     in Settings > Apps, restart). After a removal it offers to restart Windows, as VB-Audio's setup
     asks. Neither has been run on a machine yet: the flags come from VB-Audio's setups, not their
     documentation.
+
+  - **Remove the BlueCaster service**: shown only while the keyboard and mouse service is
+    installed. The uninstaller reads `HKLM\SYSTEM\CurrentControlSet\Services\BlueCaster` without
+    elevation to find out. The choice is on by default and first in the list. The removal runs
+    first, before the core closes and before the driver and cable steps. The uninstaller runs
+    `bluecaster-core.exe --service-setup remove` elevated, with one UAC prompt. It uses the
+    installation's copy of the core, or the service folder's copy when the installation's copy is
+    missing. That copy removes the service but cannot delete its own folder, so the uninstall
+    goes on whenever the service is gone. With **Delete user data** checked, the uninstaller adds `--remove-data`, and the
+    data line also names `%ProgramData%\BlueCaster`. If the user declines the prompt or the
+    removal fails, the uninstall stops with a message before removing anything. A service without
+    its app would keep the adapter and keep running as SYSTEM. A silent uninstall cannot show a
+    prompt, so it removes the service only when it already runs elevated, and stops otherwise.
+    Once the service is gone, the window closes on the service's Bye, and the uninstaller ends any
+    window still running from the installation folder.
+
+  Setup itself never elevates and never touches the service. The service runs its own copy from
+  `Program Files\BlueCaster Service`. `--quit` reaches only the user's own pipe. Restart Manager
+  closes only what uses the installation's files, which here means the window. After an update
+  the service is older than the app, and the app asks the user to update the service.
 
   Silent mode (`/SILENT`, `/VERYSILENT`) shows no page: the adapters stay on WinUSB, and the data
   and the cables stay. Updates do not run the uninstaller. The download cache `%TEMP%\A2DPWB_cache` always

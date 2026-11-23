@@ -186,7 +186,7 @@ flowchart TD
 |:-------|:----------|:--------|
 | capture | MMCSS "Audio" | Liest WASAPI; füllt stille Abschnitte mit Stille auf |
 | encode | MMCSS "Pro Audio" | Wandelt in das Format des Encoders um, kodiert ganze Encoder-Blöcke (der Rest wartet auf die nächste Runde) und packt Frames in Mediennutzdaten. Arbeitet in Runden von etwa 10 ms, damit die Pakete gleichmäßig gesendet werden |
-| bt-runloop | -- | Die Run Loop von BTstack. Sendet ein wartendes Paket, sobald L2CAP senden kann. Bei jedem neu eingereihten Paket verwirft die Sendewarteschlange (64 Pakete) Pakete, die 350 ms gewartet haben, die ältesten zuerst |
+| bt-runloop | -- | Die Run Loop von BTstack. Sendet ein wartendes Paket, sobald L2CAP senden kann. Bei jedem neu eingereihten Paket verwirft die Sendewarteschlange (64 Pakete) Pakete, die 350 ms (100 ms bei LHDC V5 mit niedriger Latenz) gewartet haben, die ältesten zuerst |
 | USB | -- | WinUSB-Übertragungen: drei laufende Lesevorgänge auf jeder IN-Pipe (Events, ACL-Daten), ein Schreiber für Befehle und einer für ACL-Daten (bis zu 8 laufende Übertragungen) |
 | core | Normal | Zustandsautomat, IPC (tokio; die Warteschlangen des RFCOMM-Passthrough pro Verbindung), Einstellungen, Statistik (4 Hz), Updateprüfung |
 
@@ -425,7 +425,7 @@ sobald der Helfer beendet ist.
 
 | Encoder | Bibliothek | Bitrate | Merkmale |
 |---------|------------|---------|----------|
-| LHDC V5 | lhdcv5-enc (C-Portierung des AOSP-Encoders) | 400/500/900/1000 kbps (Niedrig/Mittel/Mittel-hoch/Hoch), höchstens das von der Senke aufgeführte Maximum, ABR 160–400 kbps | 16/24 Bit, 5-ms-Frames, 2 Byte Header der Mediennutzdaten, RTP-Header |
+| LHDC V5 | lhdcv5-enc (C-Portierung des AOSP-Encoders) | 400/500/900/1000 kbps (Niedrig/Mittel/Mittel-hoch/Hoch), höchstens das von der Senke aufgeführte Maximum, ABR 160–400 kbps | 16/24 Bit, 5-ms-Frames, 2 Byte Header der Mediennutzdaten, RTP-Header; niedrige Latenz, wo die Senke sie aufführt (kodiert alle 10 ms statt alle 20; bei ausgeschaltetem ABR kommt der Warteschlangenschutz unten hinzu) |
 | LDAC | libldac (AOSP) | 330/660/990 kbps | Modi Hoch/Mittel/Niedrig (HQ/SQ/MQ), ABR |
 | aptX Adaptive | aptx-adaptive (reiner Rust-Encoder von AKS-Logic/aptx-adaptive-linux, MIT) | 427 kbps Hoch, 265 kbps Niedrige Latenz (R2-Senken: 270); ABR stuft auf 364/318 herunter (R2: 270/204) | 48 kHz Stereo (96 kHz in Hoch, wenn gewählt, an eine R2-Senke, die es aufführt: 646/340/255 kbps), 24 Bit; ein Codec-Paket pro Medienpaket hinter dem eigenen RTP-Header von BlueCaster; ABR in Hoch; Automatisch nimmt es nach LHDC V5 und LDAC |
 | Opus | libopus 1.6.1 | 256 kbps (Stereo; Mono die Hälfte) | A2DP Opus von Android: 48 kHz, 20-ms-Frames (10 ms, falls die Senke nur diese hat), Constrained VBR, begrenzt auf die Mediennutzdaten, ein Frame pro Paket, 1 Byte Header der Mediennutzdaten, RTP-Header |
@@ -436,6 +436,13 @@ sobald der Helfer beendet ist.
 | SBC XQ | derselbe SBC-Encoder | ca. 385/505/552 kbps | Dual Channel, Bitpool 47 / 43 bei 44,1 / 48 kHz (Hoch); nur wenn das SBC der Senke Dual Channel und einen Bitpool von mindestens 29 erlaubt (der Bitpool wird dann wie bei PipeWire auf das Maximum der Senke begrenzt); teilt sich mit SBC den Stream-Endpunkt, den Header der Mediennutzdaten und den RTP-Header |
 | SBC | Rust-Portierung des Bluedroid-Encoders | bis ca. 345 kbps | Verpflichtende A2DP-Grundlage; bitgenau zum C-Encoder (über alle Konfigurationen getestet) |
 | FastStream | derselbe SBC-Encoder | 198/216 kbps (44,1/48 kHz) | CSR-Hersteller-Codec, nur Musikrichtung (kein Sprachrückkanal): SBC Joint Stereo Bitpool 29, Frames auf 72 Byte aufgefüllt, 3 pro Paket, kein Header der Mediennutzdaten und kein RTP-Header (wie bei PipeWire); wird von Automatisch nie gewählt |
+
+**LHDC-V5-Warteschlangenschutz** (niedrige Latenz an, ABR aus): Solange die
+Sendewarteschlange im Mittel über eine Sekunde 12 oder mehr Pakete enthält,
+senkt der Encoder die Bitrate um eine Stufe (1000, 900, dann 500 kbps), mit
+mindestens 2 s Abstand. Nach einer ruhigen Minute erhöht er sie wieder um eine
+Stufe. Hält eine Erhöhung keine 30 s, verdoppelt sich die Wartezeit, bis zu
+10 Minuten.
 
 Alle Encoder implementieren den Trait `codec::Encoder`. Sie geben das PCM-Format
 und die Anzahl der Frames pro Aufruf an und liefern Codec-Frames zurück.
@@ -474,8 +481,10 @@ Größen der Codec Information Elements (einschließlich der 6 Byte für Vendor 
   Abtastraten (0x20 44,1k, 0x10 48k, 0x04 96k, 0x01 192k), Byte 7 Bittiefe
   (0x04 16 Bit, 0x02 24 Bit) und die minimale/maximale Bitrate der Senke, Byte 8
   Codec-Unterversion (0x01 = V5 ver.1) und 0x10 = 5-ms-Frames, Byte 9-10
-  optionale Funktionen (Low Latency, Lossless, JAS, AR, META), von denen
-  BlueCaster keine anbietet. Nur Stereo. Die Bitratengrenzen der Senke werden in der
+  optionale Funktionen (Low Latency, Lossless, JAS, AR, META). BlueCaster fordert
+  Low Latency an (Byte 9, 0x40), wenn in den LHDC-V5-Einstellungen Niedrige Latenz
+  eingeschaltet ist und die Senke sie aufführt. Die anderen Funktionen bietet
+  BlueCaster nicht an. Nur Stereo. Die Bitratengrenzen der Senke werden in der
   Konfiguration zurückgegeben und auf den Encoder angewendet, wie bei Android. Medienpakete
   tragen einen 2 Byte langen Nutzdaten-Header: Frame-Anzahl << 2 (Latenz-Bits 0) und eine
   Sequenznummer
@@ -522,6 +531,7 @@ unten genannten Ordner):
 | `profiles.json` | Profile |
 | `devices\devices.txt` | Bekannte Geräte |
 | `devices\le_audio_devices.txt` | LE Audio: die LE-Audio-Einträge der Geräteliste |
+| `devices\le_audio_sets.txt` | LE Audio: die koordinierten Sets der gespeicherten Geräte (nur die Adressen der Mitglieder; beide Ohrhörer eines Paars sind ein Gerät) |
 | `devices\device_codecs.json` | Was jedes klassische Gerät bei seiner letzten Verbindung angeboten hat (und ob OPPO-Ohrhörer nach Hi-Res gefragt wurden) |
 | `pairing\link_keys.txt` | Link Keys: Mit v1 oder 2.0.x gekoppelte Kopfhörer verbinden sich ohne erneute Kopplung wieder |
 | `pairing\le_audio_bonds.tlv`, `pairing\le_audio_csip.txt` | LE Audio: LE-Bonds (mit den dauerhaften CCC-Werten des GATT-Servers) und koordinierte Sets |

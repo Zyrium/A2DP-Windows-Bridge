@@ -2,6 +2,10 @@
 //! same server under the pipe's 2.0.x name too (third-party clients written
 //! for A2DPWB; see ipc::old_pipe_name).
 //!
+//! Service mode ([`serve_service`]): one pipe for every user, no 2.0.x
+//! name, and every client is identified from the pipe (win_sys::pipe_peer)
+//! and its requests checked against the rules (crate::rules).
+//!
 //! A connection says Hello, gets Welcome and a Snapshot, then the events of
 //! every state change; requests run concurrently and their responses go out
 //! through the same writer. A client that falls behind on events gets a new
@@ -56,23 +60,85 @@ async fn serve_old(state: Arc<CoreState>, name: String) {
     }
 }
 
-async fn accept(state: Arc<CoreState>, name: &str, mut server: NamedPipeServer) -> std::io::Result<()> {
+/// Service mode: accepts connections on the service pipe `name`
+/// (ipc::service_pipe_name) until the process ends; Err if another
+/// process owns the name
+pub async fn serve_service(state: Arc<CoreState>, name: String) -> std::io::Result<()> {
+    let server = win_sys::pipe_peer::create_service_server(&name, true)?;
+    tracing::info!("IPC: listening on the service pipe");
+    accept_with(state, &name, server, true).await
+}
+
+async fn accept(state: Arc<CoreState>, name: &str, server: NamedPipeServer) -> std::io::Result<()> {
+    accept_with(state, name, server, false).await
+}
+
+async fn accept_with(
+    state: Arc<CoreState>,
+    name: &str,
+    mut server: NamedPipeServer,
+    service: bool,
+) -> std::io::Result<()> {
     loop {
         server.connect().await?;
         let client = server;
-        server = win_sys::pipe::create_server(name, false)?;
+        server = if service {
+            win_sys::pipe_peer::create_service_server(name, false)?
+        } else {
+            win_sys::pipe::create_server(name, false)?
+        };
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = session(state, client).await {
+            if let Err(e) = session(state, client, service).await {
                 tracing::debug!("IPC: client ended: {e}");
             }
         });
     }
 }
 
-async fn session(state: Arc<CoreState>, pipe: NamedPipeServer) -> Result<(), ipc::FrameError> {
+/// Tests: the identity the server sees instead of the pipe's (an
+/// elevated client without a UAC prompt). Not in a release build.
+#[cfg(test)]
+pub(crate) static TEST_IDENTITY: Mutex<Option<win_sys::pipe_peer::ClientIdentity>> = Mutex::new(None);
+
+/// The client on `pipe`, from its token and process
+fn identify(pipe: &NamedPipeServer) -> std::io::Result<win_sys::pipe_peer::ClientIdentity> {
+    #[cfg(test)]
+    if let Some(id) = TEST_IDENTITY.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Ok(id);
+    }
+    use std::os::windows::io::AsHandle;
+    win_sys::pipe_peer::client_identity(pipe.as_handle())
+}
+
+/// Service mode: the rules' view of the client, or why it may not connect
+fn service_caller(
+    id: std::io::Result<win_sys::pipe_peer::ClientIdentity>,
+    ticket: Option<&str>,
+) -> Result<crate::rules::Caller, &'static str> {
+    let id = id.map_err(|_| "the client is not known")?;
+    let programs = crate::rules::own_elevated_programs();
+    let caller = crate::rules::Caller::of(&id, &programs, ticket);
+    if id.session_id == 0 && !caller.elevated {
+        return Err("not an interactive session");
+    }
+    Ok(caller)
+}
+
+/// Service mode's version rule for a hello `name`: BlueCaster's own UI
+/// ("bluecaster-ui/<version>") must be the service's `own` version. Other
+/// clients (the elevated helper runs from the service folder itself, pipe
+/// clients of other authors) are not asked.
+fn ui_version_reject(name: &str, own: &str) -> Option<&'static str> {
+    let version = name.strip_prefix("bluecaster-ui/")?;
+    ipc::service_state::version_reject(own, version)
+}
+
+async fn session(state: Arc<CoreState>, mut pipe: NamedPipeServer, service: bool) -> Result<(), ipc::FrameError> {
+    let hello = tokio::time::timeout(HELLO_TIMEOUT, read_frame::<_, ClientMessage>(&mut pipe)).await;
+    // After the first read: Windows lets the server read the client's token
+    let identity = service.then(|| identify(&pipe));
     let (mut rd, mut wr) = tokio::io::split(pipe);
-    let hello = tokio::time::timeout(HELLO_TIMEOUT, read_frame::<_, ClientMessage>(&mut rd)).await;
     let client = match hello {
         Ok(Ok(Some(ClientMessage::Hello { protocol, client }))) => {
             if protocol != PROTOCOL_VERSION {
@@ -88,8 +154,38 @@ async fn session(state: Arc<CoreState>, pipe: NamedPipeServer) -> Result<(), ipc
             return Ok(());
         }
     };
-    tracing::info!("IPC: {client} connected");
+    // The elevated helper's ticket is not part of its name
+    let (name, ticket) = ipc::access::split_client_name(&client);
+    let caller = match identity.map(|id| service_caller(id, ticket)) {
+        Some(Err(why)) => {
+            tracing::info!("IPC: a client was refused: {why}");
+            write_frame(&mut wr, &ServerMessage::Reject { reason: why.to_string() }).await?;
+            return Ok(());
+        }
+        Some(Ok(c)) => Some(c),
+        None => None,
+    };
+    // Service mode: the app and the service are one version; another
+    // version is told which side needs the update (the UI reads it from the
+    // reason, ipc::service_state::version_reject_code)
+    if caller.is_some()
+        && let Some(why) = ui_version_reject(name, env!("CARGO_PKG_VERSION"))
+    {
+        tracing::info!("IPC: a client was refused: {why}");
+        write_frame(&mut wr, &ServerMessage::Reject { reason: why.to_string() }).await?;
+        return Ok(());
+    }
+    let client = name.to_string();
+    match &caller {
+        Some(c) => tracing::info!("IPC: {client} connected (elevated {})", c.elevated),
+        None => tracing::info!("IPC: {client} connected"),
+    }
     lock_clients().push(client.clone());
+    // Service mode: BlueCaster's window started again after an Exit brings
+    // the tray icon back
+    if caller.is_some() && client.starts_with("bluecaster-ui/") {
+        crate::headless::user_returned();
+    }
     write_frame(
         &mut wr,
         &ServerMessage::Welcome {
@@ -129,6 +225,21 @@ async fn session(state: Arc<CoreState>, pipe: NamedPipeServer) -> Result<(), ipc
                     Ok(None) => Ok(None),
                     Err(e) => Err(e),
                 };
+                // Service mode: the request rules first
+                let msg = match (msg, &caller) {
+                    (Ok(Some(ClientMessage::Request { id, call })), Some(c)) => {
+                        match crate::rules::check(c, &call, &*state) {
+                            Ok(()) => Ok(Some(ClientMessage::Request { id, call })),
+                            Err(e) => {
+                                tracing::info!("IPC: {client} #{id} {} refused: {}", method_name(&call), e.code);
+                                let m = ServerMessage::Response { id, result: None, error: Some(e) };
+                                if let Err(e) = write_frame(&mut wr, &m).await { break Err(e); }
+                                continue;
+                            }
+                        }
+                    }
+                    (msg, _) => msg,
+                };
                 match msg {
                     Ok(Some(ClientMessage::Request { id, call })) if rfcomm.request(id, &call) => {}
                     Ok(Some(ClientMessage::Request { id, call })) => {
@@ -148,11 +259,17 @@ async fn session(state: Arc<CoreState>, pipe: NamedPipeServer) -> Result<(), ipc
                         }
                         let (state, tx) = (state.clone(), resp_tx.clone());
                         let client = client.clone();
+                        let ticket = caller.as_ref().and_then(|c| c.ticket.clone());
                         tokio::spawn(async move {
                             let method = method_name(&call);
                             tracing::trace!("IPC: {client} #{id} {call:?}");
                             let started = std::time::Instant::now();
                             let r = state.handle(call).await;
+                            // The elevated helper's call: its result goes to
+                            // the client that asked (app.run_as_admin) too
+                            if let Some(t) = &ticket {
+                                crate::rules::finish(t, &r);
+                            }
                             let ms = started.elapsed().as_millis();
                             let msg = match r {
                                 Ok(v) => {
@@ -293,6 +410,18 @@ fn set_subscribed(count: &AtomicUsize, current: &mut bool, wanted: bool) -> bool
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_ui_of_another_version_is_told_which_side_is_older() {
+        use ipc::service_state::{APP_OLDER_THAN_SERVICE, SERVICE_NEEDS_UPDATE};
+        assert_eq!(ui_version_reject("bluecaster-ui/3.0.3", "3.0.3"), None);
+        assert_eq!(ui_version_reject("bluecaster-ui/3.0.4", "3.0.3"), Some(SERVICE_NEEDS_UPDATE));
+        assert_eq!(ui_version_reject("bluecaster-ui/3.0.2", "3.0.3"), Some(APP_OLDER_THAN_SERVICE));
+        assert_eq!(ui_version_reject("bluecaster-ui/x", "3.0.3"), Some(APP_OLDER_THAN_SERVICE));
+        // Not the UI: not asked
+        assert_eq!(ui_version_reject("bluecaster-request/3.0.2", "3.0.3"), None);
+        assert_eq!(ui_version_reject("encodeck/1.14.0", "3.0.3"), None);
+    }
+
     /// The core answers under both names (test names, not the user's pipe)
     #[test]
     fn serves_the_new_and_the_old_name() {
@@ -336,6 +465,91 @@ mod tests {
             // A second core cannot have the new name
             assert!(win_sys::pipe::create_server(&name, true).is_err());
         });
+        rt.shutdown_background();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Service mode through a real pipe, with the identity the test seam
+    /// gives: a normal client is refused hid.code, an elevated one of our
+    /// program gets past the rules (developer mode is off: developer.off),
+    /// a client in session 0 that is not elevated may not connect
+    #[test]
+    fn service_mode_checks_each_client() {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("bluecaster-server-service-{pid}"));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let options = bluecaster_core::ServiceOptions {
+            config_dir: dir.clone(),
+            hci_tcp: None,
+            capture: bt_host::HciCapture::new(),
+            afh: None,
+            usb: Default::default(),
+        };
+        let state = CoreState::new(
+            Arc::new(bluecaster_core::Service::new(options, tx)),
+            Box::new(|_| {}),
+            Box::new(|| {}),
+            Box::new(|_| {}),
+        );
+        let name = format!(r"\\.\pipe\bluecaster-test-service-rules-{pid}");
+        let identity = |elevated: bool, session_id: u32| win_sys::pipe_peer::ClientIdentity {
+            pid,
+            session_id,
+            user_sid: "S-1-5-21-1".into(),
+            elevated,
+            integrity: win_sys::pipe_peer::INTEGRITY_HIGH,
+            image: std::env::current_exe().ok(),
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.block_on(async {
+            tokio::spawn(serve_service(state, name.clone()));
+            // One request on a new connection: the response's error code, or
+            // the reject
+            let ask = |id: win_sys::pipe_peer::ClientIdentity, call: Method| {
+                let name = name.clone();
+                async move {
+                    *TEST_IDENTITY.lock().unwrap() = Some(id);
+                    let started = std::time::Instant::now();
+                    let pipe = loop {
+                        match ClientOptions::new().open(&name) {
+                            Ok(p) => break p,
+                            Err(e) if started.elapsed() > Duration::from_secs(5) => panic!("{e}"),
+                            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                        }
+                    };
+                    let (mut rd, mut wr) = tokio::io::split(pipe);
+                    let hello = ClientMessage::Hello { protocol: PROTOCOL_VERSION, client: "test".into() };
+                    write_frame(&mut wr, &hello).await.unwrap();
+                    // A refused client may find the pipe already closed
+                    // here; the reject is still there to read
+                    let _ = write_frame(&mut wr, &ClientMessage::Request { id: 1, call }).await;
+                    loop {
+                        let m: serde_json::Value = read_frame(&mut rd).await.unwrap().unwrap();
+                        match m["type"].as_str() {
+                            Some("reject") => return "reject".to_string(),
+                            Some("response") => {
+                                return m["error"]["code"].as_str().unwrap_or("ok").to_string();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            };
+            // hid.enable needs an administrator (hid.code is open)
+            let enable = || Method::HidEnable { code: "1".into(), other_input_at_hand: true, risk_understood: true };
+            assert_eq!(ask(identity(false, 1), enable()).await, ipc::access::NEEDS_ADMIN);
+            assert_ne!(ask(identity(true, 1), enable()).await, ipc::access::NEEDS_ADMIN);
+            assert_eq!(ask(identity(false, 1), Method::HidCode).await, "developer.off");
+            assert_eq!(ask(identity(false, 1), Method::HidStatus).await, "ok");
+            assert_eq!(ask(identity(true, 1), Method::AppQuit).await, ipc::access::NOT_IN_SERVICE);
+            assert_eq!(ask(identity(false, 0), Method::HidStatus).await, "reject");
+            // Another program's elevated process is a normal client
+            let other =
+                win_sys::pipe_peer::ClientIdentity { image: Some("C:\\x\\cmd.exe".into()), ..identity(true, 1) };
+            assert_eq!(ask(other, enable()).await, ipc::access::NEEDS_ADMIN);
+        });
+        *TEST_IDENTITY.lock().unwrap() = None;
         rt.shutdown_background();
         let _ = std::fs::remove_dir_all(&dir);
     }

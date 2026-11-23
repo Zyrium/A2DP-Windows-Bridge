@@ -51,4 +51,15 @@ le_audio: boolean,
  * LE Audio: a member of a coordinated set (it advertised a CSIP RSI;
  * both earbuds stream together)
  */
-le_audio_set: boolean, };
+le_audio_set: boolean, 
+/**
+ * Keyboards and mice (experimental, issue #413): a Bluetooth LE
+ * keyboard or mouse with its address type for hid.add. Such entries
+ * are only in Snapshot.hid_candidates, never in the device list.
+ */
+hid_le: number | null, 
+/**
+ * LE Audio: the addresses of the other members of its coordinated set
+ * (the other earbud), once a connection learned it
+ */
+set_addresses: Array<string>, };

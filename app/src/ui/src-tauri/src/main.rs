@@ -14,6 +14,7 @@ mod commands;
 mod connection;
 mod logging;
 mod recovery;
+mod service;
 mod update;
 mod windows;
 
@@ -83,6 +84,8 @@ fn main() {
             commands::qcy_reconnect,
             commands::qcy_set,
             commands::qcy_save_profile,
+            commands::service_state,
+            commands::service_setup,
         ])
         .on_window_event(windows::on_window_event)
         .setup(move |app| {

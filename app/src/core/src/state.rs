@@ -17,7 +17,7 @@ use bluecaster_core::settings::Settings as CoreSettings;
 use bluecaster_core::vendor;
 use bluecaster_core::{
     CodecStopKind, LeStreamDetails, ScannedDevice, Service, ServiceEvent, SourceRequest, StreamRequest,
-    StreamState as CoreStreamState, VolumeSync, devices,
+    StreamState as CoreStreamState, VolumeSync, devices, le_sets,
 };
 use bt_host::chips::{self, ChipVendor};
 use bt_host::{HeadsetMic, LinkStats};
@@ -171,6 +171,11 @@ pub(crate) fn bad_request(code: &str, method: &str, why: String) -> ErrorInfo {
     }
 }
 
+/// Developer mode is on (the HID host's requests)
+fn developer(state: &CoreState) -> Result<(), ErrorInfo> {
+    if state.service.settings().debug_mode { Ok(()) } else { Err(err("developer.off", "ipc.error.developer_only")) }
+}
+
 /// A result as JSON (plain data: it cannot fail)
 fn json<T: serde::Serialize>(v: &T) -> Value {
     serde_json::to_value(v).unwrap_or(Value::Null)
@@ -184,6 +189,7 @@ fn to_ipc_profile(p: &CoreProfile, legacy: u16) -> Profile {
         codec: p.codec.clone(),
         quality: p.quality.clone(),
         abr: p.abr,
+        lhdcv5_low_latency: p.lhdcv5_low_latency,
         codec_fallback: p.codec_fallback,
         codec_forced: p.codec_forced,
         unlisted_options: p.unlisted_options,
@@ -229,6 +235,7 @@ fn to_ipc_codec_values(v: &profiles::CodecValues) -> ipc::CodecValues {
         sample_rate: v.sample_rate,
         bit_depth: v.bit_depth,
         abr: v.abr,
+        lhdcv5_low_latency: v.lhdcv5_low_latency,
         sbc_bitpool: v.sbc_bitpool,
         sbcxq_bitpool: v.sbcxq_bitpool,
         sbc_min_bitpool: v.sbc_min_bitpool,
@@ -247,6 +254,7 @@ fn from_ipc_codec_values(v: &ipc::CodecValues) -> profiles::CodecValues {
         sample_rate: v.sample_rate,
         bit_depth: v.bit_depth,
         abr: v.abr,
+        lhdcv5_low_latency: v.lhdcv5_low_latency,
         sbc_bitpool: v.sbc_bitpool,
         sbcxq_bitpool: v.sbcxq_bitpool,
         sbc_min_bitpool: v.sbc_min_bitpool,
@@ -279,6 +287,7 @@ fn merge_profile(base: Option<&CoreProfile>, p: &Profile) -> CoreProfile {
     c.codec = p.codec.clone();
     c.quality = p.quality.clone();
     c.abr = p.abr;
+    c.lhdcv5_low_latency = p.lhdcv5_low_latency;
     c.codec_fallback = p.codec_fallback;
     c.codec_forced = p.codec_forced;
     c.unlisted_options = p.unlisted_options;
@@ -427,11 +436,14 @@ fn to_ipc_settings(s: &CoreSettings) -> Settings {
         bt_chip_pid: s.bt_chip_pid,
         bt_chip_fw_stem: s.bt_chip_fw_stem.clone(),
         realtek_custom_firmware: s.realtek_custom_firmware,
+        adapter_id: s.adapter_id.clone(),
+        auracast_adapter_id: s.auracast_adapter_id.clone(),
         afh: s.afh.clone(),
         remote_sink: s.remote_sink.clone(),
         le_audio_experimental: s.le_audio_experimental,
         le_audio_low_latency: s.le_audio_low_latency,
         auto_codec: s.auto_codec,
+        hid_host: s.hid_host,
     }
 }
 
@@ -439,6 +451,35 @@ fn to_ipc_settings(s: &CoreSettings) -> Settings {
 /// microphone's cable (issue #86)
 fn hifi_cable(devices: &[audio_capture::DeviceInfo]) -> Option<&audio_capture::DeviceInfo> {
     devices.iter().find(|d| profiles::is_hifi_cable(&d.name))
+}
+
+/// Service mode (crate::rules): whether settings.set with `s` changes
+/// anything only an elevated client may change: developer mode and what
+/// it sets, the chip, its firmware and radio settings, the receiver host.
+/// Not the adapter to use (or the Auracast adapter): a choice among the
+/// adapters an administrator already gave to BlueCaster.
+pub(crate) fn admin_settings_change(base: &CoreSettings, s: &Settings) -> bool {
+    let m = merge_settings(base, s);
+    m.debug_mode != base.debug_mode
+        || m.dev_overrides != base.dev_overrides
+        || m.dev_vendors != base.dev_vendors
+        || m.dev_log != base.dev_log
+        || m.dev_debug != base.dev_debug
+        || m.bt_chip_pid != base.bt_chip_pid
+        || m.bt_chip_fw_stem != base.bt_chip_fw_stem
+        || m.realtek_custom_firmware != base.realtek_custom_firmware
+        || m.afh != base.afh
+        || m.remote_sink != base.remote_sink
+}
+
+#[cfg(test)]
+pub(crate) fn test_ipc_settings(s: &CoreSettings) -> Settings {
+    to_ipc_settings(s)
+}
+
+#[cfg(test)]
+pub(crate) fn test_ipc_profile() -> Profile {
+    to_ipc_profile(&CoreProfile::default(), 0)
 }
 
 fn merge_settings(base: &CoreSettings, s: &Settings) -> CoreSettings {
@@ -537,12 +578,66 @@ fn merge_settings(base: &CoreSettings, s: &Settings) -> CoreSettings {
     c.bt_chip_pid = s.bt_chip_pid;
     c.bt_chip_fw_stem = s.bt_chip_fw_stem.clone();
     c.realtek_custom_firmware = s.realtek_custom_firmware;
+    c.adapter_id = s.adapter_id.trim().to_string();
+    c.auracast_adapter_id = s.auracast_adapter_id.trim().to_string();
     c.afh = s.afh.clone();
     c.remote_sink = s.remote_sink.clone();
     c.le_audio_experimental = s.le_audio_experimental;
     c.le_audio_low_latency = s.le_audio_low_latency;
     c.auto_codec = s.auto_codec;
+    // Keyboards and mice through BlueCaster: only hid.enable turns them on
+    // (issue #413). Developer mode off turns them off for good, so that
+    // turning it on again later does not bring them back unasked.
+    c.hid_host = base.hid_host && s.hid_host && c.debug_mode;
     c
+}
+
+fn to_ipc_hid_devices(list: Vec<bluecaster_core::HidDevice>) -> Vec<ipc::HidDevice> {
+    list.into_iter()
+        .map(|d| ipc::HidDevice { address: d.address, name: d.name, connected: d.connected, le: d.le })
+        .collect()
+}
+
+fn to_ipc_hid_passkey(p: Option<(String, String)>) -> Option<ipc::HidPasskey> {
+    p.map(|(address, passkey)| ipc::HidPasskey { address, passkey })
+}
+
+/// The devices being added, with the time left as of now
+fn to_ipc_hid_checks(service: &Service) -> Vec<ipc::HidCheck> {
+    let ms = |d: std::time::Duration| d.as_millis().min(u128::from(u32::MAX)) as u32;
+    service
+        .hid_checks()
+        .into_iter()
+        .map(|c| ipc::HidCheck {
+            address: c.address,
+            name: c.name,
+            kind: c.kind.to_string(),
+            waiting: c.waiting,
+            remaining_ms: ms(c.remaining),
+            window_ms: ms(c.window),
+        })
+        .collect()
+}
+
+fn to_ipc_hid_rolled_back(service: &Service) -> Option<ipc::HidRolledBack> {
+    service.hid_rolled_back().map(|r| ipc::HidRolledBack {
+        address: r.address,
+        name: r.name,
+        le: r.le,
+        reason: r.reason.as_str().to_string(),
+    })
+}
+
+fn to_ipc_hid_health(service: &Service) -> Option<ipc::HidHealth> {
+    service.hid_health().map(|h| {
+        let (state, reason) = h.parts();
+        ipc::HidHealth { state: state.to_string(), reason: reason.map(str::to_string) }
+    })
+}
+
+/// A Msg error of crate::hid ("error.hid.off") with its code ("hid.off")
+fn hid_err(m: &bluecaster_core::Msg) -> ErrorInfo {
+    ErrorInfo { code: m.key.strip_prefix("error.").unwrap_or(m.key).to_string(), message: msg(m) }
 }
 
 /// What the UI tells about an adapter's firmware besides Realtek's files.
@@ -561,9 +656,14 @@ fn vendor_note(vendor: ChipVendor, vid: u16, pid: u16) -> Option<Msg> {
         ChipVendor::Actions => "firmware.vendor_actions",
         ChipVendor::MediaTek => "firmware.vendor_mediatek",
         ChipVendor::Qualcomm => "firmware.vendor_qualcomm",
-        // The RTL8852BD: its firmware comes from Realtek's Windows driver
-        ChipVendor::Realtek if bt_host::realtek_btnic::chip(vid, pid).is_some() => "firmware.vendor_realtek_driver",
-        ChipVendor::Realtek | ChipVendor::Unknown => return None,
+        // Chips whose firmware comes from Realtek's Windows driver: the
+        // RTL8852BD's note names it, the others' (RTL8922A, RTL8852BT) not
+        ChipVendor::Realtek => match bt_host::realtek_btnic::chip(vid, pid) {
+            Some(("RTL8852BD", _)) => "firmware.vendor_realtek_driver",
+            Some(_) => "firmware.vendor_realtek_driver_other",
+            None => return None,
+        },
+        ChipVendor::Unknown => return None,
     };
     Some(Msg::new(key))
 }
@@ -575,6 +675,42 @@ const CM_PROB_NEED_RESTART: u32 = 14;
 /// running stack's, else what a stack found out on the first WinUSB adapter
 fn le_audio_now(running: Option<bool>, adapters: &[AdapterInfo]) -> Option<bool> {
     running.or_else(|| adapters.iter().find(|a| a.driver == DriverKind::Winusb).and_then(|a| a.le_audio))
+}
+
+/// The adapter in use (AdapterState::active) from its entry in the list:
+/// the one on WinUSB if two have this VID:PID. One not listed (yet) gets
+/// what its VID:PID tells.
+fn active_adapter(vid: u16, pid: u16, adapters: &[AdapterInfo]) -> ipc::ActiveAdapter {
+    let same = |a: &&AdapterInfo| a.vid == vid && a.pid == pid;
+    let listed =
+        adapters.iter().filter(same).find(|a| a.driver == DriverKind::Winusb).or_else(|| adapters.iter().find(same));
+    let realtek_driver_chip = || bt_host::realtek_btnic::chip(vid, pid).map(|(chip, _)| chip.to_owned());
+    match listed {
+        Some(a) => ipc::ActiveAdapter {
+            display_name: a.display_name.clone(),
+            windows_name: a.windows_name.clone(),
+            vid,
+            pid,
+            vendor: a.vendor.clone(),
+            chip: a
+                .realtek_chip
+                .clone()
+                .or_else(|| (a.vendor == ChipVendor::Realtek.name()).then(realtek_driver_chip).flatten()),
+            bt_version: a.bt_version.clone(),
+        },
+        None => {
+            let vendor = chips::vendor_for_usb(vid, pid, None);
+            ipc::ActiveAdapter {
+                display_name: chips::display_name(vid, pid, None, vendor),
+                windows_name: None,
+                vid,
+                pid,
+                vendor: vendor.name().to_owned(),
+                chip: (vendor == ChipVendor::Realtek).then(realtek_driver_chip).flatten(),
+                bt_version: None,
+            }
+        }
+    }
 }
 
 /// The Realtek chip (PID, firmware stem) whose files an adapter's card
@@ -798,9 +934,12 @@ fn saved_devices(
             codecs_on_request: Vec::new(),
             le_audio: d.le_audio,
             le_audio_set: false,
+            hid_le: None,
+            set_addresses: Vec::new(),
         })
         .collect();
-    for s in scanned {
+    // A Bluetooth LE keyboard or mouse is never an audio device (issue #413)
+    for s in scanned.iter().filter(|s| s.hid_le.is_none()) {
         match list.iter_mut().find(|d| d.le_audio == s.le_audio && d.address.eq_ignore_ascii_case(&s.address)) {
             Some(d) => {
                 d.rssi = s.rssi;
@@ -824,6 +963,7 @@ fn saved_devices(
                     sample_rates: k.sample_rates.clone(),
                     bit_depths: k.bit_depths.clone(),
                     max_bitrate: k.max_bitrate,
+                    lhdcv5_low_latency: k.lhdcv5_low_latency,
                 })
                 .collect();
         }
@@ -832,7 +972,49 @@ fn saved_devices(
             d.codecs_on_request = vec!["ldac".to_string()];
         }
     }
+    let sets = le_sets::KnownSets::of(le_sets::load(config_dir));
+    for d in list.iter_mut().filter(|d| d.le_audio) {
+        let group = sets.group_of(&d.address).unwrap_or_default();
+        d.set_addresses = group.iter().filter(|a| !a.eq_ignore_ascii_case(&d.address)).cloned().collect();
+    }
     list
+}
+
+/// Saved LE Audio entries that are members of one coordinated set (two
+/// earbuds saved as two devices) become one entry: the one with the user's
+/// profiles or volume stays, else the one saved first, and the others'
+/// profiles and volume move to it (bluecaster_core::le_sets). Returns how
+/// many entries went, the profiles when they changed (not saved yet), and
+/// whether `settings` (the saved volumes) changed.
+fn merge_le_set_entries(
+    dir: &Path,
+    sets: &le_sets::KnownSets,
+    settings: &mut CoreSettings,
+) -> (usize, Option<Vec<CoreProfile>>, bool) {
+    let saved_le = devices::load_le(dir);
+    let mut list = profiles::load(dir);
+    let merges = le_sets::merges(&saved_le, sets, |a| {
+        list.iter().any(|p| p.le_audio && p.device_address.eq_ignore_ascii_case(a))
+            || settings.saved_volumes.contains_key(&a.to_uppercase())
+    });
+    if merges.is_empty() {
+        return (0, None, false);
+    }
+    for m in &merges {
+        if let Err(e) = devices::remove_le(dir, &m.drop) {
+            tracing::warn!("devices: merging a coordinated set's entries: {e}");
+        }
+        // Kept with the device from now on
+        if let Some(group) = sets.group_of(&m.keep)
+            && let Err(e) = le_sets::remember(dir, group)
+        {
+            tracing::warn!("devices: cannot keep the coordinated set: {e}");
+        }
+    }
+    tracing::info!("devices: {} saved LE Audio entries merged into the entry of their coordinated set", merges.len());
+    let profiles_moved = le_sets::move_profiles(&mut list, &merges, &saved_le);
+    let volumes_moved = le_sets::move_volumes(&mut settings.saved_volumes, &merges);
+    (merges.len(), profiles_moved.then_some(list), volumes_moved)
 }
 
 /// A scan's entry as the UI lists it (not saved yet)
@@ -849,7 +1031,18 @@ fn scanned_device(d: &ScannedDevice) -> Device {
         codecs_on_request: Vec::new(),
         le_audio: d.le_audio,
         le_audio_set: d.le_audio_set,
+        hid_le: d.hid_le,
+        set_addresses: Vec::new(),
     }
+}
+
+/// A scan's entries as the UI gets them: the device list the audio screens
+/// use, and apart from it the Bluetooth LE keyboards and mice for the HID
+/// host (issue #413), so that those never reach a stream, a profile or the
+/// saved devices
+fn split_scan(found: &[ScannedDevice]) -> (Vec<Device>, Vec<Device>) {
+    let (hid, audio): (Vec<&ScannedDevice>, Vec<&ScannedDevice>) = found.iter().partition(|d| d.hid_le.is_some());
+    (audio.into_iter().map(scanned_device).collect(), hid.into_iter().map(scanned_device).collect())
 }
 
 /// The codec the UI shows for an LE Audio (experimental) stream
@@ -906,6 +1099,7 @@ fn to_ipc_codec_details(d: bluecaster_core::CodecDetails) -> ipc::CodecDetails {
             sample_rates: c.sample_rates,
             bit_depths: c.bit_depths,
             max_bitrate: c.max_bitrate,
+            lhdcv5_low_latency: c.lhdcv5_low_latency,
         }),
     }
 }
@@ -1052,6 +1246,7 @@ pub struct CustomStream {
     pub source_name: Option<String>,
     pub max_media_payload: Option<u16>,
     pub abr: Option<bool>,
+    pub lhdcv5_low_latency: Option<bool>,
     pub codec_fallback: Option<bool>,
 }
 
@@ -1062,7 +1257,15 @@ pub struct BroadcastStream {
     pub code: Option<String>,
     /// "hq" or "sq"
     pub quality: String,
+    /// A matrix layout's rear: "hq" or "sq"; None: `quality`
+    pub rear_quality: Option<String>,
     pub mono: Option<bool>,
+    /// Left and right as two broadcasts of their own (layout "split"
+    /// when no `layout` is given)
+    pub split: Option<bool>,
+    /// The channels and broadcasts (`BroadcastLayout::as_str`); None:
+    /// stereo (or split)
+    pub layout: Option<String>,
     pub source: String,
     pub source_id: Option<String>,
     pub source_name: Option<String>,
@@ -1072,11 +1275,30 @@ pub struct BroadcastStream {
 /// stream.start_custom, no device, LE Audio with the broadcast
 pub fn broadcast_request(b: &BroadcastStream, legacy_max_media_payload: u16) -> Result<StreamRequest, ErrorInfo> {
     const METHOD: &str = "stream.start_broadcast";
-    let preset = match b.quality.trim().to_ascii_lowercase().as_str() {
-        "" | "hq" => bluecaster_core::BROADCAST_PRESET_HQ,
-        "sq" => bluecaster_core::BROADCAST_PRESET_SQ,
-        other => return Err(bad_request("stream.bad_quality", METHOD, format!("unknown quality \"{other}\""))),
+    let preset_of = |q: &str| match q.trim().to_ascii_lowercase().as_str() {
+        "" | "hq" => Ok(bluecaster_core::BROADCAST_PRESET_HQ),
+        "sq" => Ok(bluecaster_core::BROADCAST_PRESET_SQ),
+        other => Err(bad_request("stream.bad_quality", METHOD, format!("unknown quality \"{other}\""))),
     };
+    let preset = preset_of(&b.quality)?;
+    let rear_preset = b.rear_quality.as_deref().map(preset_of).transpose()?;
+    let layout = match b.layout.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
+        None if b.split == Some(true) => bt_host::BroadcastLayout::Split,
+        None => bt_host::BroadcastLayout::Stereo,
+        Some(l) => bt_host::BroadcastLayout::parse(l).ok_or_else(|| {
+            bad_request(
+                "stream.bad_layout",
+                METHOD,
+                format!("unknown layout \"{l}\" (one of {})", bt_host::BroadcastLayout::NAMES),
+            )
+        })?,
+    };
+    // One mono channel, or left and right as broadcasts of their own (or
+    // any layout of more than one channel): not both
+    let one_channel = matches!(layout, bt_host::BroadcastLayout::Stereo | bt_host::BroadcastLayout::Mono);
+    if b.mono == Some(true) && !one_channel {
+        return Err(bad_request("stream.bad_channels", METHOD, "mono and split cannot be used together".into()));
+    }
     let c = CustomStream {
         device: "00:00:00:00:00:00".into(),
         device_name: Some(b.name.clone()),
@@ -1094,6 +1316,8 @@ pub fn broadcast_request(b: &BroadcastStream, legacy_max_media_payload: u16) -> 
             name: b.name.clone(),
             code: b.code.clone(),
             mono: b.mono.unwrap_or(false),
+            layout,
+            rear_preset: rear_preset.map(Into::into),
         }),
         ..bt_host::LeRequest::default()
     });
@@ -1126,6 +1350,7 @@ pub fn custom_request(c: &CustomStream, legacy_max_media_payload: u16) -> Result
         codec,
         quality: if c.quality.trim().is_empty() { "hq".into() } else { c.quality.trim().to_ascii_lowercase() },
         abr: c.abr.unwrap_or(false),
+        lhdcv5_low_latency: c.lhdcv5_low_latency.unwrap_or(false),
         codec_fallback: c.codec_fallback.unwrap_or(false),
         sample_rate: c.sample_rate.unwrap_or(0),
         bit_depth: c.bit_depth.unwrap_or(0),
@@ -1161,15 +1386,26 @@ fn effective_volume_sync(global: bool, _profile: VolumeSync) -> VolumeSync {
 }
 
 /// HKCU Run value of v2: the resident core, which opens the UI unless
-/// started with --background (start_minimized: only the tray at logon)
+/// started with --background (start_minimized: only the tray at logon).
+/// Written by the session host: the agent's user's HKCU when the agent
+/// does the session's work.
+///
+/// Service mode: nothing is written. The service starts with Windows and
+/// its agent shows the tray; the Run value keeps pointing at the user's
+/// per-user core, which exits at once while the service is installed
+/// (resident::EXIT_SERVICE_HOSTS) and works again once it is removed.
+/// This program (the service folder's core) must never be written there.
 fn apply_autostart(enabled: bool, minimized: bool) -> Result<(), String> {
-    use win_sys::autostart;
+    use win_sys::autostart::{VALUE_NAME, command_line};
+    if bluecaster_core::paths::service_mode() {
+        tracing::info!("start with Windows: left as it is in service mode");
+        return Ok(());
+    }
     if enabled {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        autostart::set(autostart::VALUE_NAME, &autostart::command_line(&exe, autostart_args(minimized)))
-            .map_err(|e| e.to_string())
+        session_host::autostart::set(VALUE_NAME, &command_line(&exe, autostart_args(minimized)))
     } else {
-        autostart::remove(autostart::VALUE_NAME).map(|_| ()).map_err(|e| e.to_string())
+        session_host::autostart::remove(VALUE_NAME).map(|_| ())
     }
 }
 
@@ -1278,11 +1514,13 @@ fn autostart_changed(before: &CoreSettings, after: &CoreSettings) -> bool {
         || (after.start_with_windows && before.start_minimized != after.start_minimized)
 }
 
-/// The chip or firmware setting changed: the stack must load firmware anew
+/// The chip or firmware setting, or the adapter to use, changed: the stack
+/// must start anew
 fn chip_changed(before: &CoreSettings, after: &CoreSettings) -> bool {
     before.bt_chip_pid != after.bt_chip_pid
         || before.bt_chip_fw_stem != after.bt_chip_fw_stem
         || before.realtek_custom_firmware != after.realtek_custom_firmware
+        || !before.adapter_id.eq_ignore_ascii_case(&after.adapter_id)
 }
 
 /// The codec and what it runs with: "LDAC 990 kbps | 96 kHz | 24-bit | ABR"
@@ -1456,6 +1694,99 @@ fn restart_after_save(stream: &StreamStatus, saved: &str) -> bool {
         && stream.profile.as_deref() == Some(saved)
 }
 
+/// The stream of profile `name` is connecting (or connecting again)
+fn connecting(stream: &StreamStatus, name: &str) -> bool {
+    matches!(stream.state, StreamState::Connecting | StreamState::Reconnecting)
+        && stream.profile.as_deref() == Some(name)
+}
+
+/// The profile a tool's profile.set_* is for: `name`, or (None) the one
+/// streaming, else the active one. Error profile.not_found.
+fn tool_profile<'a>(s: &'a Snapshot, name: Option<&str>) -> Result<&'a Profile, ErrorInfo> {
+    let name = match name {
+        Some(n) => Some(n),
+        None => {
+            s.stream.profile.as_deref().filter(|n| restart_after_save(&s.stream, n)).or(s.active_profile.as_deref())
+        }
+    };
+    name.and_then(|n| s.profiles.iter().find(|p| p.name == n))
+        .ok_or_else(|| err("profile.not_found", "ipc.error.profile_not_found"))
+}
+
+/// profile.set_headset_mic: `p` with the headset mode `mode` as the window's
+/// mode buttons set it (InputSource.tsx): Off mutes a profile whose mode is
+/// Auto or On, the others set the mode and unmute. None: the mode shown is
+/// `mode` already (Off while muted; On outside developer mode shows as Auto).
+fn tool_headset_mic(p: &Profile, mode: ipc::HeadsetMicMode, developer: bool) -> Result<Option<Profile>, ErrorInfo> {
+    let shown = match HeadsetMic::parse(&p.headset_mic) {
+        _ if p.mic_muted => HeadsetMic::Off,
+        HeadsetMic::On if !developer => HeadsetMic::Auto,
+        m => m,
+    };
+    let wanted = HeadsetMic::parse(mode.as_str());
+    if wanted == shown {
+        return Ok(None);
+    }
+    if wanted == HeadsetMic::On && !developer {
+        return Err(err("developer.off", "ipc.error.developer_only"));
+    }
+    if wanted == HeadsetMic::Off {
+        return Ok(Some(Profile { mic_muted: true, ..p.clone() }));
+    }
+    if p.mic_device_id.is_empty() {
+        return Err(err("profile.no_mic_output", "ipc.error.no_mic_output"));
+    }
+    Ok(Some(Profile { headset_mic: wanted.as_str().into(), mic_muted: false, ..p.clone() }))
+}
+
+/// profile.set_mic_muted: `p` muted or not (Home's microphone button); None:
+/// it is already
+fn tool_mic_muted(p: &Profile, muted: bool) -> Result<Option<Profile>, ErrorInfo> {
+    if p.mic_muted == muted {
+        Ok(None)
+    } else if p.mic_device_id.is_empty() {
+        Err(err("profile.no_mic_output", "ipc.error.no_mic_output"))
+    } else {
+        Ok(Some(Profile { mic_muted: muted, ..p.clone() }))
+    }
+}
+
+/// The points the window's playback EQ starts with (lib/eq.ts
+/// DEFAULT_POINTS): flat, so turning it on changes nothing yet
+const FLAT_EQ_HZ: [f32; 10] = [31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0];
+
+/// profile.set_media_eq: `p` with its playback EQ on or off, the points
+/// kept; turned on without points, the window's flat ones. None: it is
+/// already.
+fn tool_media_eq(p: &Profile, enabled: bool) -> Option<Profile> {
+    if p.media_eq.enabled == enabled {
+        return None;
+    }
+    let mut eq = p.media_eq.clone();
+    eq.enabled = enabled;
+    if enabled && eq.bands.is_empty() {
+        eq.bands = FLAT_EQ_HZ
+            .iter()
+            .map(|&frequency| ipc::EqPoint { frequency, gain: 0.0, q: 1.41, band_type: ipc::EqBandType::Peaking })
+            .collect();
+    }
+    Some(Profile { media_eq: eq, ..p.clone() })
+}
+
+/// stream.volume_step: the volume `delta` away from the one the headphones
+/// last reported, within 0..127. Errors stream.bad_volume_step (beyond
+/// ±[`ipc::MAX_VOLUME_STEP`]), stream.volume_unknown (not streaming, or no
+/// volume reported yet).
+fn volume_step(stream: &StreamStatus, delta: i16) -> Result<u8, ErrorInfo> {
+    if !(-ipc::MAX_VOLUME_STEP..=ipc::MAX_VOLUME_STEP).contains(&delta) {
+        return Err(bad_request("stream.bad_volume_step", "stream.volume_step", format!("delta {delta}")));
+    }
+    let Some(volume) = stream.volume.filter(|_| stream.state == StreamState::Streaming) else {
+        return Err(err("stream.volume_unknown", "ipc.error.volume_unknown"));
+    };
+    Ok((i16::from(volume) + delta).clamp(0, 127) as u8)
+}
+
 /// The last stream of profile `name` stopped with an error its codec caused
 /// (refused, unsupported, in use; issue #86)
 fn stopped_by_codec(stream: &StreamStatus, name: &str) -> bool {
@@ -1530,7 +1861,7 @@ fn default_mic_output(p: &mut CoreProfile, stream: &StreamStatus, list: &[CorePr
     if !p.mic_device_id.is_empty() || HeadsetMic::parse(&p.headset_mic) == HeadsetMic::Off {
         return;
     }
-    let devices = audio_capture::render_devices().unwrap_or_default();
+    let devices = session_host::devices::render_devices().unwrap_or_default();
     let default_output = default_output_for_cables(&devices, stream, list);
     if profiles::fill_mic_outputs(std::slice::from_mut(p), &cables(&devices), default_output) > 0 {
         tracing::info!("profile \"{}\": microphone output {} by default", p.name, p.mic_device_name);
@@ -1810,12 +2141,25 @@ impl CoreState {
         balloon: Box<dyn Fn(BalloonRequest) + Send + Sync>,
     ) -> Arc<CoreState> {
         let dir = service.config_dir().to_path_buf();
-        let settings = service.settings();
+        let mut settings = service.settings();
+        // Two earbuds of one set saved as two devices (a set learned in an
+        // earlier session, or kept with their bonds): one entry
+        let (_, merged_profiles, volumes) = merge_le_set_entries(&dir, &service.known_le_sets(), &mut settings);
+        if let Some(list) = merged_profiles
+            && let Err(e) = profiles::save(&dir, &list)
+        {
+            tracing::warn!("devices: saving the profiles of merged entries: {e}");
+        }
+        if volumes {
+            let _ = settings.save(&dir);
+            service.set_settings(settings.clone());
+        }
         let legacy = settings.legacy_max_media_payload();
         let profiles: Vec<Profile> = profiles::load(&dir).iter().map(|p| to_ipc_profile(p, legacy)).collect();
         let active = Some(settings.last_profile.clone()).filter(|n| profiles.iter().any(|p| &p.name == n));
         let (adapters, hung) = adapter_infos(&dir, &settings);
         warn_invalid_firmware(&dir, &firmware_change(&[], &adapters).invalid);
+        let service_mode = paths::service_mode();
         let snapshot = Snapshot {
             adapter: AdapterState {
                 status: AdapterStatus::Stopped,
@@ -1826,6 +2170,7 @@ impl CoreState {
                 rom_firmware: false,
                 hung,
                 loader: None,
+                active: None,
             },
             devices: saved_devices(&dir, &[], &service.device_codecs()),
             scanning: false,
@@ -1835,9 +2180,12 @@ impl CoreState {
             active_profile: active,
             settings: to_ipc_settings(&settings),
             update: UpdateState { current_version: env!("CARGO_PKG_VERSION").into(), ..Default::default() },
-            config_dir: dir.display().to_string(),
+            // Service mode: a protected folder the user cannot open, so
+            // none is named (files come through crate::handover)
+            config_dir: if service_mode { String::new() } else { dir.display().to_string() },
             // Where main.rs has the log files written
-            log_dir: paths::log_dir(&dir).display().to_string(),
+            log_dir: if service_mode { String::new() } else { paths::log_dir(&dir).display().to_string() },
+            service_mode,
             capture: None,
             // Set by logging::init, first thing in main
             clock_ms: crate::logging::hub().clock(),
@@ -1846,6 +2194,12 @@ impl CoreState {
             verbose: crate::logging::verbose(),
             crashes: crate::crashes::unseen(&dir, &settings),
             audio_endpoints: 0,
+            hid_devices: to_ipc_hid_devices(service.hid_devices()),
+            hid_candidates: Vec::new(),
+            hid_passkey: to_ipc_hid_passkey(service.hid_passkey()),
+            hid_checks: to_ipc_hid_checks(&service),
+            hid_rolled_back: to_ipc_hid_rolled_back(&service),
+            hid_health: to_ipc_hid_health(&service),
             vendors: bluecaster_core::vendor::VENDORS
                 .iter()
                 .map(|v| ipc::VendorInfo {
@@ -1887,7 +2241,12 @@ impl CoreState {
     }
 
     pub fn snapshot(&self) -> (u64, Snapshot) {
-        self.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        let (rev, mut snap) = self.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // The countdowns as of now, not as of the last event
+        if !snap.hid_checks.is_empty() {
+            snap.hid_checks = to_ipc_hid_checks(&self.service);
+        }
+        (rev, snap)
     }
 
     /// The revision of the state now
@@ -1936,6 +2295,14 @@ impl CoreState {
                 Event::Verbose(v) => s.verbose = *v,
                 Event::Crashes(c) => s.crashes = c.clone(),
                 Event::AudioEndpoints(n) => s.audio_endpoints = *n,
+                Event::HidDevices(d) => s.hid_devices = d.clone(),
+                Event::HidCandidates(d) => s.hid_candidates = d.clone(),
+                Event::HidPasskey(p) => s.hid_passkey = p.clone(),
+                Event::HidCheck { checks, rolled_back } => {
+                    s.hid_checks = checks.clone();
+                    s.hid_rolled_back = rolled_back.clone();
+                }
+                Event::HidHealth(h) => s.hid_health = h.clone(),
                 // Not state: no revision
                 Event::Link(_)
                 | Event::Log(_)
@@ -1943,6 +2310,8 @@ impl CoreState {
                 | Event::Qcy(_)
                 | Event::RfcommData(_)
                 | Event::RfcommClosed(_)
+                | Event::MediaButton(_)
+                | Event::UiClose
                 | Event::Bye => {
                     let _ = self.events.send((g.0, Arc::new(event)));
                     return;
@@ -2001,7 +2370,7 @@ impl CoreState {
     /// Windows' audio devices changed (resident.rs: watch_audio_endpoints):
     /// a cable that came is taken into use, and the UI reads its lists again
     pub fn audio_endpoints_changed(&self) {
-        if let Ok(devices) = audio_capture::render_devices() {
+        if let Ok(devices) = session_host::devices::render_devices() {
             self.watch_cables(&devices);
         }
         let n = self.with_snapshot(|s| s.audio_endpoints).wrapping_add(1);
@@ -2206,6 +2575,7 @@ impl CoreState {
                     abr: i.abr,
                     bitrate_capped: i.bitrate_capped,
                     hi_res_set: i.hi_res_set,
+                    low_latency: i.low_latency,
                     source: Some(to_ipc_source(&i.source)),
                     le,
                     details: i.details.map(|d| Box::new(to_ipc_codec_details(*d))),
@@ -2233,6 +2603,50 @@ impl CoreState {
                     }),
                     ..s.adapter
                 }));
+                return;
+            }
+            ServiceEvent::LeSetLearned => {
+                self.merge_le_sets();
+                return;
+            }
+            // The adapter a stack opened, or none any more
+            ServiceEvent::Adapter(ids) => {
+                let active = ids.map(|(vid, pid)| active_adapter(vid, pid, &s.adapter.adapters));
+                if active != s.adapter.active {
+                    self.publish(Event::Adapter(AdapterState { active, ..s.adapter }));
+                }
+                return;
+            }
+            ServiceEvent::Button(b) => {
+                self.publish(Event::MediaButton(b));
+                return;
+            }
+            ServiceEvent::HidDevices => {
+                let list = to_ipc_hid_devices(self.service.hid_devices());
+                if list != s.hid_devices {
+                    self.publish(Event::HidDevices(list));
+                }
+                return;
+            }
+            ServiceEvent::HidPasskey => {
+                let p = to_ipc_hid_passkey(self.service.hid_passkey());
+                if p != s.hid_passkey {
+                    self.publish(Event::HidPasskey(p));
+                }
+                return;
+            }
+            // Always sent: the time left changes
+            ServiceEvent::HidCheck => {
+                let checks = to_ipc_hid_checks(&self.service);
+                let rolled_back = to_ipc_hid_rolled_back(&self.service);
+                self.publish(Event::HidCheck { checks, rolled_back });
+                return;
+            }
+            ServiceEvent::HidHealth => {
+                let h = to_ipc_hid_health(&self.service);
+                if h != s.hid_health {
+                    self.publish(Event::HidHealth(h));
+                }
                 return;
             }
             // Another saved device connected while the one streamed was off
@@ -2311,6 +2725,44 @@ impl CoreState {
         }
     }
 
+    /// Service mode, after the one-time move of the user's data (when the
+    /// first agent connected): settings, profiles and devices read again
+    /// from the folder and published, as if the core had started with them
+    pub(crate) fn reload_from_disk(&self) {
+        let settings = self.service.reload_saved();
+        crate::logging::set_dev(&settings.log());
+        self.publish(Event::Settings(to_ipc_settings(&settings)));
+        let legacy = settings.legacy_max_media_payload();
+        let profiles: Vec<Profile> =
+            profiles::load(&self.config_dir()).iter().map(|p| to_ipc_profile(p, legacy)).collect();
+        let active = Some(settings.last_profile.clone()).filter(|n| profiles.iter().any(|p| &p.name == n));
+        self.publish(Event::Profiles { profiles, active_profile: active });
+        self.refresh_devices();
+        self.update_tray();
+    }
+
+    /// A connection learned a coordinated set: saved entries of it become
+    /// one ([`merge_le_set_entries`]), published
+    fn merge_le_sets(&self) {
+        let dir = self.config_dir();
+        let _tx = self.service.settings_tx();
+        let mut settings = self.service.settings();
+        let (_, list, volumes) = merge_le_set_entries(&dir, &self.service.known_le_sets(), &mut settings);
+        if let Some(list) = list {
+            let (_, s) = self.snapshot();
+            let active = s.active_profile.filter(|a| list.iter().any(|p| &p.name == a));
+            if self.save_profiles(&list, active).is_err() {
+                tracing::warn!("devices: saving the profiles of merged entries failed");
+            }
+        }
+        if volumes {
+            let _ = settings.save(&dir);
+            self.service.set_settings(settings);
+        }
+        // The addresses of the set too
+        self.refresh_devices();
+    }
+
     fn save_profiles(&self, list: &[CoreProfile], active: Option<String>) -> Result<(), ErrorInfo> {
         let dir = self.config_dir();
         profiles::save(&dir, list).map_err(|_| err("profile.save_failed", "error.profile_save"))?;
@@ -2328,7 +2780,14 @@ impl CoreState {
     fn forget_device(&self, address: &str, le_audio: bool) -> Result<Value, ErrorInfo> {
         let dir = self.config_dir();
         let mut list = profiles::load(&dir);
-        let of_it = |p: &CoreProfile| p.le_audio == le_audio && p.device_address.eq_ignore_ascii_case(address);
+        // An LE Audio device of a coordinated set: every member goes (both
+        // earbuds of a pair are one device)
+        let mut members = vec![address.to_uppercase()];
+        if le_audio && let Some(group) = self.service.known_le_sets().group_of(address) {
+            members.extend(group.iter().filter(|m| !m.eq_ignore_ascii_case(address)).cloned());
+        }
+        let is_member = |a: &str| members.iter().any(|m| m.eq_ignore_ascii_case(a));
+        let of_it = |p: &CoreProfile| p.le_audio == le_audio && is_member(&p.device_address);
         let (_, s) = self.snapshot();
         let streaming = s.stream.profile.as_ref().is_some_and(|n| list.iter().any(|p| p.name == *n && of_it(p)));
         if streaming && s.stream.state != StreamState::Idle {
@@ -2337,14 +2796,32 @@ impl CoreState {
         }
         let r = if le_audio { devices::remove_le(&dir, address) } else { devices::remove(&dir, address) };
         r.map_err(|_| err("device.forget_failed", "error.device_forget"))?;
+        for m in members.iter().skip(1) {
+            if let Err(e) = devices::remove_le(&dir, m) {
+                tracing::warn!("devices: removing another member of the set: {e}");
+            }
+        }
+        if members.len() > 1 {
+            le_sets::forget(&dir, address);
+            tracing::info!("device forgotten with the other {} member(s) of its coordinated set", members.len() - 1);
+        }
         let gone: Vec<String> = list.iter().filter(|p| of_it(p)).map(|p| p.name.clone()).collect();
         list.retain(|p| !of_it(p));
         let active = s.active_profile.filter(|a| !gone.contains(a));
         self.save_profiles(&list, active)?;
-        self.service.forget_device(address, le_audio);
-        crate::pairing::forget_services(&dir, address, le_audio);
+        // Off every list now (Home, Codecs, the sidebar): what
+        // follows may wait for the stack (up to seconds per entry)
+        self.refresh_devices();
+        for m in &members {
+            self.service.forget_device(m, le_audio);
+            crate::pairing::forget_services(&dir, m, le_audio);
+        }
+        let _tx = self.service.settings_tx();
         let mut settings = self.service.settings();
-        let volume = settings.saved_volumes.remove(&address.to_uppercase()).is_some();
+        let mut volume = false;
+        for m in &members {
+            volume |= settings.saved_volumes.remove(m).is_some();
+        }
         let last = gone.contains(&settings.last_profile);
         if last {
             settings.last_profile.clear();
@@ -2353,6 +2830,7 @@ impl CoreState {
             let _ = settings.save(&dir);
             self.service.set_settings(settings);
         }
+        // Published again only if a scan changed the list meanwhile
         self.refresh_devices();
         Ok(Value::Null)
     }
@@ -2462,6 +2940,7 @@ impl CoreState {
         }
         if flags_changed {
             // As they are now: the settings may have been saved meanwhile
+            let _tx = self.service.settings_tx();
             let mut s = self.service.settings();
             s.awaiting_vb_cable = vb_missing;
             s.awaiting_hifi_cable = hifi_missing;
@@ -2474,12 +2953,38 @@ impl CoreState {
         s.save(&self.config_dir()).map_err(|_| err("settings.save_failed", "error.settings_save"))?;
         crate::logging::set_dev(&s.log());
         let ui = to_ipc_settings(&s);
+        let hid_on = s.hid_host();
         self.service.set_settings(s);
         self.publish(Event::Settings(ui));
+        // Turned off: the keyboards and mice found are out of date
+        if !hid_on && !self.snapshot().1.hid_candidates.is_empty() {
+            self.publish(Event::HidCandidates(Vec::new()));
+        }
         Ok(())
     }
 
+    /// The Bluetooth LE keyboards and mice of a scan; published if they
+    /// changed (each name or signal update of a scan calls this)
+    fn publish_hid_candidates(&self, list: Vec<Device>) {
+        if list != self.snapshot().1.hid_candidates {
+            self.publish(Event::HidCandidates(list));
+        }
+    }
+
+    /// hid.enable (after the confirmation) and hid.disable: the setting
+    /// saved and applied as settings.set does
+    fn set_hid_host(&self, on: bool) -> Result<Value, ErrorInfo> {
+        let _tx = self.service.settings_tx();
+        let mut s = self.service.settings();
+        if s.hid_host != on {
+            s.hid_host = on;
+            self.save_settings(s)?;
+        }
+        Ok(Value::Null)
+    }
+
     fn set_active_profile(&self, name: Option<String>) {
+        let tx = self.service.settings_tx();
         let mut s = self.service.settings();
         if let Some(n) = &name
             && s.last_profile != *n
@@ -2488,6 +2993,7 @@ impl CoreState {
             let _ = s.save(&self.config_dir());
             self.service.set_settings(s);
         }
+        drop(tx);
         let (_, snap) = self.snapshot();
         self.publish(Event::Profiles { profiles: snap.profiles, active_profile: name });
     }
@@ -2522,7 +3028,16 @@ impl CoreState {
         warn_invalid_firmware(&paths::firmware_dir(&self.config_dir()), &change.invalid);
         let le_audio = le_audio_now(self.service.le_audio_supported(), &list);
         let other_radio = other_radio(&list);
-        self.publish(Event::Adapter(AdapterState { adapters: list.clone(), le_audio, other_radio, hung, ..s.adapter }));
+        // What the new list tells about the adapter in use
+        let active = s.adapter.active.as_ref().map(|a| active_adapter(a.vid, a.pid, &list));
+        self.publish(Event::Adapter(AdapterState {
+            adapters: list.clone(),
+            le_audio,
+            other_radio,
+            hung,
+            active,
+            ..s.adapter
+        }));
         (list, change.fixed)
     }
 
@@ -2633,12 +3148,15 @@ impl CoreState {
         Ok(())
     }
 
+    /// Error developer.off while developer mode is off
+    fn developer_only(&self) -> Result<(), ErrorInfo> {
+        if self.service.settings().debug_mode { Ok(()) } else { Err(err("developer.off", "ipc.error.developer_only")) }
+    }
+
     /// stream.start_broadcast (developer mode)
     pub fn start_broadcast(&self, b: &BroadcastStream) -> Result<(), ErrorInfo> {
+        self.developer_only()?;
         let settings = self.service.settings();
-        if !settings.debug_mode {
-            return Err(err("developer.off", "ipc.error.developer_only"));
-        }
         let mut req = broadcast_request(b, settings.legacy_max_media_payload())?;
         req.mute_output = settings.mutes_output();
         tracing::info!("broadcast \"{}\": quality {}, source {}", b.name, b.quality, req.source);
@@ -2711,6 +3229,206 @@ impl CoreState {
         }));
     }
 
+    /// profile.save: adds or replaces a profile; the stream of the profile
+    /// in use takes the change in place or starts again
+    fn save_profile(self: &Arc<Self>, profile: &Profile, original_name: Option<String>) -> Result<Value, ErrorInfo> {
+        if profile.name.trim().is_empty() || bt_host::parse_addr(&profile.device_address).is_none() {
+            return Err(err("profile.invalid", "error.invalid_address_format"));
+        }
+        let dir = self.config_dir();
+        let mut list = profiles::load(&dir);
+        let key = original_name.as_deref().unwrap_or(&profile.name).to_string();
+        let pos = list.iter().position(|p| p.name == key);
+        let mut merged = merge_profile(pos.map(|i| &list[i]), profile);
+        if pos.is_none() {
+            default_mic_output(&mut merged, &self.snapshot().1.stream, &list);
+        }
+        let known = if merged.le_audio { devices::load_le(&dir) } else { devices::load(&dir) };
+        // Another earbud of a saved set is that saved device: its
+        // profile is the saved device's, no second entry
+        if merged.le_audio
+            && let Some(d) = self.service.known_le_sets().saved_entry(&merged.device_address, &known)
+            && !d.address.eq_ignore_ascii_case(&merged.device_address)
+        {
+            tracing::info!("profile: a member of a saved coordinated set, saved for the set's device");
+            merged.device_address = d.address.clone();
+        }
+        let before = pos.map(|i| list[i].clone());
+        // Only the device's codec order changed (its cards dragged):
+        // the stream goes on unless the order changes its codec
+        let order_only = pos.is_some_and(|i| {
+            list[i].codec_order != merged.codec_order
+                && CoreProfile { codec_order: merged.codec_order.clone(), ..list[i].clone() } == merged
+        });
+        let auto_select = self.service.settings().auto_codec;
+        // Settings of a codec not in use: nothing the stream uses
+        // The playback EQ and the microphone's processing (one or
+        // both): the running stream takes them in place
+        let live_only = pos.is_some_and(|i| list[i].only_live_processing_differs(&merged));
+        let processing_only = live_only && pos.is_some_and(|i| list[i].mic_processing != merged.mic_processing);
+        let kept_only = live_only
+            || pos.is_some_and(|i| {
+                list[i].only_kept_settings_differ(&merged) || list[i].only_default_input_differs(&merged)
+            });
+        let in_order = merged.clone();
+        // The profile's device joins the saved ones of its kind (as
+        // a connection saves it)
+        let address = merged.device_address.clone();
+        if !known.iter().any(|d| d.address == address) {
+            let r = if merged.le_audio {
+                devices::save_le(&dir, &address, &merged.device_name)
+            } else {
+                devices::save(&dir, &address, &merged.device_name)
+            };
+            if let Err(e) = r {
+                tracing::warn!("cannot save the device {address}: {e}");
+            }
+        }
+        match pos {
+            Some(i) => list[i] = merged,
+            None => list.push(merged),
+        }
+        let (_, s) = self.snapshot();
+        let renamed_active = s.active_profile.as_deref() == Some(key.as_str()) && key != profile.name;
+        let active = match s.active_profile {
+            Some(a) if a == key => Some(profile.name.clone()),
+            other => other.or(Some(profile.name.clone())),
+        };
+        self.save_profiles(&list, active)?;
+        // A renamed active profile (its name follows the codec chosen
+        // on the Codecs screen) stays the one remembered
+        if renamed_active {
+            self.set_active_profile(Some(profile.name.clone()));
+        }
+        self.refresh_devices();
+        // The stream of this profile plays its EQ as saved from now
+        // on (also when it starts again below)
+        if restart_after_save(&s.stream, &key) {
+            media_eq::apply(Some(&in_order.media_eq));
+        }
+        // The profile in use starts again with what was saved (v1),
+        // but for another source, which needs nothing of the link
+        if processing_only && restart_after_save(&s.stream, &key) {
+            self.service.set_mic_processing(in_order.mic_processing);
+        }
+        let order_keeps_codec = order_only && !restart_for_order(&s.stream, &in_order, auto_select);
+        let headset = headset_change(&s.stream, before.as_ref(), &in_order);
+        let headset_kept = match headset {
+            Some(HeadsetChange::Unused) => true,
+            Some(HeadsetChange::InPlace) => {
+                tracing::info!(
+                    "profile {} saved while in use: headset microphone {} in place",
+                    bluecaster_core::diag::quoted(&key),
+                    in_order.headset_mic_mode().as_str()
+                );
+                // The session refuses an output that would feed the
+                // capture; false (no stream, or a stack without
+                // voice): it starts again instead
+                let mode = headset_mic_in_force(&in_order, self.service.settings().debug_mode);
+                let kept = self.service.set_headset_mic(
+                    mode,
+                    mode.is_on().then(|| in_order.mic_device_id.clone()),
+                    in_order.voice_codec_in_force(auto_select),
+                );
+                // Another output or mode: the session tries again
+                // and says so anew if it still cannot
+                let mut stream = self.with_snapshot(|s| s.stream.clone());
+                if kept && self.drop_mic_note(&mut stream) {
+                    self.publish(Event::Stream(stream));
+                }
+                kept
+            }
+            Some(HeadsetChange::Restart) | None => false,
+        };
+        if restart_after_save(&s.stream, &key) && !order_keeps_codec && !kept_only && !headset_kept {
+            let in_place = source_changes_in_place(&s.stream, before.as_ref(), &in_order)
+                && self.service.change_source(self.service.settings().source_in_force(in_order.source()));
+            let bitpools_in_place = !self.service.settings().auto_codec
+                && bitpools_change_in_place(&s.stream, before.as_ref(), &in_order)
+                && self.service.change_bitpools(in_order.bitpools());
+            // "Show only options it supports" turned, the stream
+            // set up the same either way (issue #86)
+            let unlisted_in_place = !bitpools_in_place
+                && !in_place
+                && before.as_ref().is_some_and(|b| b.only_unlisted_differs(&in_order))
+                && self.service.change_unlisted(in_order.unlisted_options);
+            let named_in_place = !bitpools_in_place
+                && !in_place
+                && !unlisted_in_place
+                && codec_named_in_place(&s.stream, before.as_ref(), &in_order)
+                && (before.as_ref().is_some_and(|b| b.unlisted_options == in_order.unlisted_options)
+                    || self.service.change_unlisted(in_order.unlisted_options));
+            if named_in_place {
+                tracing::info!(
+                    "profile {} saved while in use as {}: it names the codec it streams with, the stream stays",
+                    bluecaster_core::diag::quoted(&key),
+                    bluecaster_core::diag::quoted(&profile.name)
+                );
+                self.rename_stream_profile(&profile.name);
+            } else if unlisted_in_place {
+                tracing::info!(
+                    "profile {} saved while in use: the stream stays as it is",
+                    bluecaster_core::diag::quoted(&key)
+                );
+            } else if bitpools_in_place {
+                tracing::debug!("profile {} saved while in use: new bitpools", bluecaster_core::diag::quoted(&key));
+            } else if in_place {
+                tracing::info!(
+                    "profile {} saved while in use: its source changes in place",
+                    bluecaster_core::diag::quoted(&key)
+                );
+            } else {
+                tracing::info!(
+                    "profile {} saved while in use: it starts again as {}",
+                    bluecaster_core::diag::quoted(&key),
+                    bluecaster_core::diag::quoted(&profile.name)
+                );
+                self.restart_profile(&profile.name)?;
+            }
+        } else if reconnect_after_codec_stop(&s.stream, &key, before.as_ref(), &in_order) {
+            tracing::info!(
+                "profile {} saved after its codec stopped the stream: connecting again as {}",
+                bluecaster_core::diag::quoted(&key),
+                bluecaster_core::diag::quoted(&profile.name)
+            );
+            self.start_profile(&profile.name)?;
+        }
+        Ok(Value::Null)
+    }
+
+    /// Asks the headphones for this volume (0..127): AVRCP, or VCP for LE
+    /// Audio. Nothing without a stream.
+    fn request_volume(&self, volume: u8) {
+        if let Some(h) = self.service.host() {
+            // LE Audio: through VCP, not AVRCP (issue #86)
+            if self.service.le_stream().is_none() || !h.le_request_volume(volume.min(127)) {
+                h.request_volume(volume.min(127));
+            }
+        }
+    }
+
+    /// A tool's change of one value of a profile (profile.set_headset_mic,
+    /// set_mic_muted, set_media_eq): `change` gives the profile `name` (None:
+    /// [`tool_profile`]) with it, None when it has it already: nothing
+    /// happens then. Saved as the window saves it (profile.save), so the
+    /// stream takes it as from the window and every client gets the profiles.
+    /// `mic`: a change the stream may start again for, refused while that
+    /// stream connects (a tool that repeats it cannot keep it reconnecting).
+    fn save_tool_change(
+        self: &Arc<Self>,
+        name: Option<String>,
+        mic: bool,
+        change: impl FnOnce(&Profile) -> Result<Option<Profile>, ErrorInfo>,
+    ) -> Result<Value, ErrorInfo> {
+        let (_, s) = self.snapshot();
+        let p = tool_profile(&s, name.as_deref())?;
+        let Some(changed) = change(p)? else { return Ok(Value::Null) };
+        if mic && connecting(&s.stream, &p.name) {
+            return Err(err("stream.busy", "ipc.error.stream_busy"));
+        }
+        self.save_profile(&changed, None)
+    }
+
     fn restart_profile(&self, name: &str) -> Result<(), ErrorInfo> {
         self.restarting.store(true, Ordering::Release);
         let r = self.start_profile(name);
@@ -2748,9 +3466,17 @@ impl CoreState {
     /// or names a copy of the core that is gone (the program moved). One
     /// naming another copy of the core that exists (the installed copy while
     /// a test build runs) is left alone; the settings toggle still writes
-    /// it. See autostart_plan.
+    /// it. See autostart_plan. The values are read and written by the
+    /// session host (the agent's user's when the agent does the session's
+    /// work).
     pub fn refresh_autostart(&self, replaces_v1: bool) {
-        use win_sys::autostart::{OLD_VALUE_NAME, VALUE_NAME, get};
+        use session_host::autostart::get;
+        use win_sys::autostart::{OLD_VALUE_NAME, VALUE_NAME};
+        // Service mode: the Run value belongs to the per-user core
+        // (apply_autostart)
+        if bluecaster_core::paths::service_mode() {
+            return;
+        }
         let s = self.service.settings();
         let (current, old) = match (get(VALUE_NAME), get(OLD_VALUE_NAME)) {
             (Ok(c), Ok(o)) => (c, o),
@@ -2773,11 +3499,11 @@ impl CoreState {
         }
         if plan.remove_old {
             tracing::info!("old start with Windows entry {OLD_VALUE_NAME} removed: was {}", old.unwrap_or_default());
-            if let Err(e) = win_sys::autostart::remove(OLD_VALUE_NAME) {
+            if let Err(e) = session_host::autostart::remove(OLD_VALUE_NAME) {
                 tracing::warn!("cannot remove the old start with Windows entry {OLD_VALUE_NAME}: {e}");
             }
             // Disabled in Task Manager's Startup tab stays disabled
-            match win_sys::autostart::carry_startup_approved(OLD_VALUE_NAME, VALUE_NAME) {
+            match session_host::autostart::carry_startup_approved(OLD_VALUE_NAME, VALUE_NAME) {
                 Ok(true) => {
                     tracing::info!("Task Manager's startup state of {OLD_VALUE_NAME} carried over to {VALUE_NAME}")
                 }
@@ -2806,6 +3532,7 @@ impl CoreState {
     /// The reports shown were seen: only newer ones are shown from now on
     fn crashes_seen(&self) {
         let Some(newest) = self.with_snapshot(|s| s.crashes.first().map(|c| c.name.clone())) else { return };
+        let _tx = self.service.settings_tx();
         let mut s = self.service.settings();
         crate::crashes::mark_seen(&mut s, &newest);
         if let Err(e) = s.save(&self.config_dir()) {
@@ -2818,6 +3545,7 @@ impl CoreState {
     /// The UI hid its window to the tray (app.hidden_to_tray): v1's "still
     /// running in the tray" balloon, once
     pub fn hidden_to_tray(&self) {
+        let _tx = self.service.settings_tx();
         let mut s = self.service.settings();
         if s.other.get(TRAY_HINT_SHOWN).and_then(Value::as_bool) == Some(true) {
             return;
@@ -2953,11 +3681,11 @@ impl CoreState {
     fn start_capture(&self) -> Result<String, ErrorInfo> {
         let capture = self.service.capture();
         if let Some(p) = capture.path() {
-            return Ok(p.display().to_string());
+            return Ok(capture_shown(&p));
         }
         let path = paths::capture_file(&self.config_dir(), &local_stamp());
         capture.start(&path).map_err(|_| err("diag.capture_failed", "error.capture_start"))?;
-        let path = path.display().to_string();
+        let path = capture_shown(&path);
         self.publish(Event::Capture(Some(CaptureState {
             path: path.clone(),
             bytes: capture.bytes_written(),
@@ -2974,7 +3702,7 @@ impl CoreState {
         capture.stop();
         let done = match path {
             Some(p) => Some(CaptureState {
-                path: p.display().to_string(),
+                path: capture_shown(&p),
                 bytes: capture.bytes_written(),
                 started_ms: known.as_ref().map_or(0, |k| k.started_ms),
             }),
@@ -3073,6 +3801,7 @@ impl CoreState {
                 source_name,
                 max_media_payload,
                 abr,
+                lhdcv5_low_latency,
                 codec_fallback,
             } => {
                 let c = CustomStream {
@@ -3087,12 +3816,35 @@ impl CoreState {
                     source_name,
                     max_media_payload,
                     abr,
+                    lhdcv5_low_latency,
                     codec_fallback,
                 };
                 self.start_custom(&c).map(|()| Value::Null)
             }
-            Method::StreamStartBroadcast { name, code, quality, mono, source, source_id, source_name } => {
-                let b = BroadcastStream { name, code, quality, mono, source, source_id, source_name };
+            Method::StreamStartBroadcast {
+                name,
+                code,
+                quality,
+                rear_quality,
+                mono,
+                split,
+                layout,
+                source,
+                source_id,
+                source_name,
+            } => {
+                let b = BroadcastStream {
+                    name,
+                    code,
+                    quality,
+                    rear_quality,
+                    mono,
+                    split,
+                    layout,
+                    source,
+                    source_id,
+                    source_name,
+                };
                 self.start_broadcast(&b).map(|()| Value::Null)
             }
             Method::StreamStop => {
@@ -3100,13 +3852,27 @@ impl CoreState {
                 Ok(Value::Null)
             }
             Method::StreamSetVolume { volume } => {
-                if let Some(h) = self.service.host() {
-                    // LE Audio: through VCP, not AVRCP (issue #86)
-                    if self.service.le_stream().is_none() || !h.le_request_volume(volume.min(127)) {
-                        h.request_volume(volume.min(127));
-                    }
-                }
+                self.request_volume(volume);
                 Ok(Value::Null)
+            }
+            Method::StreamVolumeStep { delta } => {
+                let stream = self.with_snapshot(|s| s.stream.clone());
+                let volume = volume_step(&stream, delta)?;
+                if stream.volume != Some(volume) {
+                    tracing::debug!("IPC: stream.volume_step {delta}: volume {volume}");
+                    self.request_volume(volume);
+                }
+                Ok(json(&volume))
+            }
+            Method::ProfileSetHeadsetMic { name, mode } => {
+                let developer = self.service.settings().debug_mode;
+                self.save_tool_change(name, true, |p| tool_headset_mic(p, mode, developer))
+            }
+            Method::ProfileSetMicMuted { name, muted } => {
+                self.save_tool_change(name, true, |p| tool_mic_muted(p, muted))
+            }
+            Method::ProfileSetMediaEq { name, enabled } => {
+                self.save_tool_change(name, false, |p| Ok(tool_media_eq(p, enabled)))
             }
             Method::DeviceScan { seconds } => {
                 blocking(Box::new(move |me| {
@@ -3118,10 +3884,12 @@ impl CoreState {
                     let codecs = me.service.device_codecs();
                     if !me.service.is_running() {
                         me.publish(Event::Devices(saved_devices(&dir, &[], &codecs)));
+                        me.publish(Event::HidCandidates(Vec::new()));
                     }
                     let mut on_found = |found: &[ScannedDevice]| {
-                        let scanned: Vec<Device> = found.iter().map(scanned_device).collect();
+                        let (scanned, hid) = split_scan(found);
                         me.publish(Event::Devices(saved_devices(&dir, &scanned, &codecs)));
+                        me.publish_hid_candidates(hid);
                     };
                     // Classic, then (LE Audio on) the LE Audio devices
                     let r = me.service.scan_devices(seconds.clamp(3, ipc::MAX_SCAN_SECONDS), &mut on_found);
@@ -3130,9 +3898,10 @@ impl CoreState {
                     }
                     me.publish(Event::Scanning(false));
                     let found = r.map_err(|m| ErrorInfo { code: "adapter.init_failed".into(), message: msg(&m) })?;
-                    let scanned: Vec<Device> = found.iter().map(scanned_device).collect();
+                    let (scanned, hid) = split_scan(&found);
                     let list = saved_devices(&me.config_dir(), &scanned, &me.service.device_codecs());
                     me.publish(Event::Devices(list.clone()));
+                    me.publish_hid_candidates(hid);
                     Ok(json(&list))
                 }))
                 .await
@@ -3201,163 +3970,52 @@ impl CoreState {
                 self.refresh_devices();
                 Ok(Value::Null)
             }
-            Method::ProfileSave { profile, original_name } => {
-                if profile.name.trim().is_empty() || bt_host::parse_addr(&profile.device_address).is_none() {
-                    return Err(err("profile.invalid", "error.invalid_address_format"));
-                }
+            Method::ProfileSave { profile, original_name } => self.save_profile(&profile, original_name),
+            Method::AuracastSetSource { source } => {
+                self.developer_only()?;
+                let source = match source.trim().to_ascii_lowercase().as_str() {
+                    "tone" => bluecaster_core::stream::SourceRequest::TestTone,
+                    "" | "loopback" => bluecaster_core::stream::SourceRequest::SystemLoopback,
+                    other => {
+                        return Err(bad_request(
+                            "stream.bad_source",
+                            "auracast.set_source",
+                            format!("unknown source \"{other}\""),
+                        ));
+                    }
+                };
+                Ok(Value::Bool(self.service.change_source(source)))
+            }
+            Method::AuracastMixGet { channels, rear } => {
+                self.developer_only()?;
+                Ok(json(&bluecaster_core::auracast_mix::state(&self.config_dir(), channels, rear)))
+            }
+            Method::AuracastMixSet { mix, channels, rear } => {
+                self.developer_only()?;
                 let dir = self.config_dir();
-                let mut list = profiles::load(&dir);
-                let key = original_name.as_deref().unwrap_or(&profile.name).to_string();
-                let pos = list.iter().position(|p| p.name == key);
-                let mut merged = merge_profile(pos.map(|i| &list[i]), &profile);
-                if pos.is_none() {
-                    default_mic_output(&mut merged, &self.snapshot().1.stream, &list);
-                }
-                let before = pos.map(|i| list[i].clone());
-                // Only the device's codec order changed (its cards dragged):
-                // the stream goes on unless the order changes its codec
-                let order_only = pos.is_some_and(|i| {
-                    list[i].codec_order != merged.codec_order
-                        && CoreProfile { codec_order: merged.codec_order.clone(), ..list[i].clone() } == merged
-                });
-                let auto_select = self.service.settings().auto_codec;
-                // Settings of a codec not in use: nothing the stream uses
-                // The playback EQ and the microphone's processing (one or
-                // both): the running stream takes them in place
-                let live_only = pos.is_some_and(|i| list[i].only_live_processing_differs(&merged));
-                let processing_only = live_only && pos.is_some_and(|i| list[i].mic_processing != merged.mic_processing);
-                let kept_only = live_only
-                    || pos.is_some_and(|i| {
-                        list[i].only_kept_settings_differ(&merged) || list[i].only_default_input_differs(&merged)
-                    });
-                let in_order = merged.clone();
-                // The profile's device joins the saved ones of its kind (as
-                // a connection saves it)
-                let address = merged.device_address.clone();
-                let known = if merged.le_audio { devices::load_le(&dir) } else { devices::load(&dir) };
-                if !known.iter().any(|d| d.address == address) {
-                    let r = if merged.le_audio {
-                        devices::save_le(&dir, &address, &merged.device_name)
-                    } else {
-                        devices::save(&dir, &address, &merged.device_name)
-                    };
-                    if let Err(e) = r {
-                        tracing::warn!("cannot save the device {address}: {e}");
-                    }
-                }
-                match pos {
-                    Some(i) => list[i] = merged,
-                    None => list.push(merged),
-                }
-                let (_, s) = self.snapshot();
-                let renamed_active = s.active_profile.as_deref() == Some(key.as_str()) && key != profile.name;
-                let active = match s.active_profile {
-                    Some(a) if a == key => Some(profile.name.clone()),
-                    other => other.or(Some(profile.name.clone())),
-                };
-                self.save_profiles(&list, active)?;
-                // A renamed active profile (its name follows the codec chosen
-                // on the Codecs screen) stays the one remembered
-                if renamed_active {
-                    self.set_active_profile(Some(profile.name.clone()));
-                }
-                self.refresh_devices();
-                // The stream of this profile plays its EQ as saved from now
-                // on (also when it starts again below)
-                if restart_after_save(&s.stream, &key) {
-                    media_eq::apply(Some(&in_order.media_eq));
-                }
-                // The profile in use starts again with what was saved (v1),
-                // but for another source, which needs nothing of the link
-                if processing_only && restart_after_save(&s.stream, &key) {
-                    self.service.set_mic_processing(in_order.mic_processing);
-                }
-                let order_keeps_codec = order_only && !restart_for_order(&s.stream, &in_order, auto_select);
-                let headset = headset_change(&s.stream, before.as_ref(), &in_order);
-                let headset_kept = match headset {
-                    Some(HeadsetChange::Unused) => true,
-                    Some(HeadsetChange::InPlace) => {
-                        tracing::info!(
-                            "profile {} saved while in use: headset microphone {} in place",
-                            bluecaster_core::diag::quoted(&key),
-                            in_order.headset_mic_mode().as_str()
-                        );
-                        // The session refuses an output that would feed the
-                        // capture; false (no stream, or a stack without
-                        // voice): it starts again instead
-                        let mode = headset_mic_in_force(&in_order, self.service.settings().debug_mode);
-                        let kept = self.service.set_headset_mic(
-                            mode,
-                            mode.is_on().then(|| in_order.mic_device_id.clone()),
-                            in_order.voice_codec_in_force(auto_select),
-                        );
-                        // Another output or mode: the session tries again
-                        // and says so anew if it still cannot
-                        let mut stream = self.with_snapshot(|s| s.stream.clone());
-                        if kept && self.drop_mic_note(&mut stream) {
-                            self.publish(Event::Stream(stream));
-                        }
-                        kept
-                    }
-                    Some(HeadsetChange::Restart) | None => false,
-                };
-                if restart_after_save(&s.stream, &key) && !order_keeps_codec && !kept_only && !headset_kept {
-                    let in_place = source_changes_in_place(&s.stream, before.as_ref(), &in_order)
-                        && self.service.change_source(self.service.settings().source_in_force(in_order.source()));
-                    let bitpools_in_place = !self.service.settings().auto_codec
-                        && bitpools_change_in_place(&s.stream, before.as_ref(), &in_order)
-                        && self.service.change_bitpools(in_order.bitpools());
-                    // "Show only options it supports" turned, the stream
-                    // set up the same either way (issue #86)
-                    let unlisted_in_place = !bitpools_in_place
-                        && !in_place
-                        && before.as_ref().is_some_and(|b| b.only_unlisted_differs(&in_order))
-                        && self.service.change_unlisted(in_order.unlisted_options);
-                    let named_in_place = !bitpools_in_place
-                        && !in_place
-                        && !unlisted_in_place
-                        && codec_named_in_place(&s.stream, before.as_ref(), &in_order)
-                        && (before.as_ref().is_some_and(|b| b.unlisted_options == in_order.unlisted_options)
-                            || self.service.change_unlisted(in_order.unlisted_options));
-                    if named_in_place {
-                        tracing::info!(
-                            "profile {} saved while in use as {}: it names the codec it streams with, the stream stays",
-                            bluecaster_core::diag::quoted(&key),
-                            bluecaster_core::diag::quoted(&profile.name)
-                        );
-                        self.rename_stream_profile(&profile.name);
-                    } else if unlisted_in_place {
-                        tracing::info!(
-                            "profile {} saved while in use: the stream stays as it is",
-                            bluecaster_core::diag::quoted(&key)
-                        );
-                    } else if bitpools_in_place {
-                        tracing::debug!(
-                            "profile {} saved while in use: new bitpools",
-                            bluecaster_core::diag::quoted(&key)
-                        );
-                    } else if in_place {
-                        tracing::info!(
-                            "profile {} saved while in use: its source changes in place",
-                            bluecaster_core::diag::quoted(&key)
-                        );
-                    } else {
-                        tracing::info!(
-                            "profile {} saved while in use: it starts again as {}",
-                            bluecaster_core::diag::quoted(&key),
-                            bluecaster_core::diag::quoted(&profile.name)
-                        );
-                        self.restart_profile(&profile.name)?;
-                    }
-                } else if reconnect_after_codec_stop(&s.stream, &key, before.as_ref(), &in_order) {
-                    tracing::info!(
-                        "profile {} saved after its codec stopped the stream: connecting again as {}",
-                        bluecaster_core::diag::quoted(&key),
-                        bluecaster_core::diag::quoted(&profile.name)
-                    );
-                    self.start_profile(&profile.name)?;
-                }
-                Ok(Value::Null)
+                bluecaster_core::auracast_mix::set(&dir, &mix).map_err(|e| {
+                    tracing::warn!("Auracast mixer: not saved: {e}");
+                    err("auracast.mix_save_failed", "error.settings_save")
+                })?;
+                Ok(json(&bluecaster_core::auracast_mix::state(&dir, channels, rear)))
+            }
+            Method::AuracastMixPresetSave { name, mix } => {
+                self.developer_only()?;
+                let dir = self.config_dir();
+                bluecaster_core::auracast_mix::save_preset(&dir, &name, &mix).map_err(|e| {
+                    tracing::warn!("Auracast mixer: preset not saved: {e}");
+                    err("auracast.mix_save_failed", "error.settings_save")
+                })?;
+                Ok(json(&bluecaster_core::auracast_mix::state(&dir, None, None)))
+            }
+            Method::AuracastMixPresetDelete { name } => {
+                self.developer_only()?;
+                let dir = self.config_dir();
+                bluecaster_core::auracast_mix::delete_preset(&dir, &name).map_err(|e| {
+                    tracing::warn!("Auracast mixer: preset not deleted: {e}");
+                    err("auracast.mix_save_failed", "error.settings_save")
+                })?;
+                Ok(json(&bluecaster_core::auracast_mix::state(&dir, None, None)))
             }
             Method::MediaEqPreview { name, eq } => {
                 let (_, s) = self.snapshot();
@@ -3395,7 +4053,13 @@ impl CoreState {
                     let developer_toggled = base.debug_mode != merged.debug_mode;
                     let sync_toggled =
                         base.volume_sync != merged.volume_sync || base.mutes_output() != merged.mutes_output();
-                    me.save_settings(merged)?;
+                    {
+                        // Merged again into the settings as they are now:
+                        // another change may have been saved since `base`
+                        let _tx = me.service.settings_tx();
+                        let merged = merge_settings(&me.service.settings(), &settings);
+                        me.save_settings(merged)?;
+                    }
                     if chip {
                         me.reload_adapter();
                     }
@@ -3617,7 +4281,12 @@ impl CoreState {
                         ..s.adapter
                     }));
                     let summary = bluecaster_core::probe_report::summary_line(&report);
-                    tracing::info!("chip probe of {instance_id}: {summary}");
+                    // The service's log names no device
+                    if bluecaster_core::paths::service_mode() {
+                        tracing::info!("chip probe: {summary}");
+                    } else {
+                        tracing::info!("chip probe of {instance_id}: {summary}");
+                    }
                     let version = env!("CARGO_PKG_VERSION");
                     let path =
                         bluecaster_core::probe_report::save(&me.config_dir(), &report, Some(&instance_id), version)
@@ -3627,7 +4296,14 @@ impl CoreState {
                             })?;
                     let report =
                         bluecaster_core::probe_report::to_json(&report, Some(&instance_id), version).to_string();
-                    Ok(json(&ProbeResult { path: path.display().to_string(), summary, report }))
+                    // Service mode: the user's copy (the core's folder is
+                    // protected)
+                    let saved = std::fs::read(&path).unwrap_or_default();
+                    let path =
+                        crate::handover::for_user(session_host::handover::Kind::ProbeReport, &path, &saved, || {
+                            err("adapter.probe_failed", "error.probe_save")
+                        })?;
+                    Ok(json(&ProbeResult { path, summary, report }))
                 }))
                 .await
             }
@@ -3646,10 +4322,12 @@ impl CoreState {
                         Err(_) => return Err(invalid("error.script_invalid", &check.errors)),
                     };
                     let total = parsed.lines.len();
-                    tracing::info!(
-                        "chip script on {instance_id}: {total} lines, {} that may change the chip",
-                        check.writes.len()
-                    );
+                    let on = if bluecaster_core::paths::service_mode() {
+                        String::new()
+                    } else {
+                        format!(" on {instance_id}")
+                    };
+                    tracing::info!("chip script{on}: {total} lines, {} that may change the chip", check.writes.len());
                     let report = me
                         .service
                         .run_script(Some(instance_id.clone()), parsed)
@@ -3677,8 +4355,13 @@ impl CoreState {
                         err("adapter.script_failed", "error.probe_save")
                     })?;
                     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+                    let saved = std::fs::read(&path).unwrap_or_default();
+                    let path =
+                        crate::handover::for_user(session_host::handover::Kind::ScriptReport, &path, &saved, || {
+                            err("adapter.script_failed", "error.probe_save")
+                        })?;
                     Ok(json(&ScriptResult {
-                        path: path.display().to_string(),
+                        path,
                         summary,
                         lines: bt_host::script::report_text(&report),
                         other_events: report.other_events.iter().map(|e| hex(e)).collect(),
@@ -3722,7 +4405,7 @@ impl CoreState {
             }
             Method::AudioDevices => {
                 blocking(Box::new(|me| {
-                    let devices = audio_capture::render_devices();
+                    let devices = session_host::devices::render_devices();
                     if let Ok(d) = &devices {
                         me.watch_cables(d);
                     }
@@ -3730,7 +4413,7 @@ impl CoreState {
                         .unwrap_or_default()
                         .into_iter()
                         .map(|d| {
-                            let mix = audio_capture::mix_format(Some(&d.id));
+                            let mix = session_host::devices::mix_format(Some(&d.id));
                             AudioDevice {
                                 mix_rate: mix.map(|m| m.rate),
                                 mix_channels: mix.map(|m| m.channels),
@@ -3755,7 +4438,7 @@ impl CoreState {
                 blocking(Box::new(|me| {
                     let found = crate::vb_cable::install()?;
                     // Taken into use as any VB-CABLE that comes (watch_cables)
-                    if let Ok(d) = audio_capture::render_devices() {
+                    if let Ok(d) = session_host::devices::render_devices() {
                         me.watch_cables(&d);
                     }
                     Ok(json(&found))
@@ -3771,7 +4454,7 @@ impl CoreState {
             }
             Method::AudioApps => {
                 blocking(Box::new(|_| {
-                    let list: Vec<AudioApp> = audio_capture::audio_apps()
+                    let list: Vec<AudioApp> = session_host::endpoints::audio_apps()
                         .into_iter()
                         .map(|a| AudioApp { exe: a.exe, name: a.name })
                         .collect();
@@ -3781,7 +4464,7 @@ impl CoreState {
             }
             Method::AudioMixer => {
                 blocking(Box::new(|_| {
-                    let list: Vec<MixerApp> = audio_capture::mixer_apps()
+                    let list: Vec<MixerApp> = session_host::volume::mixer_apps()
                         .into_iter()
                         .map(|a| MixerApp { key: a.key, name: a.name, volume: a.volume, muted: a.muted })
                         .collect();
@@ -3791,7 +4474,7 @@ impl CoreState {
             }
             Method::AudioMixerSet { app, volume, muted } => {
                 blocking(Box::new(move |_| {
-                    audio_capture::set_mixer_app(&app, volume, muted);
+                    session_host::volume::set_mixer_app(&app, volume, muted);
                     Ok(Value::Null)
                 }))
                 .await
@@ -3881,6 +4564,7 @@ impl CoreState {
                     // Ends a previous connection first (bounded by its
                     // connect and discovery timeouts)
                     me.receiver.start(&target);
+                    let _tx = me.service.settings_tx();
                     let mut s = me.service.settings();
                     if s.remote_sink != target {
                         s.remote_sink = target;
@@ -3984,6 +4668,71 @@ impl CoreState {
                 self.service.mic_test_end();
                 Ok(Value::Null)
             }
+            Method::HidCode => {
+                developer(self)?;
+                Ok(json(&ipc::HidCode { code: self.service.hid_code() }))
+            }
+            Method::HidEnable { code, other_input_at_hand, risk_understood } => {
+                developer(self)?;
+                blocking(Box::new(move |me| {
+                    me.service.hid_confirm(&code, other_input_at_hand, risk_understood).map_err(|m| hid_err(&m))?;
+                    me.set_hid_host(true)?;
+                    // The path to Windows tested at once: on failure the
+                    // feature goes off again, as hid.disable turns it off
+                    if let Err(m) = me.service.hid_self_test_enable() {
+                        let _ = me.set_hid_host(false);
+                        return Err(hid_err(&m));
+                    }
+                    Ok(Value::Null)
+                }))
+                .await
+            }
+            Method::HidDisable => blocking(Box::new(|me| me.set_hid_host(false))).await,
+            Method::HidStatus => Ok(json(&ipc::HidStatus {
+                devices: to_ipc_hid_devices(self.service.hid_devices()),
+                counts: self.service.hid_counts().map(|c| ipc::HidCounts {
+                    reports: c.reports,
+                    undecoded: c.undecoded,
+                    events: c.events,
+                    injected: c.injected,
+                    blocked: c.blocked,
+                    refused: c.refused,
+                }),
+            })),
+            Method::HidAdd { address, name, le } => {
+                developer(self)?;
+                blocking(Box::new(move |me| {
+                    me.service.hid_add(&address, &name, le).map_err(|m| hid_err(&m))?;
+                    Ok(Value::Null)
+                }))
+                .await
+            }
+            Method::HidConnect { address } => {
+                developer(self)?;
+                blocking(Box::new(move |me| {
+                    me.service.hid_connect(&address).map_err(|m| hid_err(&m))?;
+                    Ok(Value::Null)
+                }))
+                .await
+            }
+            Method::HidRemove { address } => {
+                blocking(Box::new(move |me| {
+                    me.service.hid_remove(&address);
+                    Ok(Value::Null)
+                }))
+                .await
+            }
+            Method::HidCheckCancel { address } => {
+                blocking(Box::new(move |me| {
+                    me.service.hid_check_cancel(&address);
+                    Ok(Value::Null)
+                }))
+                .await
+            }
+            Method::HidCheckDismiss => {
+                self.service.hid_check_dismiss();
+                Ok(Value::Null)
+            }
             Method::AppCheckUpdate => blocking(Box::new(|me| me.check_update().map(|u| json(&u)))).await,
             Method::AppHiddenToTray => {
                 self.hidden_to_tray();
@@ -3992,6 +4741,19 @@ impl CoreState {
             Method::AppQuit => {
                 self.quit();
                 Ok(Value::Null)
+            }
+            // Service mode: the core stays (crate::headless)
+            Method::AppClose => {
+                if paths::service_mode() {
+                    crate::headless::close_for_user(self);
+                } else {
+                    self.quit();
+                }
+                Ok(Value::Null)
+            }
+            Method::AppRunAsAdmin { call } => {
+                let service = bluecaster_core::paths::service_mode();
+                blocking(Box::new(move |me| crate::rules::run_as_admin(&call, &**me, service))).await
             }
             Method::AppQuitForUpdate => match self.service.state() {
                 CoreStreamState::Connecting | CoreStreamState::Streaming | CoreStreamState::Reconnecting => {
@@ -4044,6 +4806,7 @@ impl CoreState {
     /// The automatic check: at most once a day (recorded before asking, as v1)
     pub fn check_update_if_due(self: &Arc<Self>) {
         use bluecaster_core::update;
+        let tx = self.service.settings_tx();
         let mut s = self.service.settings();
         let today = update::today();
         if !update::automatic_check_due(&s, &today) {
@@ -4052,6 +4815,7 @@ impl CoreState {
         s.last_update_check = today;
         let _ = s.save(&self.config_dir());
         self.service.set_settings(s);
+        drop(tx);
         let me = self.clone();
         std::thread::spawn(move || {
             // A failure is in the update state
@@ -4064,6 +4828,16 @@ impl CoreState {
     pub fn link_subscribed(&self) -> bool {
         self.link_subscribers.load(Ordering::Acquire) > 0
     }
+}
+
+/// A capture's file as the UI shows it: its path, or in service mode its
+/// name only (the folder is protected; the capture reaches the user in a
+/// diagnostic bundle, crate::handover)
+fn capture_shown(path: &Path) -> String {
+    if paths::service_mode() {
+        return path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    }
+    path.display().to_string()
 }
 
 /// yyyyMMdd_HHmmss of the local time, for file names (as v1)
@@ -4109,6 +4883,29 @@ mod tests {
             address: None,
             bt_version: None,
             windows_name: None,
+        }
+    }
+
+    #[test]
+    fn a_broadcast_is_mono_or_split_not_both() {
+        let b = |mono, split| BroadcastStream {
+            name: "Speakers".into(),
+            quality: "hq".into(),
+            mono,
+            split,
+            source: "tone".into(),
+            ..BroadcastStream::default()
+        };
+        let e = broadcast_request(&b(Some(true), Some(true)), 0).expect_err("refused");
+        assert_eq!(e.code, "stream.bad_channels");
+        assert_eq!(e.message.key, "ipc.error.bad_request");
+        assert_eq!(e.message.args, ["stream.start_broadcast", "mono and split cannot be used together"]);
+        for (mono, split) in [(Some(true), Some(false)), (Some(false), Some(true)), (None, None), (Some(true), None)] {
+            let req = broadcast_request(&b(mono, split), 0).expect("accepted");
+            let le = req.le.and_then(|l| l.broadcast).expect("a broadcast");
+            let layout =
+                if split == Some(true) { bt_host::BroadcastLayout::Split } else { bt_host::BroadcastLayout::Stereo };
+            assert_eq!((le.mono, le.layout), (mono.unwrap_or(false), layout));
         }
     }
 
@@ -4230,6 +5027,7 @@ mod tests {
                 abr,
                 bitrate_capped: false,
                 hi_res_set: false,
+                low_latency: false,
                 source: None,
                 le: None,
                 details: None,
@@ -4303,6 +5101,7 @@ mod tests {
                 abr: false,
                 bitrate_capped: false,
                 hi_res_set: false,
+                low_latency: false,
                 source: bluecaster_core::SourceInfo { kind: "tone", name: String::new(), waiting: false },
                 details: None,
             }))
@@ -4378,6 +5177,8 @@ mod tests {
             codecs_on_request: Vec::new(),
             le_audio,
             le_audio_set: false,
+            hid_le: None,
+            set_addresses: Vec::new(),
         };
         let core = CoreProfile {
             name: "EarFun Air Pro 4+ | aptX Adaptive".into(),
@@ -4816,6 +5617,7 @@ mod tests {
                 abr: false,
                 bitrate_capped: false,
                 hi_res_set: false,
+                low_latency: false,
                 source: None,
                 le: None,
                 details: None,
@@ -5662,6 +6464,7 @@ mod tests {
         assert!(chip_changed(&a, &CoreSettings { bt_chip_pid: 0x8771, ..a.clone() }));
         assert!(chip_changed(&a, &CoreSettings { bt_chip_fw_stem: "rtl8761bu".into(), ..a.clone() }));
         assert!(chip_changed(&a, &CoreSettings { realtek_custom_firmware: true, ..a.clone() }));
+        assert!(chip_changed(&a, &CoreSettings { adapter_id: "USB\\VID_8087&PID_0033\\1".into(), ..a.clone() }));
     }
 
     #[test]
@@ -5671,17 +6474,42 @@ mod tests {
         assert_eq!(vendor_note(ChipVendor::Qualcomm, 0x0CF3, 0xE300).unwrap().key, "firmware.vendor_qualcomm");
         assert_eq!(vendor_note(ChipVendor::Qualcomm, 0x0489, 0xE0C7).unwrap().key, "firmware.vendor_qualcomm");
         assert_eq!(vendor_note(ChipVendor::Qualcomm, 0x0CF3, 0xE400).unwrap().key, "firmware.vendor_unsupported");
-        // MediaTek: the MT79xx and the MT7927 have a loader, the others none
-        // (MT7663)
+        // MediaTek: the MT79xx, the MT7927 and the MT7663 have a loader, the
+        // others none (MT7630)
         assert_eq!(vendor_note(ChipVendor::MediaTek, 0x0E8D, 0x7925).unwrap().key, "firmware.vendor_mediatek");
         assert_eq!(vendor_note(ChipVendor::MediaTek, 0x0E8D, 0x0608).unwrap().key, "firmware.vendor_mediatek");
         assert_eq!(vendor_note(ChipVendor::MediaTek, 0x0E8D, 0x7927).unwrap().key, "firmware.vendor_mediatek");
-        assert_eq!(vendor_note(ChipVendor::MediaTek, 0x0E8D, 0x7663).unwrap().key, "firmware.vendor_unsupported");
+        assert_eq!(vendor_note(ChipVendor::MediaTek, 0x0E8D, 0x7630).unwrap().key, "firmware.vendor_unsupported");
         assert!(vendor_note(ChipVendor::Realtek, 0x0BDA, 0x8771).is_none());
+        // Realtek chips whose firmware comes from Realtek's Windows driver
+        assert_eq!(vendor_note(ChipVendor::Realtek, 0x0BDA, 0xB853).unwrap().key, "firmware.vendor_realtek_driver");
+        assert_eq!(
+            vendor_note(ChipVendor::Realtek, 0x0BDA, 0xB892).unwrap().key,
+            "firmware.vendor_realtek_driver_other"
+        );
+        assert_eq!(
+            vendor_note(ChipVendor::Realtek, 0x13D3, 0x3618).unwrap().key,
+            "firmware.vendor_realtek_driver_other"
+        );
         // ROM dongles and Wi-Fi-loaded combos: a note, never "unsupported"
         assert_eq!(vendor_note(ChipVendor::Barrot, 0x33FA, 0x0010).unwrap().key, "firmware.vendor_barrot");
         assert_eq!(vendor_note(ChipVendor::Marvell, 0x1286, 0x204C).unwrap().key, "firmware.vendor_marvell");
         assert_eq!(vendor_note(ChipVendor::Actions, 0x10D7, 0xB012).unwrap().key, "firmware.vendor_actions");
+    }
+
+    #[test]
+    fn an_earbud_lists_the_other_addresses_of_its_set() {
+        let dir = std::env::temp_dir().join(format!("bluecaster-state-set-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        devices::save(&dir, "C0:00:00:00:00:01", "Buds").unwrap();
+        devices::save_le(&dir, "C0:00:00:00:00:01", "Buds").unwrap();
+        le_sets::remember(&dir, &["C0:00:00:00:00:01".into(), "C0:00:00:00:00:02".into()]).unwrap();
+        let list = saved_devices(&dir, &[], &BTreeMap::new());
+        // Its classic side has the one address
+        assert!(!list[0].le_audio && list[0].set_addresses.is_empty());
+        assert!(list[1].le_audio);
+        assert_eq!(list[1].set_addresses, ["C0:00:00:00:00:02"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5701,6 +6529,8 @@ mod tests {
             codecs_on_request: Vec::new(),
             le_audio: false,
             le_audio_set: false,
+            hid_le: None,
+            set_addresses: Vec::new(),
         }];
         let mut codecs = BTreeMap::new();
         let sbc = bluecaster_core::SbcDeviceCaps {
@@ -5921,6 +6751,7 @@ mod tests {
                 audio: true,
                 le_audio: false,
                 le_audio_set: false,
+                hid_le: None,
             },
             ScannedDevice {
                 address: "AA:BB:CC:DD:EE:FF".into(),
@@ -5930,6 +6761,7 @@ mod tests {
                 audio: true,
                 le_audio: true,
                 le_audio_set: false,
+                hid_le: None,
             },
             ScannedDevice {
                 address: "C0:11:22:33:44:55".into(),
@@ -5939,6 +6771,7 @@ mod tests {
                 audio: true,
                 le_audio: true,
                 le_audio_set: true,
+                hid_le: None,
             },
         ];
         let scanned: Vec<Device> = scan.iter().map(scanned_device).collect();
@@ -5963,6 +6796,225 @@ mod tests {
         let list = saved_devices(&dir, &[], &codecs);
         assert_eq!(list.len(), 1);
         assert!(!list[0].le_audio);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bluetooth LE keyboards and mice (issue #413) stay out of the device
+    /// list the audio screens use, also when a saved device has their address
+    #[test]
+    fn le_keyboards_and_mice_stay_out_of_the_audio_devices() {
+        let dir = std::env::temp_dir().join(format!("bluecaster-state-hid-le-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        devices::save(&dir, "AA:BB:CC:DD:EE:FF", "Phones").unwrap();
+        let entry = |address: &str, name: &str, audio: bool, hid_le: Option<u8>| ScannedDevice {
+            address: address.into(),
+            name: name.into(),
+            rssi: -50,
+            class_of_device: 0,
+            audio,
+            le_audio: false,
+            le_audio_set: false,
+            hid_le,
+        };
+        let scan = [
+            entry("AA:BB:CC:DD:EE:FF", "Phones", true, None),
+            entry("11:22:33:44:55:66", "Classic keyboard", false, None),
+            entry("C0:11:22:33:44:55", "LE mouse", false, Some(1)),
+            // The saved headphones' address: still not that device
+            entry("AA:BB:CC:DD:EE:FF", "LE keyboard", false, Some(0)),
+        ];
+        let (scanned, hid) = split_scan(&scan);
+        let names = |l: &[Device]| l.iter().map(|d| d.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&scanned), ["Phones", "Classic keyboard"]);
+        assert_eq!(names(&hid), ["LE mouse", "LE keyboard"]);
+        assert_eq!(hid.iter().map(|d| d.hid_le).collect::<Vec<_>>(), [Some(1), Some(0)]);
+        assert!(hid.iter().all(|d| !d.audio && !d.le_audio && !d.saved));
+        let list = saved_devices(&dir, &scanned, &BTreeMap::new());
+        assert_eq!(names(&list), ["Phones", "Classic keyboard"]);
+        assert_eq!(list[0].rssi, Some(-50));
+        // Even when handed one, the device list leaves it out, and nothing is saved
+        let all: Vec<Device> = scan.iter().map(scanned_device).collect();
+        let list = saved_devices(&dir, &all, &BTreeMap::new());
+        assert_eq!(names(&list), ["Phones", "Classic keyboard"]);
+        assert!(list.iter().all(|d| d.hid_le.is_none()));
+        assert_eq!(devices::load_all(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A removed device stayed on Home and Codecs for a while
+    #[test]
+    fn forgetting_takes_a_device_off_the_lists_at_once() {
+        let dir = std::env::temp_dir().join(format!("bluecaster-state-forget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A dual-mode headset (both kinds), LE Audio earbuds alone, another device
+        let (dual, set, kept) = ("00:A2:D0:00:00:31", "00:A2:D0:00:00:32", "00:A2:D0:00:00:33");
+        devices::save(&dir, dual, "Phones").unwrap();
+        devices::save_le(&dir, dual, "Phones").unwrap();
+        devices::save_le(&dir, set, "Buds").unwrap();
+        devices::save(&dir, kept, "Speaker").unwrap();
+        let profile = |name: &str, address: &str, le_audio: bool| CoreProfile {
+            name: name.into(),
+            device_address: address.into(),
+            le_audio,
+            ..CoreProfile::default()
+        };
+        let list = [
+            profile("Phones | Auto", dual, false),
+            profile("Phones LE Audio", dual, true),
+            profile("Buds LE Audio", set, true),
+            profile("Speaker | Auto", kept, false),
+        ];
+        profiles::save(&dir, &list).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let options = bluecaster_core::ServiceOptions {
+            config_dir: dir.clone(),
+            hci_tcp: None,
+            capture: bt_host::HciCapture::new(),
+            afh: None,
+            usb: Default::default(),
+        };
+        let state =
+            CoreState::new(Arc::new(Service::new(options, tx)), Box::new(|_| {}), Box::new(|| {}), Box::new(|_| {}));
+        state.refresh_devices();
+        state.publish(Event::Profiles {
+            profiles: list.iter().map(|p| to_ipc_profile(p, 679)).collect(),
+            active_profile: Some("Buds LE Audio".into()),
+        });
+        let saved = |state: &CoreState| -> Vec<(String, bool)> {
+            let s = state.snapshot().1;
+            s.devices.iter().filter(|d| d.saved).map(|d| (d.address.clone(), d.le_audio)).collect()
+        };
+        assert_eq!(saved(&state).len(), 4);
+
+        // The profiles, then the device list, each once
+        let mut events = state.subscribe();
+        state.forget_device(set, true).unwrap();
+        let kinds: Vec<&str> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|(_, e)| match *e {
+                Event::Profiles { .. } => Some("profiles"),
+                Event::Devices(_) => Some("devices"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, ["profiles", "devices"]);
+        assert!(!saved(&state).iter().any(|(a, _)| a == set));
+        let s = state.snapshot().1;
+        assert!(s.profiles.iter().all(|p| p.device_address != set));
+        assert_eq!(s.active_profile, None);
+
+        // Both kinds of the dual-mode headset, one after the other (Audio
+        // Devices removes both): only the other device and its profile stay
+        state.forget_device(dual, true).unwrap();
+        assert_eq!(saved(&state), [(dual.to_string(), false), (kept.to_string(), false)]);
+        state.forget_device(dual, false).unwrap();
+        assert_eq!(saved(&state), [(kept.to_string(), false)]);
+        let names: Vec<String> = state.snapshot().1.profiles.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["Speaker | Auto"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn state_in(dir: &Path) -> Arc<CoreState> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let options = bluecaster_core::ServiceOptions {
+            config_dir: dir.to_path_buf(),
+            hci_tcp: None,
+            capture: bt_host::HciCapture::new(),
+            afh: None,
+            usb: Default::default(),
+        };
+        CoreState::new(Arc::new(Service::new(options, tx)), Box::new(|_| {}), Box::new(|| {}), Box::new(|_| {}))
+    }
+
+    /// Both earbuds of a pair saved as two devices: one entry, at startup
+    /// (set known from before) or once a connection learns the set
+    #[test]
+    fn earbuds_of_one_set_become_one_saved_device() {
+        let dir = std::env::temp_dir().join(format!("bluecaster-state-sets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(paths::devices_dir(&dir)).unwrap();
+        let (left, right, other) = ("C0:00:00:00:00:01", "C0:00:00:00:00:02", "00:A2:D0:00:00:33");
+        devices::save_le(&dir, left, "Buds").unwrap();
+        devices::save_le(&dir, right, "Buds").unwrap();
+        devices::save(&dir, other, "Speaker").unwrap();
+        // The profile is the right one's: it stays
+        let profile = |name: &str, address: &str| CoreProfile {
+            name: name.into(),
+            device_address: address.into(),
+            device_name: "Buds".into(),
+            le_audio: true,
+            ..CoreProfile::default()
+        };
+        profiles::save(&dir, &[profile("Buds LE Audio", right)]).unwrap();
+        let state = state_in(&dir);
+        // Not known as one set yet: two entries
+        let saved_le = |state: &CoreState| -> Vec<String> {
+            let s = state.snapshot().1;
+            s.devices.iter().filter(|d| d.saved && d.le_audio).map(|d| d.address.clone()).collect()
+        };
+        assert_eq!(saved_le(&state), [left, right]);
+
+        // A connection learned the set
+        le_sets::remember(&dir, &[left.into(), right.into()]).unwrap();
+        let mut events = state.subscribe();
+        state.on_service_event(ServiceEvent::LeSetLearned);
+        assert_eq!(saved_le(&state), [right]);
+        assert!(std::iter::from_fn(|| events.try_recv().ok()).any(|(_, e)| matches!(*e, Event::Devices(_))));
+        assert_eq!(devices::load_le(&dir).len(), 1);
+        // The other earbud is the same device from now on
+        devices::save_le(&dir, left, "Buds").unwrap();
+        assert_eq!(devices::load_le(&dir).len(), 1);
+
+        // Saved twice again by an older version, the left one with a
+        // profile and a volume: merged at startup into the one set up
+        std::fs::write(paths::le_devices_file(&dir), format!("{right}|Buds\n{left}|Buds (L)\n")).unwrap();
+        profiles::save(&dir, &[profile("Left", left)]).unwrap();
+        let mut settings = CoreSettings::default();
+        settings.saved_volumes.insert(left.into(), 55);
+        settings.save(&dir).unwrap();
+        let state = state_in(&dir);
+        assert_eq!(saved_le(&state), [left]);
+        assert_eq!(state.snapshot().1.profiles[0].device_address, left);
+
+        // Removing it removes every member
+        devices::save_le(&dir, right, "").unwrap();
+        std::fs::write(paths::le_devices_file(&dir), format!("{left}|Buds\n{right}|Buds\n")).unwrap();
+        profiles::save(&dir, &[profile("Left", left), profile("Right", right)]).unwrap();
+        state.forget_device(left, true).unwrap();
+        assert!(devices::load_le(&dir).is_empty());
+        assert!(profiles::load(&dir).is_empty());
+        assert!(le_sets::load(&dir).is_empty());
+        assert!(!state.service.settings().saved_volumes.contains_key(left));
+        assert_eq!(devices::load(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A profile saved for the other earbud of a saved set is the saved
+    /// device's
+    #[test]
+    fn a_profile_for_another_member_goes_to_the_saved_device() {
+        let dir = std::env::temp_dir().join(format!("bluecaster-state-set-profile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(paths::devices_dir(&dir)).unwrap();
+        let (left, right) = ("C0:00:00:00:00:11", "C0:00:00:00:00:12");
+        devices::save_le(&dir, left, "Buds").unwrap();
+        le_sets::remember(&dir, &[left.into(), right.into()]).unwrap();
+        let state = state_in(&dir);
+        let profile = CoreProfile {
+            name: "Buds LE Audio".into(),
+            device_address: right.into(),
+            device_name: "Buds".into(),
+            le_audio: true,
+            ..CoreProfile::default()
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let r = rt.block_on(
+            state.handle(Method::ProfileSave { profile: Box::new(to_ipc_profile(&profile, 679)), original_name: None }),
+        );
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(devices::load_le(&dir).len(), 1);
+        assert_eq!(profiles::load(&dir)[0].device_address, left);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5991,5 +7043,240 @@ mod tests {
         assert_eq!(s.len(), 15);
         assert_eq!(&s[8..9], "_");
         assert!(s.bytes().enumerate().all(|(i, b)| i == 8 || b.is_ascii_digit()));
+    }
+
+    #[test]
+    fn the_adapter_in_use_comes_from_its_list_entry() {
+        let mut windows = rtl(r"USB\VID_0BDA&PID_8771\1", Some(true), None);
+        windows.driver = DriverKind::Bluetooth;
+        windows.display_name = "the one Windows has".into();
+        let mut ours = rtl(r"USB\VID_0BDA&PID_8771\2", Some(true), None);
+        ours.windows_name = Some("TP-Link UB500 Adapter".into());
+        ours.bt_version = Some("5.1".into());
+        ours.address = Some("00:11:22:33:44:55".into());
+        let a = active_adapter(0x0BDA, 0x8771, &[windows, ours]);
+        assert_eq!(
+            a,
+            ipc::ActiveAdapter {
+                display_name: "RTL8761BU".into(),
+                windows_name: Some("TP-Link UB500 Adapter".into()),
+                vid: 0x0BDA,
+                pid: 0x8771,
+                vendor: "Realtek".into(),
+                chip: Some("RTL8761BU".into()),
+                bt_version: Some("5.1".into()),
+            }
+        );
+        // Neither the address nor the instance ID reaches it
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(!json.contains("00:11:22") && !json.contains("VID_0BDA"), "{json}");
+        // Not listed: what its VID:PID tells
+        let intel = active_adapter(0x8087, 0x0033, &[]);
+        assert_eq!((intel.vendor.as_str(), intel.chip, intel.windows_name), ("Intel", None, None));
+        assert!(intel.display_name.contains("0x8087:0x0033"), "{}", intel.display_name);
+    }
+
+    /// settings.set can turn keyboards and mice off, never on; developer
+    /// mode off turns them off for good (issue #413)
+    #[test]
+    fn settings_set_never_turns_the_hid_host_on() {
+        let off = CoreSettings { debug_mode: true, hid_host: false, ..CoreSettings::default() };
+        let mut ui = to_ipc_settings(&off);
+        ui.hid_host = true;
+        assert!(!merge_settings(&off, &ui).hid_host);
+
+        let on = CoreSettings { debug_mode: true, hid_host: true, ..CoreSettings::default() };
+        let mut ui = to_ipc_settings(&on);
+        assert!(merge_settings(&on, &ui).hid_host);
+        ui.hid_host = false;
+        assert!(!merge_settings(&on, &ui).hid_host);
+    }
+
+    #[test]
+    fn developer_mode_off_turns_the_hid_host_off_for_good() {
+        let on = CoreSettings { debug_mode: true, hid_host: true, ..CoreSettings::default() };
+        let mut ui = to_ipc_settings(&on);
+        ui.developer_mode = false;
+        let merged = merge_settings(&on, &ui);
+        assert!(!merged.debug_mode && !merged.hid_host);
+        // Developer mode on again: still off
+        let mut ui = to_ipc_settings(&merged);
+        ui.developer_mode = true;
+        ui.hid_host = true;
+        let again = merge_settings(&merged, &ui);
+        assert!(again.debug_mode && !again.hid_host && !again.hid_host());
+    }
+
+    #[test]
+    fn adapter_and_button_events_reach_the_clients() {
+        let dir = std::env::temp_dir().join(format!("bluecaster-state-adapter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = state_in(&dir);
+        let mut events = state.subscribe();
+        let rev = state.rev();
+        state.on_service_event(ServiceEvent::Adapter(Some((0x0BDA, 0x8771))));
+        let active = state.snapshot().1.adapter.active.expect("an adapter in use");
+        assert_eq!((active.vid, active.pid, active.vendor.as_str()), (0x0BDA, 0x8771, "Realtek"));
+        assert_eq!(state.rev(), rev + 1);
+        // The same again: nothing new
+        state.on_service_event(ServiceEvent::Adapter(Some((0x0BDA, 0x8771))));
+        assert_eq!(state.rev(), rev + 1);
+        // A button: an event without a revision of its own
+        let press = ipc::ButtonPress { button: ipc::MediaButton::Next, pressed: true, le_audio: false };
+        state.on_service_event(ServiceEvent::Button(press));
+        assert_eq!(state.rev(), rev + 1);
+        state.on_service_event(ServiceEvent::Adapter(None));
+        assert_eq!(state.snapshot().1.adapter.active, None);
+        let got: Vec<(u64, Event)> =
+            std::iter::from_fn(|| events.try_recv().ok()).map(|(r, e)| (r, (*e).clone())).collect();
+        assert!(matches!(&got[0], (r, Event::Adapter(a)) if *r == rev + 1 && a.active.is_some()));
+        assert_eq!(got[1], (rev + 1, Event::MediaButton(press)));
+        assert!(matches!(&got[2], (r, Event::Adapter(a)) if *r == rev + 2 && a.active.is_none()));
+        assert_eq!(got.len(), 3);
+        let json = serde_json::to_value(&got[1].1).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "media_button", "value": {"button": "next", "pressed": true, "le_audio": false}})
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tool_test_profile() -> Profile {
+        let core = CoreProfile {
+            name: "WH".into(),
+            device_address: "00:11:22:33:44:55".into(),
+            device_name: "WH".into(),
+            headset_mic: "auto".into(),
+            mic_device_id: "{cable}".into(),
+            ..CoreProfile::default()
+        };
+        to_ipc_profile(&core, 679)
+    }
+
+    /// profile.set_headset_mic does what the window's mode buttons do
+    #[test]
+    fn tool_headset_mode_follows_the_mode_buttons() {
+        use ipc::HeadsetMicMode::{Auto, Off, On};
+        let auto = tool_test_profile();
+        // Off mutes Auto, the mode kept; the mode in force already: nothing
+        let muted = tool_headset_mic(&auto, Off, false).unwrap().unwrap();
+        assert_eq!((muted.headset_mic.as_str(), muted.mic_muted), ("auto", true));
+        assert_eq!(tool_headset_mic(&auto, Auto, false).unwrap(), None);
+        assert_eq!(tool_headset_mic(&muted, Off, false).unwrap(), None);
+        // Auto unmutes
+        let back = tool_headset_mic(&muted, Auto, false).unwrap().unwrap();
+        assert_eq!(back, auto);
+        // On: developer mode only; On saved shows as Auto outside it
+        assert_eq!(tool_headset_mic(&auto, On, false).unwrap_err().code, "developer.off");
+        let on = tool_headset_mic(&auto, On, true).unwrap().unwrap();
+        assert_eq!((on.headset_mic.as_str(), on.mic_muted), ("on", false));
+        assert_eq!(tool_headset_mic(&on, Auto, false).unwrap(), None);
+        assert_eq!(tool_headset_mic(&on, Auto, true).unwrap().unwrap().headset_mic, "auto");
+        // From Off: the mode, once a microphone output is chosen
+        let off = Profile { headset_mic: "off".into(), ..auto.clone() };
+        assert_eq!(tool_headset_mic(&off, Off, true).unwrap(), None);
+        assert_eq!(tool_headset_mic(&off, Auto, false).unwrap().unwrap().headset_mic, "auto");
+        let no_output = Profile { mic_device_id: String::new(), ..off };
+        assert_eq!(tool_headset_mic(&no_output, Auto, false).unwrap_err().code, "profile.no_mic_output");
+        assert_eq!(tool_mic_muted(&no_output, true).unwrap_err().code, "profile.no_mic_output");
+        // Mute alone
+        assert_eq!(tool_mic_muted(&auto, false).unwrap(), None);
+        assert_eq!(tool_mic_muted(&auto, true).unwrap().unwrap(), muted);
+    }
+
+    #[test]
+    fn tool_media_eq_keeps_the_points() {
+        let p = tool_test_profile();
+        assert_eq!(tool_media_eq(&p, false), None);
+        let on = tool_media_eq(&p, true).unwrap();
+        assert!(on.media_eq.enabled);
+        assert_eq!(on.media_eq.bands.len(), 10);
+        assert!(on.media_eq.bands.iter().all(|b| b.gain == 0.0 && b.band_type == ipc::EqBandType::Peaking));
+        assert_eq!(tool_media_eq(&on, true), None);
+        let off = tool_media_eq(&on, false).unwrap();
+        assert_eq!((off.media_eq.enabled, off.media_eq.bands.len()), (false, 10));
+        // Saved points stay as they are
+        let mut custom = off.clone();
+        custom.media_eq.bands.truncate(2);
+        custom.media_eq.bands[0].gain = 6.0;
+        let again = tool_media_eq(&custom, true).unwrap();
+        assert_eq!(again.media_eq.bands, custom.media_eq.bands);
+        assert_eq!(Profile { media_eq: custom.media_eq.clone(), ..again }, custom);
+    }
+
+    #[test]
+    fn volume_steps_are_checked() {
+        let streaming = StreamStatus { state: StreamState::Streaming, volume: Some(60), ..StreamStatus::default() };
+        assert_eq!(volume_step(&streaming, 8).unwrap(), 68);
+        assert_eq!(volume_step(&streaming, -8).unwrap(), 52);
+        assert_eq!(volume_step(&streaming, 0).unwrap(), 60);
+        // Within 0..127 at either end
+        assert_eq!(volume_step(&streaming, 127).unwrap(), 127);
+        assert_eq!(volume_step(&streaming, -127).unwrap(), 0);
+        for delta in [128, -128, i16::MAX, i16::MIN] {
+            let e = volume_step(&streaming, delta).unwrap_err();
+            assert_eq!((e.code.as_str(), e.message.key.as_str()), ("stream.bad_volume_step", "ipc.error.bad_request"));
+        }
+        let unknown = StreamStatus { volume: None, ..streaming.clone() };
+        assert_eq!(volume_step(&unknown, 1).unwrap_err().code, "stream.volume_unknown");
+        let connecting = StreamStatus { state: StreamState::Connecting, ..streaming };
+        assert_eq!(volume_step(&connecting, 1).unwrap_err().code, "stream.volume_unknown");
+    }
+
+    /// The tools' profile.set_* save through profile.save once; the value
+    /// it has already saves nothing; a connecting stream refuses the
+    /// microphone's
+    #[test]
+    fn tool_changes_save_the_profile() {
+        let dir = std::env::temp_dir().join(format!("bluecaster-state-tool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(paths::devices_dir(&dir)).unwrap();
+        let p = tool_test_profile();
+        profiles::save(&dir, &[merge_profile(None, &p)]).unwrap();
+        let state = state_in(&dir);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let call = |m: Method| rt.block_on(state.handle(m));
+        let profiles_events = |events: &mut broadcast::Receiver<(u64, Arc<Event>)>| {
+            std::iter::from_fn(|| events.try_recv().ok()).filter(|(_, e)| matches!(**e, Event::Profiles { .. })).count()
+        };
+
+        // No profile named, none streaming or active
+        let e = call(Method::ProfileSetMicMuted { name: None, muted: true }).unwrap_err();
+        assert_eq!((e.code.as_str(), e.message.key.as_str()), ("profile.not_found", "ipc.error.profile_not_found"));
+        let e = call(Method::ProfileSetMediaEq { name: Some("Other".into()), enabled: true }).unwrap_err();
+        assert_eq!(e.code, "profile.not_found");
+
+        let mut events = state.subscribe();
+        assert_eq!(call(Method::ProfileSetMicMuted { name: Some("WH".into()), muted: true }).unwrap(), Value::Null);
+        assert!(profiles::load(&dir)[0].mic_muted);
+        assert_eq!(profiles_events(&mut events), 1);
+        // Saved as profile.save saves it: it is the active one now
+        assert_eq!(state.snapshot().1.active_profile.as_deref(), Some("WH"));
+        // The same again: nothing saved, no event
+        assert_eq!(call(Method::ProfileSetMicMuted { name: None, muted: true }).unwrap(), Value::Null);
+        assert_eq!(
+            call(Method::ProfileSetHeadsetMic { name: None, mode: ipc::HeadsetMicMode::Off }).unwrap(),
+            Value::Null
+        );
+        assert_eq!(profiles_events(&mut events), 0);
+        let e = call(Method::ProfileSetHeadsetMic { name: None, mode: ipc::HeadsetMicMode::On }).unwrap_err();
+        assert_eq!((e.code.as_str(), e.message.key.as_str()), ("developer.off", "ipc.error.developer_only"));
+
+        // While its stream connects: the EQ (in place) yes, the microphone no
+        state.publish(Event::Stream(StreamStatus {
+            state: StreamState::Connecting,
+            profile: Some("WH".into()),
+            ..StreamStatus::default()
+        }));
+        let e = call(Method::ProfileSetHeadsetMic { name: None, mode: ipc::HeadsetMicMode::Auto }).unwrap_err();
+        assert_eq!((e.code.as_str(), e.message.key.as_str()), ("stream.busy", "ipc.error.stream_busy"));
+        assert!(profiles::load(&dir)[0].mic_muted);
+        assert_eq!(call(Method::ProfileSetMediaEq { name: None, enabled: true }).unwrap(), Value::Null);
+        let saved = &profiles::load(&dir)[0];
+        assert!(saved.media_eq.enabled && saved.mic_muted);
+        assert_eq!(state.snapshot().1.profiles[0].media_eq.bands.len(), 10);
+        assert_eq!(profiles_events(&mut events), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

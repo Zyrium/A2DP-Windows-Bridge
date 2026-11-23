@@ -391,6 +391,9 @@ pub struct PeerParams {
     /// aptX Adaptive: the sink is R2 (its codec information has the
     /// capability extension), which changes the bitstream and the tables
     pub aptxad_r2: bool,
+    /// LHDC V5: low latency is in the configuration (asked for and listed
+    /// by the sink): the encoder runs every 10 ms instead of 20
+    pub lhdcv5_low_latency: bool,
 }
 
 /// Encoder setup, fixed for a stream
@@ -490,6 +493,14 @@ pub trait Encoder: Send {
     /// Adaptive bit rate is running: asked for and set up (LDAC keeps a
     /// fixed quality when its ABR module fails to start)
     fn abr_active(&self) -> bool {
+        false
+    }
+
+    /// The encoder wants [`Encoder::abr_adjust`] with the
+    /// queue depth although ABR is off (LHDC V5's queue guard under low
+    /// latency). The encode thread then calls it as under ABR; the stream
+    /// info still says ABR off.
+    fn queue_guard_active(&self) -> bool {
         false
     }
 

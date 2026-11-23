@@ -44,6 +44,22 @@ bluecaster_decode --le-audio on both sides:
     --mic-output <out>/le-<case>/mic.wav)
 Outputs go to tools/emu/out/le-<case>/.
 
+    python tools/emu/run_test.py --auracast [case ...]
+
+runs the Auracast cases instead (le_audio_tests/auracast.py: stereo, mono,
+encrypted, split and the matrix layouts): emu_le_audio_sink.py --layout
+auracast with one broadcast sink per broadcast, bluecaster-core.exe --cli
+--auracast with the test tone. Checked from both logs (the BIS audio is
+not decoded):
+  - each broadcast's name, Broadcast_ID, announced quality and BASE
+    (subgroups, LC3 configuration, BIS locations, labels), one presentation
+    delay for all
+  - the BIG asked of the controller for each (BIS, max SDU, RTN)
+  - every BIS delivered SDUs of its length for the whole duration, without
+    a sequence gap and none too late; left and right differ, and BIS with
+    the same audio and configuration carry the same SDU
+Outputs go to tools/emu/out/auracast-<case>/.
+
     python tools/emu/run_test.py --scan [case ...]
 
 runs the device scan cases instead (eir, name-request): emu_sink.py answers
@@ -56,7 +72,8 @@ bluecaster-core.exe --cli --scan lists it:
     from a name request after the first inquiry
 Outputs go to tools/emu/out/scan-<case>/.
 
-    python tools/emu/run_test.py --voice [cvsd msbc lc3swb cvsd-roundtrip cvsd-auto lc3swb-msbc lc3swb-cvsd msbc-gain]
+    python tools/emu/run_test.py --voice [cvsd msbc lc3swb cvsd-roundtrip cvsd-auto lc3swb-msbc lc3swb-cvsd msbc-gain
+                                          msbc-agent cvsd-agent-killed]
 
 runs the HFP audio cases instead (headset mode: bluecaster-core --headset-mic
 --mic-output <out>/mic.wav): emu_sink.py --hfp <codec> adds a hands-free
@@ -86,6 +103,12 @@ given --voice-codec msbc / cvsd (the call codec chosen with Auto-select off):
 the link must come up with that codec instead.
 msbc-gain: msbc with --mic-gain 6: the microphone's processing runs, so
 mic.wav holds the tone 6 dB louder.
+msbc-agent: msbc with --session-agent: the microphone is decoded in the core
+and written to mic.wav by the session agent (render channel).
+cvsd-agent-killed: cvsd with --session-agent and the agent killed 1.5 s
+after it opened the microphone's output: the core opens the output and the
+uplink capture again through the next agent; the next agent's mic.wav
+(written anew) holds the tone, the sink the test tone.
 Outputs go to tools/emu/out/voice-<case>/.
 
     python tools/emu/run_test.py --le-pairing [link-key link-key-ct2 no-link-key replaces-classic drops-authenticated]
@@ -109,15 +132,97 @@ only with the link key it has for BlueCaster:
     pairing with LinkKey (Just Works): the older key is dropped, not
     replaced, and the next classic connection pairs
 Outputs go to tools/emu/out/lepair-<case>/.
+
+    python tools/emu/run_test.py --hid [hid-connect hid-incoming ... hid-le-audio-untouched]
+
+runs the keyboard and mouse cases instead (experimental HID host, issue
+#413): emu_hid.py is a classic HID keyboard, mouse and consumer keys that
+sends a fixed script of input reports once its channels are open;
+bluecaster-core --cli --hid-test prints the HID host's counts once a second
+(dry run: over --hci-tcp nothing reaches Windows):
+  - hid-connect: BlueCaster opens the channels (--hid-connect); every report
+    arrives and is decoded into the events the script implies, none injected
+    although --hid-inject is given
+  - hid-incoming: the device opens them itself and is on the list; the same
+  - hid-refused: the device is not on the list: its control channel is
+    refused, nothing is counted but the refusal
+  - hid-release: the device drops the link with a key still held: one event
+    more (the release), and nothing connected at the end
+  - hid-off: a core without --hid-* (the scan mode): the HID PSMs are not
+    there, the device's control channel is refused as an unknown PSM
+  - hid-kept-descriptor: the device connects by itself and types at once,
+    twice on one configuration: the first run may drop the first report
+    (the descriptor is read after the channels open), the second decodes
+    every report with the descriptor kept from the first
+  - hid-leds: as hid-incoming, with the test lights --hid-leds 5: the
+    device gets them as output report 1 (Num Lock and Scroll Lock); every
+    other case checks that no lights are sent without --hid-leds
+  - hid-incoming-helper, hid-release-helper: as hid-incoming and
+    hid-release, with the input through a real input helper process that
+    records what it would pass to Windows (--hid-helper-record, debug
+    builds only: run these with a debug bluecaster-core); every event is
+    recorded, none dropped, the held key released after the drop
+  - hid-passkey: a keyboard that can only type and asks for MITM: BlueCaster
+    (adding it with --hid-connect) answers as a display, prints
+    "hid passkey shown <digits>" (over --hci-tcp only), the harness hands
+    the digits to the device, which types them; pairing succeeds and the
+    script's input arrives. Every other case checks that no number is shown
+    (hid-connect: a device without input or output pairs with Just Works)
+and the LE ones: emu_hid_le.py is the same keyboard, mouse and consumer
+keys over HID over GATT (BlueCaster's controller there keeps a filter accept
+list, which the background connection uses):
+  - hid-le-connect: BlueCaster connects (background connection), pairs
+    (Just Works, one SMP Pairing Request, one encryption), subscribes to the
+    three input reports; every report decoded, none undecoded
+  - hid-le-reconnect: the device drops the link after its script and
+    advertises again: BlueCaster connects again by itself, encrypts with
+    the stored bond (no second Pairing Request, two encryptions) and the
+    script's input arrives again; the key held at the drop is released
+  - hid-le-release: the same drop, the device stays away: one release
+    event, nothing connected at the end
+  - hid-le-not-listed: another LE device is on the list: the emulated one
+    is never connected to and nothing is subscribed to
+  - hid-le-scan: --hid-scan lists the device as an LE keyboard or mouse;
+    the device scan of LE Audio (--scan --le-audio, keyboards and mice off)
+    does not list it
+  - hid-le-audio-untouched: keyboards and mice on, LE Audio off: only the
+    HID module runs, the device reads BlueCaster's GATT services and finds
+    none of LE Audio, no LE Audio advertiser is listed
+  - hid-le-leds: a background connection with --hid-leds 5: the lights
+    are written to the Output report (Report Reference type 2)
+  - hid-le-privacy: the device advertises with a resolvable private
+    address, is listed with it, pairs and tells its identity and IRK; it
+    drops the link and comes back with another private address, which the
+    accept list (BlueCaster's controller here does not resolve) cannot
+    match: BlueCaster's passive scan resolves it with the IRK and connects,
+    without pairing again, and the script's input arrives again
+  - hid-le-early-report: as hid-le-reconnect, and the device sends a mouse
+    move as soon as the second link is encrypted (before BlueCaster reads
+    its services): counted, decoded with the kept report handles
+  - hid-le-release-helper: hid-le-release through a recording input
+    helper (debug builds only)
+  - hid-le-passkey: the keyboard asks for MITM: BlueCaster shows a number,
+    the device types it, pairing and input as hid-le-connect (which, without
+    MITM, still pairs with Just Works and shows no number)
+and the check of a device being added (--hid-confirm, a short countdown
+instead of the app's 30 s):
+  - hid-confirm, hid-le-confirm: the device sends its script within the
+    countdown: "hid check confirmed", and it stays connected
+  - hid-confirm-silent, hid-le-confirm-silent: the device connects and sends
+    nothing: "hid check removed no_input" after the countdown, and
+    BlueCaster closes its link
+Outputs go to tools/emu/out/hid-<case>/.
 """
 
 import argparse
+import glob
 import json
 import math
 import os
 import queue
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -127,6 +232,7 @@ import time
 import wave
 
 import le_audio_tests
+import le_audio_tests.auracast
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -245,6 +351,8 @@ NEGOTIATION = {
     # asked of an EarFun gave aptX, not aptX Adaptive); aptX HD missing:
     # LDAC above it, not AAC below
     'fallback-lhdcv5-to-ldac': ('lhdcv5', ['--codecs', 'sbc', 'aac', 'ldac'], 'ldac', ['--fallback']),
+    # LHDC V5 low latency asked for (issue #543): the sink lists it (P9 0x40)
+    'lhdcv5-ll': ('lhdcv5', [], 'lhdcv5', ['--lhdcv5-ll']),
     'fallback-aptxhd-to-ldac': ('aptxhd', ['--codecs', 'sbc', 'aac', 'ldac'], 'ldac', ['--fallback']),
     'fallback-opus-to-aptxad': ('opus', APTXAD_SINK, 'aptxad', ['--fallback']),
     # Opus 05: 48 kHz from a 44.1 kHz request; Auto never takes it (AAC here)
@@ -354,7 +462,37 @@ NEGOTIATION = {
     'ctkd-silent': ('sbc', CTKD_SINK + ['--ctkd-silent'], 'sbc', []),
     'ctkd-developer-off': ('sbc', CTKD_SINK, 'sbc', []),
     'ctkd-le-off': ('sbc', CTKD_SINK, 'sbc', []),
+    # The capture in the session agent (--session-agent, or its first name
+    # --capture-agent: the test tone made there, its PCM through shared
+    # memory, requests over the agent pipe): the decoded tone shows it
+    # arrives intact; a 44.1 kHz source reaches the encoder as it is; an
+    # agent killed mid-stream (AGENT_KILL) ends the capture as a lost device
+    # does, and the core starts a new one. AGENT_FIRST: an agent started by
+    # hand before the core serves it (the core starts none), and goes back
+    # to waiting when the core exits; or is killed mid-stream and the core
+    # starts its own
+    'sbc-agent': ('sbc', [], 'sbc', ['--session-agent']),
+    'aac-agent': ('aac', [], 'aac', ['--capture-agent']),
+    'sbcxq-44k-agent': ('sbcxq', [], 'sbcxq', ['--rate', '44100', '--session-agent']),
+    'sbc-agent-killed': ('sbc', [], 'sbc', ['--session-agent']),
+    'sbc-agent-first': ('sbc', [], 'sbc', ['--session-agent']),
+    'sbc-agent-replaced': ('sbc', [], 'sbc', ['--session-agent']),
 }
+# --capture-agent cases whose agent is killed: when, as a share of --duration
+# after the agent started (after the middle of the stream, which
+# tone_check reads)
+AGENT_KILL = {'sbc-agent-killed': 0.7, 'sbc-agent-replaced': 0.7}
+AGENT_STARTED = re.compile(r'session agent: started \(process (\d+)\)')
+# The agent cases with an agent started by hand before the core (its
+# output: agent.log); it is the one killed in AGENT_KILL
+AGENT_FIRST = {'sbc-agent-first', 'sbc-agent-replaced'}
+AGENT_ON = [('bluecaster.log', 'audio capture: through a capture agent', 1),
+            ('bluecaster.log', 'session agent: started (process', 1),
+            ('bluecaster.log', 'session agent: connected (process', 1),
+            ('bluecaster.log', 'capture agent: capturing', 1),
+            # The agent's own lines, in the core's log
+            ('bluecaster.log', '[agent] capture agent: channel opened (1 open)', True),
+            ('bluecaster.log', 'capture agent: the agent exited', False)]
 # Cases that must stop with an error before streaming: what the CLI's log
 # says of it (its "Codec stop" line carries the structured cause)
 EXPECT_ERROR = {
@@ -379,12 +517,19 @@ DEV_SETTINGS = {
 }
 QUALITY_ON, QUALITY_OFF = 'Huawei control: 2BA2 010101', 'Huawei control: 2BA2 010100'
 HI_RES_ON, HI_RES_OFF, HI_RES_CODEC = 'OPPO control: 0403 1801', 'OPPO control: 0403 1800', 'OPPO control: 041A 080100'
+LL_ASKED = 'LHDC V5: asking for low latency'
 ENCODED_1000, ENCODED_400 = 'encoder ready: LHDC V5 1000 kbps', 'encoder ready: LHDC V5 400 kbps'
 CTKD_GIVEN, CTKD_ASKING = f'CTKD: {SINK_ADDRESS} gave its LE keys', f'CTKD: asking {SINK_ADDRESS} for its LE keys'
 PAIRED = f'new link key from pairing with {SINK_ADDRESS}'
 # What these cases' logs must, and must not, have: name -> (log, text, whether
 # it is there, or how many times)
 LOG_CHECKS = {
+    # Issue #543: low latency only when asked for; then 10 ms encoding, the
+    # 100 ms send queue limit and the queue guard (ABR off)
+    'lhdcv5': [('bluecaster.log', LL_ASKED, False), ('bluecaster.log', 'LHDC V5: encode interval 20 ms', True)],
+    'lhdcv5-ll': [('bluecaster.log', LL_ASKED, True), ('bluecaster.log', 'LHDC V5: encode interval 10 ms', True),
+                  ('bluecaster.log', 'packets dropped after 100 ms (LHDC V5 low latency)', True),
+                  ('bluecaster.log', 'LHDC V5: queue guard on', True)],
     'sbcxq-abr-hold': [('bluecaster.log', 'encode at send time', True)],
     'ldac-hold': [('bluecaster.log', 'encode at send time', True)],
     'huawei-ldac': [('sink.log', QUALITY_ON, True), ('sink.log', QUALITY_OFF, False),
@@ -420,6 +565,28 @@ LOG_CHECKS = {
                               ('sink.log', 'AVDTP connection', 4)],
     # Paired once: the link key stays valid after the keys (a later
     # connection authenticates with it), and they are asked for only once
+    'sbc-agent': AGENT_ON,
+    'aac-agent': AGENT_ON,
+    'sbcxq-44k-agent': AGENT_ON + [('bluecaster.log', 'capture: 44100 Hz, 2 channel(s), F32', True)],
+    'sbc-agent-killed': [('bluecaster.log', 'capture agent: the agent exited, capture lost', 1),
+                         ('bluecaster.log', 'audio capture ended (Some(AgentLost))', 1),
+                         ('bluecaster.log', 'audio capture: device opened again, capturing', 1),
+                         ('bluecaster.log', 'session agent: started (process', 2),
+                         ('bluecaster.log', 'session agent: connected (process', 2),
+                         ('bluecaster.log', 'capture agent: capturing', 2)],
+    'sbc-agent-first': [('bluecaster.log', 'session agent: started (process', False),
+                        ('bluecaster.log', 'session agent: connected (process', 1),
+                        ('bluecaster.log', 'capture agent: capturing', 1),
+                        ('bluecaster.log', '[agent] capture agent: channel opened (1 open)', True),
+                        ('bluecaster.log', 'capture agent: the agent exited', False),
+                        ('agent.log', 'session agent: waiting for a core', 2),
+                        ('agent.log', 'session agent: the core went away, waiting for the next one', 1)],
+    'sbc-agent-replaced': [('bluecaster.log', 'session agent: started (process', 1),
+                           ('bluecaster.log', 'session agent: connected (process', 2),
+                           ('bluecaster.log', 'capture agent: the agent exited, capture lost', 1),
+                           ('bluecaster.log', 'audio capture ended (Some(AgentLost))', 1),
+                           ('bluecaster.log', 'audio capture: device opened again, capturing', 1),
+                           ('bluecaster.log', 'capture agent: capturing', 2)],
     'ctkd': [('bluecaster.log', CTKD_GIVEN, 1), ('sink.log', 'CTKD: keys LTK', 1), ('bluecaster.log', PAIRED, 1),
              ('bluecaster.log', CTKD_ASKING, False)],
     'ctkd-next-connection': [('sink.log', 'SMP over BR/EDR not listed (connection 1)', 1),
@@ -565,16 +732,16 @@ MAX_END_GAP_S = 0.3
 END_UNDERRUN_S = 0.3
 
 
-def tone_check_stream(path, tones):
+def tone_check_stream(path, tones, max_end_gap=MAX_END_GAP_S):
     """(ok, description) for the test tone over the whole WAV of a stream,
-    except gaps of up to MAX_START_GAP_S at the start and MAX_END_GAP_S at
+    except gaps of up to MAX_START_GAP_S at the start and `max_end_gap` at
     the end"""
     rate, channels = read_wav(path)
     n = int(rate * TONE_BLOCK_S)
     if len(channels) != 2 or len(channels[0]) < rate:
         return False, f'expected >= 1 s of stereo audio, got {len(channels)} ch, {len(channels[0]) / rate:.2f} s'
     blocks = len(channels[0]) // n
-    good, bad, notes = [], [], None
+    good, bad, notes, first_notes = [], [], None, None
     for b in range(blocks):
         ok, block_notes = True, []
         for xs, expected in zip(channels, tones):
@@ -585,19 +752,20 @@ def tone_check_stream(path, tones):
             good.append(b)
             if notes is None and b >= blocks // 2:
                 notes = ', '.join(block_notes)   # a typical block, for the summary
+            first_notes = first_notes or ', '.join(block_notes)
         else:
             bad.append((b, ', '.join(block_notes)))
     if not good:
         return False, f'no {TONE_BLOCK_S * 1000:.0f} ms block with the tone in {blocks * TONE_BLOCK_S:.1f} s'
     start_gap, end_gap = good[0] * TONE_BLOCK_S, (blocks - 1 - good[-1]) * TONE_BLOCK_S
     bad = [x for x in bad if good[0] < x[0] < good[-1]]
-    desc = (f'{notes or "?"}; {blocks * TONE_BLOCK_S:.1f} s checked, gaps {start_gap:.1f} s at the start, '
+    desc = (f'{notes or first_notes}; {blocks * TONE_BLOCK_S:.1f} s checked, gaps {start_gap:.1f} s at the start, '
             f'{end_gap:.1f} s at the end')
     problems = []
     if start_gap > MAX_START_GAP_S + 1e-9:
         problems.append(f'tone only from {start_gap:.1f} s (at most {MAX_START_GAP_S} s expected)')
-    if end_gap > MAX_END_GAP_S + 1e-9:
-        problems.append(f'no tone in the last {end_gap:.1f} s (at most {MAX_END_GAP_S} s expected)')
+    if end_gap > max_end_gap + 1e-9:
+        problems.append(f'no tone in the last {end_gap:.1f} s (at most {max_end_gap} s expected)')
     if bad:
         b, block_notes = bad[0]
         problems.append(f'{len(bad)} block(s) without the tone after it started, first at '
@@ -744,6 +912,31 @@ def ctkd_check(out):
     return [f'no LE keys noted for {SINK_ADDRESS} in {path}']
 
 
+def start_agent_killer(log_path, delay, pid=None):
+    """Kills the session agent `delay` seconds after it started capturing
+    (AGENT_KILL): the one the core's log names, or `pid` (an agent this
+    script started); the thread's .killed tells whether it did"""
+    def run():
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            text = read_text(log_path)
+            started = AGENT_STARTED.search(text)
+            found = pid if pid and 'capture agent: capturing' in text else started and int(started.group(1))
+            if found:
+                time.sleep(delay)
+                try:
+                    os.kill(found, signal.SIGTERM)  # TerminateProcess on Windows
+                    thread.killed = True
+                except OSError:
+                    pass
+                return
+            time.sleep(0.05)
+    thread = threading.Thread(target=run, daemon=True)
+    thread.killed = False
+    thread.start()
+    return thread
+
+
 def run_codec(args, codec, port):
     out = os.path.join(args.out, codec)
     shutil.rmtree(out, ignore_errors=True)
@@ -755,13 +948,24 @@ def run_codec(args, codec, port):
     cli_codec, sink_args, expected, bluecaster_args = NEGOTIATION.get(codec, (codec, [], codec, []))
     port = free_port(port)
     sink = start_sink(port, sink_capture, os.path.join(out, 'sink.log'), extra=sink_args)
+    hand_agent = None
     try:
         env = dict(os.environ, BLUECASTER_CONFIG_DIR=os.path.join(out, 'config'))  # isolated link keys
+        if any(a in bluecaster_args for a in ('--session-agent', '--capture-agent')):
+            env['BLUECASTER_INSTANCE'] = f'emu-{codec}-{port}'  # its own agent pipe
+        if codec in AGENT_FIRST:
+            agent_log = open(os.path.join(out, 'agent.log'), 'w', encoding='utf-8', errors='replace')
+            hand_agent = subprocess.Popen([args.bluecaster, '--agent'], stdout=agent_log, stderr=subprocess.STDOUT,
+                                          stdin=subprocess.DEVNULL, env=env)
+            time.sleep(1)
         if codec in DEV_SETTINGS:
             os.makedirs(env['BLUECASTER_CONFIG_DIR'])
             with open(os.path.join(env['BLUECASTER_CONFIG_DIR'], 'settings.json'), 'w', encoding='utf-8') as f:
                 json.dump(DEV_SETTINGS[codec], f)
         with open(os.path.join(out, 'bluecaster.log'), 'w', encoding='utf-8', errors='replace') as log:
+            killer = (start_agent_killer(os.path.join(out, 'bluecaster.log'), AGENT_KILL[codec] * args.duration,
+                                         hand_agent and hand_agent.pid)
+                      if codec in AGENT_KILL else None)
             try:
                 rc = subprocess.run(
                     [args.bluecaster, '--cli', '--hci-tcp', f'127.0.0.1:{port}', '-d', SINK_ADDRESS,
@@ -773,7 +977,18 @@ def run_codec(args, codec, port):
                 rc = 'timeout'
         if rc != 0 and codec not in EXPECT_ERROR:
             failures.append(f'BlueCaster exited with {rc} (see bluecaster.log)')
+        if killer and not killer.killed:
+            failures.append('the capture agent was not killed (not found in bluecaster.log)')
+        if hand_agent:
+            # Not killed: it outlives the core and waits for the next one
+            time.sleep(1)
+            if codec not in AGENT_KILL and hand_agent.poll() is not None:
+                failures.append(f'the agent started first exited with the core ({hand_agent.returncode})')
     finally:
+        if hand_agent:
+            hand_agent.kill()
+            hand_agent.wait(10)
+            agent_log.close()
         sink.terminate()
         sink.wait(10)
     if codec in EXPECT_ERROR:
@@ -864,6 +1079,8 @@ def run_le_case(args, case, port):
     addresses = sink.ready_line.split('sinks=')[1].split(',')
     try:
         env = dict(os.environ, BLUECASTER_CONFIG_DIR=os.path.join(out, 'config'))  # isolated bonds
+        if any(a in case.bluecaster_args for a in ('--session-agent', '--capture-agent')):
+            env['BLUECASTER_INSTANCE'] = f'emu-le-{case.name}-{port}'  # its own agent pipe
         cmd = [args.bluecaster, '--cli', '--hci-tcp', f'127.0.0.1:{port}', '--le-audio', '-d', addresses[0]]
         for a in ([] if case.first_address_only else addresses[1:]):
             cmd += ['--le-device', a]
@@ -933,7 +1150,9 @@ def run_le_case(args, case, port):
             if case.tones:
                 # Every stream (the one set up again after a link loss too)
                 for index, path in enumerate(received['wavs']):
-                    ok, notes = tone_check_stream(path, case.tones)
+                    last = index == len(received['wavs']) - 1
+                    ok, notes = tone_check_stream(path, case.tones,
+                                                  MAX_END_GAP_S if last else MAX_END_GAP_S + case.play_on_s)
                     label = f'stream {index + 1}: ' if len(received['wavs']) > 1 else ''
                     detail += f' | {label}{notes}'
                     if not ok:
@@ -1040,6 +1259,68 @@ def main_le(args):
     sys.exit(0 if passed == len(results) else 1)
 
 
+def run_auracast_case(args, case, port):
+    out = os.path.join(args.out, 'auracast-' + case.name)
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
+    failures = []
+    port = free_port(port)
+    follow = [b.suffix for b in case.broadcasts if b.suffix]
+    sink = start_sink(port, os.path.join(out, 'sink.pklg'), os.path.join(out, 'sink.log'), 'emu_le_audio_sink.py',
+                      ['--layout', 'auracast', '--log-level', 'INFO']
+                      + (['--follow'] + follow if follow else [])
+                      + (['--broadcast-code', case.code] if case.code else []))
+    duration = max(args.duration, 5)   # the SDU compared across the BIS is 3 s in
+    try:
+        # Its own settings folder: the mixer's defaults, and LE Audio on in
+        # developer mode (a broadcast goes through the service, which asks)
+        env = dict(os.environ, BLUECASTER_CONFIG_DIR=os.path.join(out, 'config'))
+        os.makedirs(env['BLUECASTER_CONFIG_DIR'])
+        with open(os.path.join(env['BLUECASTER_CONFIG_DIR'], 'settings.json'), 'w', encoding='utf-8') as f:
+            json.dump({'debug_mode': True, 'le_audio_experimental': True}, f)
+        for knob in ('BLUECASTER_AURACAST_RTN', 'BLUECASTER_AURACAST_LATENCY_MS'):
+            env.pop(knob, None)
+        cmd = [args.bluecaster, '--cli', '--hci-tcp', f'127.0.0.1:{port}', '--auracast', le_audio_tests.auracast.NAME,
+               '--test-tone', '--duration', str(duration),
+               '--hci-capture', os.path.join(out, 'bluecaster.pklg')] + case.bluecaster_args
+        if case.code:
+            cmd += ['--auracast-code', case.code]
+        with open(os.path.join(out, 'bluecaster.log'), 'w', encoding='utf-8', errors='replace') as log:
+            try:
+                rc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env,
+                                    timeout=duration + 120).returncode
+            except subprocess.TimeoutExpired:
+                rc = 'timeout'
+        if rc != 0:
+            failures.append(f'BlueCaster exited with {rc} (see bluecaster.log)')
+        time.sleep(0.5)   # the sinks log the end of their BIG
+    finally:
+        sink.terminate()
+        sink.wait(10)
+    more, detail = le_audio_tests.auracast.check(case, read_text(os.path.join(out, 'sink.log')),
+                                                 read_text(os.path.join(out, 'bluecaster.log')), duration)
+    return failures + more, detail
+
+
+def main_auracast(args):
+    names = [c.name for c in le_audio_tests.auracast.CASES]
+    wanted = args.auracast or names
+    unknown = [n for n in wanted if n not in names]
+    if unknown:
+        sys.exit(f'Unknown Auracast case(s) {unknown}; known: {names}')
+    results = []
+    for index, case in enumerate(c for c in le_audio_tests.auracast.CASES if c.name in wanted):
+        print(f'--- Auracast {case.name} ...', flush=True)
+        failures, detail = run_auracast_case(args, case, args.base_port + 200 + index)
+        results.append((case.name, failures))
+        print(f'    {"PASS" if not failures else "FAIL"}  {detail}')
+        for failure in failures:
+            print(f'      - {failure}')
+    passed = sum(1 for _, f in results if not f)
+    print(f'\n{passed}/{len(results)} Auracast cases passed. Details: {args.out}')
+    sys.exit(0 if passed == len(results) else 1)
+
+
 # Device scan cases (--scan): name -> (emu_sink.py arguments, where the name
 # comes from, how soon it must be known after the inquiry started). The sink
 # first answers 1 s into an inquiry (emu_sink.py INQUIRY_FIRST_ANSWER).
@@ -1113,10 +1394,24 @@ LINK_CASES = {
         ('sink.log', r'delay report sent \(187\.5 ms\)', True),
     ]),
     # Headphone buttons: each pass-through answer carries the command's state
-    # flag, so a release is not answered as a press (issue #420)
-    'avrcp-keys': (['--avrcp-keys', '3'], ['--duration', '8'], [
+    # flag, so a release is not answered as a press (issue #420); each press
+    # and release reaches the IPC clients (--ipc, buttons_client)
+    'avrcp-keys': (['--avrcp-keys', '3'], ['--duration', '8', '--ipc'], [
         ('sink.log', r'avrcp keys: 6 of 6 answers carry the state flag sent', True),
         ('bluecaster.log', r'AVRCP operation 0x49 released', True),
+        ('bluecaster.log', r'Headphone button: FastForward released', True),
+    ]),
+    # PLAY, a button with a media key, through the session agent: each press
+    # reaches the agent as a key, a dry run over --hci-tcp (nothing pressed
+    # on this PC), and the core sends no key itself
+    'avrcp-keys-agent': (['--avrcp-keys', '2', '--avrcp-key', 'PLAY'], ['--duration', '8', '--session-agent'], [
+        ('sink.log', r'avrcp keys: 4 of 4 answers carry the state flag sent', True),
+        ('bluecaster.log', r'session agent: connected \(process', True),
+        ('bluecaster.log', r'AVRCP button PlayPause -> media key.*AVRCP button PlayPause -> media key', True),
+        ('bluecaster.log', r'\[agent\] media key PlayPause: dry run, not sent'
+                           r'.*\[agent\] media key PlayPause: dry run, not sent', True),
+        ('bluecaster.log', r'(?<!\[agent\] )media key PlayPause: dry run', False),
+        ('bluecaster.log', r'no session agent connected', False),
     ]),
     # A headset that answers OPEN with a stray REJECT of DISCOVER under the
     # OPEN's label first: BTstack waits on for the OPEN accept
@@ -1125,6 +1420,18 @@ LINK_CASES = {
         ('bluecaster.log', r'ignoring a response to signal 1 while waiting for 6', True),
         ('bluecaster.log', r'streaming started', True),
         ('bluecaster.log', r'stream configuration timed out', False),
+    ]),
+    # The IPC's RFCOMM passthrough (--ipc, rfcomm_client): an echo service
+    # opened by its UUID while streaming, the hands-free service refused,
+    # a channel closed by the client and one by the stream's end. One log
+    # line per open, with the client and the service and no address.
+    'rfcomm': (['--echo', '--codecs', 'sbc'], ['--duration', '12', '--ipc'], [
+        ('sink.log', r'echo: channel open.*echo: 16 bytes.*echo: channel closed', True),
+        ('bluecaster.log', r'streaming started.*'
+                           r'IPC: emu-rfcomm/1 #\d+ rfcomm.open of 5D6A7B8C-0E1F-4A2B-9C3D-4E5F60718293: opened #', True),
+        ('bluecaster.log', r'IPC: emu-rfcomm/1 #\d+ rfcomm.open of 0000111E-0000-1000-8000-00805F9B34FB: '
+                           r'refused in \d+ ms: rfcomm.service_reserved', True),
+        ('bluecaster.log', r'rfcomm.open of [^\n]*' + SINK_ADDRESS, False),
     ]),
 }
 # Dual-mode pairing cases (issue #86): sink options, BlueCaster runs ('le' or
@@ -1377,9 +1684,209 @@ def main_scan(args):
     sys.exit(0 if passed == len(results) else 1)
 
 
+ECHO_UUID = '5D6A7B8C-0E1F-4A2B-9C3D-4E5F60718293'   # emu_sink.py EchoService.UUID
+
+
+class IpcClient:
+    """A client of the core's named pipe (docs/integration.md): frames of a
+    u32 length and JSON. Reads only what has arrived (PeekNamedPipe), so a
+    write never waits behind a blocking read on the same handle."""
+
+    def __init__(self, instance, name, log):
+        import ctypes
+        import msvcrt
+        sid = subprocess.run(['whoami', '/user', '/fo', 'csv', '/nh'], capture_output=True,
+                             text=True).stdout.strip().split(',')[1].strip('"')
+        path = rf'\\.\pipe\bluecaster-{sid}-{instance}'
+        deadline = time.time() + 30
+        while True:
+            try:
+                self.pipe = open(path, 'r+b', buffering=0)
+                break
+            except OSError:
+                if time.time() > deadline:
+                    raise RuntimeError('the IPC pipe never appeared') from None
+                time.sleep(0.2)
+        self.handle = msvcrt.get_osfhandle(self.pipe.fileno())
+        self.peek = ctypes.windll.kernel32.PeekNamedPipe
+        self.peek.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p,
+                              ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p]
+        self.available = ctypes.c_ulong()
+        self.log, self.next_id, self.events = log, 0, []
+        self.send({'type': 'hello', 'protocol': 1, 'client': name})
+        self.welcome = self.recv(5)
+        self.snapshot = self.recv(5)
+
+    def close(self):
+        self.pipe.close()
+
+    def send(self, msg):
+        data = json.dumps(msg).encode()
+        self.pipe.write(struct.pack('<I', len(data)) + data)
+
+    def _read(self, n):
+        buf = b''
+        while len(buf) < n:
+            chunk = self.pipe.read(n - len(buf))
+            if not chunk:
+                raise EOFError('the core closed the pipe')
+            buf += chunk
+        return buf
+
+    def recv(self, timeout):
+        """The next message, or None after timeout seconds"""
+        import ctypes
+        deadline = time.time() + timeout
+        while True:
+            if not self.peek(self.handle, None, 0, None, ctypes.byref(self.available), None):
+                raise EOFError('the core closed the pipe')
+            if self.available.value >= 4:
+                msg = json.loads(self._read(struct.unpack('<I', self._read(4))[0]))
+                if msg.get('type') == 'event' and msg['event']['kind'] in ('rfcomm_data', 'rfcomm_closed'):
+                    self.log.write(f'{time.strftime("%H:%M:%S")} {json.dumps(msg["event"])}\n')
+                return msg
+            if time.time() > deadline:
+                return None
+            time.sleep(0.02)
+
+    def request(self, method, params=None, timeout=30):
+        """(result, error) of a request; the events meanwhile are kept"""
+        self.next_id += 1
+        msg = {'type': 'request', 'id': self.next_id, 'method': method}
+        if params is not None:
+            msg['params'] = params
+        self.send(msg)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            m = self.recv(deadline - time.time())
+            if m is None:
+                break
+            if m.get('type') == 'response' and m.get('id') == self.next_id:
+                self.log.write(f'{time.strftime("%H:%M:%S")} {method} {json.dumps(params)} -> '
+                               f'{json.dumps(m.get("result"))} {json.dumps(m.get("error"))}\n')
+                return m.get('result'), m.get('error')
+            if m.get('type') == 'event':
+                self.events.append(m['event'])
+        raise TimeoutError(f'{method}: no answer in {timeout} s')
+
+    def event(self, kind, timeout, match=lambda value: True):
+        """The first event of this kind (also one kept), or None"""
+        for i, e in enumerate(self.events):
+            if e['kind'] == kind and match(e['value']):
+                return self.events.pop(i)['value']
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            m = self.recv(deadline - time.time())
+            if m is None:
+                break
+            if m.get('type') == 'event':
+                if m['event']['kind'] == kind and match(m['event']['value']):
+                    return m['event']['value']
+                self.events.append(m['event'])
+        return None
+
+
+def rfcomm_client(instance, log):
+    """The 'rfcomm' link case's client: opens the sink's echo service once
+    A2DP is up, gets back what it sends, is refused the hands-free service,
+    closes the channel, then opens another one that must close when the
+    stream stops"""
+    import base64
+    failures = []
+    c = IpcClient(instance, 'emu-rfcomm/1', log)
+    try:
+        if 'rfcomm' not in c.welcome.get('features', []):
+            return [f'IPC: no "rfcomm" in the features: {c.welcome}']
+        # Opens fail with rfcomm.not_connected until the A2DP connection is
+        # up; the stream starts right after it (the log check makes sure)
+        time.sleep(1)
+        deadline = time.time() + 40
+        while True:
+            opened, error = c.request('rfcomm.open', {'address': SINK_ADDRESS, 'uuid': ECHO_UUID})
+            if not error or error['code'] != 'rfcomm.not_connected' or time.time() > deadline:
+                break
+            time.sleep(0.5)
+        if error:
+            return [f'rfcomm.open of the echo service: {error}']
+        channel = opened['channel_id']
+        sent = b'BlueCaster echo\n'
+        _, error = c.request('rfcomm.send', {'channel_id': channel, 'data': base64.b64encode(sent).decode()})
+        if error:
+            failures.append(f'rfcomm.send: {error}')
+        received = b''
+        while len(received) < len(sent):
+            data = c.event('rfcomm_data', 10, lambda v: v['channel_id'] == channel)
+            if data is None:
+                break
+            received += base64.b64decode(data['data'])
+        if received != sent:
+            failures.append(f'echo: sent {sent!r}, received {received!r}')
+        for uuid in ('111E', '0000111f-0000-1000-8000-00805f9b34fb'):
+            opened, error = c.request('rfcomm.open', {'address': SINK_ADDRESS, 'uuid': uuid})
+            if not error or error['code'] != 'rfcomm.service_reserved':
+                failures.append(f'rfcomm.open of {uuid}: {opened} {error}, expected rfcomm.service_reserved')
+        _, error = c.request('rfcomm.close', {'channel_id': channel})
+        if error:
+            failures.append(f'rfcomm.close: {error}')
+        _, error = c.request('rfcomm.send', {'channel_id': channel, 'data': 'AA=='})
+        if not error or error['code'] != 'rfcomm.no_channel':
+            failures.append(f'rfcomm.send after the close: {error}, expected rfcomm.no_channel')
+        # Another channel: it closes with the stream at --duration's end
+        opened, error = c.request('rfcomm.open', {'address': SINK_ADDRESS, 'uuid': ECHO_UUID})
+        if error:
+            return failures + [f'second rfcomm.open: {error}']
+        closed = c.event('rfcomm_closed', 30, lambda v: v['channel_id'] == opened['channel_id'])
+        if closed is None:
+            failures.append('no rfcomm_closed when the stream stopped')
+        elif closed['reason'] not in ('disconnected', 'stopped'):
+            failures.append(f'rfcomm_closed with reason {closed["reason"]} when the stream stopped')
+        else:
+            log.write(f'closed with the stream ({closed["reason"]})\n')
+    except EOFError as e:
+        failures.append(f'IPC: {e}')
+    finally:
+        c.close()
+    return failures
+
+
+def buttons_client(instance, log):
+    """The 'avrcp-keys' link case's client: every press and release of the
+    sink's FAST FORWARD arrives as a media_button event, in order; over the
+    emulator's TCP transport no adapter is in use"""
+    c = IpcClient(instance, 'emu-buttons/1', log)
+    try:
+        failures = []
+        if 'media_button' not in c.welcome.get('features', []):
+            failures.append(f'IPC: no "media_button" in the features: {c.welcome}')
+        adapter = c.snapshot['state']['adapter']
+        if 'active' not in adapter or adapter['active'] is not None:
+            failures.append(f'IPC: adapter.active should be null over TCP: {adapter.get("active", "missing")}')
+        got = []
+        while len(got) < 6:
+            value = c.event('media_button', 30)
+            if value is None:
+                break
+            log.write(f'{time.strftime("%H:%M:%S")} media_button {json.dumps(value)}\n')
+            got.append((value['button'], value['pressed'], value['le_audio']))
+        wanted = [('fast_forward', pressed, False) for _ in range(3) for pressed in (True, False)]
+        if got != wanted:
+            failures.append(f'media_button events {got}, expected {wanted}')
+        return failures
+    except EOFError as e:
+        return [f'IPC: {e}']
+    finally:
+        c.close()
+
+
+# Link cases with an IPC client beside the run: case -> function(instance,
+# log) -> failures, on a thread of its own from the start of bluecaster-core
+LINK_CLIENTS = {'rfcomm': rfcomm_client, 'avrcp-keys': buttons_client}
+
+
 def run_link_case(args, case, port):
     """bluecaster-core --cli with the sink ending or opening links: each pattern
-    of the case is found, or not, in bluecaster.log / sink.log."""
+    of the case is found, or not, in bluecaster.log / sink.log; with an IPC
+    client (LINK_CLIENTS) beside it, its checks too."""
     sink_args, bluecaster_args, checks = LINK_CASES[case]
     out = os.path.join(args.out, 'link-' + case)
     shutil.rmtree(out, ignore_errors=True)
@@ -1387,22 +1894,45 @@ def run_link_case(args, case, port):
     failures = []
     port = free_port(port)
     sink = start_sink(port, os.path.join(out, 'sink.pklg'), os.path.join(out, 'sink.log'), extra=sink_args)
+    client = LINK_CLIENTS.get(case)
+    client_failures = []
     try:
-        env = dict(os.environ, BLUECASTER_CONFIG_DIR=os.path.join(out, 'config'), BLUECASTER_LOG='debug')
+        # A test instance of its own (--ipc serves its pipe): never the
+        # installed core's, nor another run's
+        env = dict(os.environ, BLUECASTER_CONFIG_DIR=os.path.join(out, 'config'), BLUECASTER_LOG='debug',
+                   BLUECASTER_INSTANCE=f'emu-{case}-{port}')
         with open(os.path.join(out, 'bluecaster.log'), 'w', encoding='utf-8', errors='replace') as log:
+            proc = subprocess.Popen(
+                [args.bluecaster, '--cli', '--hci-tcp', f'127.0.0.1:{port}', '-d', SINK_ADDRESS]
+                + ([] if '-c' in bluecaster_args else ['-c', 'sbc'])
+                + ['--test-tone', '--hci-capture', os.path.join(out, 'bluecaster.pklg')] + bluecaster_args,
+                stdout=log, stderr=subprocess.STDOUT, env=env)
+            thread = None
+            if client:
+                def run_client():
+                    with open(os.path.join(out, 'client.log'), 'w', encoding='utf-8') as client_log:
+                        try:
+                            client_failures.extend(client(env['BLUECASTER_INSTANCE'], client_log))
+                        except Exception as e:  # noqa: BLE001 - reported as the case's failure
+                            client_failures.append(f'IPC client: {e!r}')
+                thread = threading.Thread(target=run_client, daemon=True)
+                thread.start()
             try:
-                rc = subprocess.run(
-                    [args.bluecaster, '--cli', '--hci-tcp', f'127.0.0.1:{port}', '-d', SINK_ADDRESS]
-                    + ([] if '-c' in bluecaster_args else ['-c', 'sbc'])
-                    + ['--test-tone', '--hci-capture', os.path.join(out, 'bluecaster.pklg')] + bluecaster_args,
-                    stdout=log, stderr=subprocess.STDOUT, env=env, timeout=120).returncode
+                rc = proc.wait(timeout=120)
             except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
                 rc = 'timeout'
+            if thread:
+                thread.join(30)
+                if thread.is_alive():
+                    client_failures.append('IPC client: still running after BlueCaster exited')
     finally:
         sink.terminate()
         sink.wait(10)
     if rc != 0:
         failures.append(f'BlueCaster exited with {rc} (see bluecaster.log)')
+    failures += client_failures
     for name, pattern, present in checks:
         if bool(re.search(pattern, read_text(os.path.join(out, name)), re.S)) != present:
             failures.append(f'{name}: "{pattern}" {"missing" if present else "found"}')
@@ -1421,7 +1951,20 @@ VOICE_CASES = {
     'lc3swb-msbc': ('mSBC', 8000 / 60),
     'lc3swb-cvsd': ('CVSD', 16000 / 60),
     'msbc-gain': ('mSBC', 8000 / 60),
+    'msbc-agent': ('mSBC', 8000 / 60),
+    'cvsd-agent-killed': ('CVSD', 16000 / 60),
 }
+# Cases with the session agent (--session-agent): the microphone decoded in
+# the core, written to mic.wav by the agent. -killed: the agent killed this
+# many seconds after it opened the microphone's output; the core opens it
+# again through the next agent, whose mic.wav (written anew) holds the tone
+VOICE_AGENT = {'msbc-agent', 'cvsd-agent-killed'}
+VOICE_AGENT_KILL = {'cvsd-agent-killed': 1.5}
+VOICE_AGENT_LINES = ('voice render: the microphone output runs in the session agent (',
+                     '[agent] render: channel opened (1 open)')
+VOICE_AGENT_KILLED_LINES = ('voice render: the session agent was lost, opening the microphone output again',
+                            'voice render: the microphone output runs again in the session agent (1 reopen(s)',
+                            'voice: the uplink capture was lost with the session agent, capturing again')
 # Cases with the microphone's gain (--mic-gain, dB): mic.wav's tone that much louder
 VOICE_MIC_GAIN = {'msbc-gain': 6}
 # Cases that choose the call codec (--voice-codec): the hands-free unit
@@ -1482,6 +2025,30 @@ def pklg_counts(path):
     return counts
 
 
+def start_voice_agent_killer(log_path, delay):
+    """Kills the session agent the core's log names `delay` seconds after
+    it opened the microphone's output (VOICE_AGENT_KILL); .killed tells
+    whether it did"""
+    def run():
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            text = read_text(log_path)
+            started = AGENT_STARTED.findall(text)
+            if started and '[agent] render: channel opened' in text:
+                time.sleep(delay)
+                try:
+                    os.kill(int(started[-1]), signal.SIGTERM)  # TerminateProcess on Windows
+                    thread.killed = True
+                except OSError:
+                    pass
+                return
+            time.sleep(0.05)
+    thread = threading.Thread(target=run, daemon=True)
+    thread.killed = False
+    thread.start()
+    return thread
+
+
 def run_voice_case(args, case, port):
     """bluecaster-core --headset-mic against emu_sink.py --hfp <codec>"""
     codec, rate = VOICE_CASES[case]
@@ -1491,7 +2058,7 @@ def run_voice_case(args, case, port):
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
     failures = []
-    duration = max(args.duration, 10 if roundtrip else 6)
+    duration = max(args.duration, 10 if roundtrip or case in VOICE_AGENT_KILL else 6)
     port = free_port(port)
     src_capture, sink_capture = os.path.join(out, 'bluecaster.pklg'), os.path.join(out, 'sink.pklg')
     mic_wav = os.path.join(out, 'mic.wav')
@@ -1505,9 +2072,16 @@ def run_voice_case(args, case, port):
     gain = VOICE_MIC_GAIN.get(case, 0)
     if gain:
         headset += ['--mic-gain', str(gain)]
+    agent = case in VOICE_AGENT
+    if agent:
+        headset += ['--session-agent']
     sink = start_sink(port, sink_capture, os.path.join(out, 'sink.log'), extra=['--hfp', hf_case])
     try:
         env = dict(os.environ, BLUECASTER_CONFIG_DIR=os.path.join(out, 'config'), BLUECASTER_LOG='debug')
+        if agent:
+            env['BLUECASTER_INSTANCE'] = f'emu-voice-{case}-{port}'  # its own agent pipe
+        killer = (start_voice_agent_killer(os.path.join(out, 'bluecaster.log'), VOICE_AGENT_KILL[case])
+                  if case in VOICE_AGENT_KILL else None)
         with open(os.path.join(out, 'bluecaster.log'), 'w', encoding='utf-8', errors='replace') as log:
             try:
                 rc = subprocess.run(
@@ -1573,6 +2147,13 @@ def run_voice_case(args, case, port):
         failures.append('bluecaster.log: Auto never saw the WAV output as recorded from')
     if roundtrip:
         failures += roundtrip_checks(args, out, sink_capture, bc_log, detail)
+    if agent:
+        lines = VOICE_AGENT_LINES + (VOICE_AGENT_KILLED_LINES if killer else ())
+        failures += [f'bluecaster.log: "{line}" missing' for line in lines if line not in bc_log]
+        if killer and not killer.killed:
+            failures.append('the session agent was not killed')
+    elif 'voice render:' in bc_log:
+        failures.append('bluecaster.log: the microphone went through a session agent without --session-agent')
     return failures, ' | '.join(detail)
 
 
@@ -1655,6 +2236,693 @@ def main_link(args):
     sys.exit(0 if passed == len(results) else 1)
 
 
+HID_ADDRESS = '00:A2:D0:00:00:03'
+# An address on the allow-list that is not the emulated device's
+HID_OTHER_ADDRESS = '00:A2:D0:00:00:09'
+HID_SECONDS = 14
+# emu_hid.py's built-in script: 12 reports, and what BlueCaster's decoder
+# (hid-input decode.rs) makes of them: one event per key or button going
+# down or up (Shift + B down and up: 2 each), one per report that moves the
+# pointer and one per wheel report. The last key stays held: a dropped link
+# releases it, one event more.
+HID_SCRIPT_REPORTS = 12
+HID_SCRIPT_EVENTS = 14
+HID_PSM_CONTROL, HID_PSM_INTERRUPT = 0x0011, 0x0013
+# --hid-leds of the light cases: Num Lock and Scroll Lock
+HID_LEDS = 5
+# In a case's device options: the file run_cli writes the passkey to
+PASSKEY_FILE = '<passkey-file>'
+# The input through a recording input helper (a test switch of debug builds)
+HELPER_RECORD = '--hid-helper-record'
+HELPER_LINE = re.compile(r'^hid helper: (.*)$', re.M)
+# BlueCaster's line with the number to type (printed over --hci-tcp only)
+PASSKEY_LINE = re.compile(r'^hid passkey shown (\d{6})$', re.M)
+
+
+def run_cli(cmd, env, timeout, passkey_file=None):
+    """bluecaster-core with its output read as it comes: (exit code, output).
+    With passkey_file, the number of a "hid passkey shown" line is written
+    there for the emulated keyboard to type."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8',
+                            errors='replace', env=env)
+    lines = []
+
+    def read():
+        for line in proc.stdout:
+            lines.append(line)
+            m = PASSKEY_LINE.match(line.rstrip('\r\n'))
+            if m and passkey_file:
+                with open(passkey_file, 'w', encoding='ascii') as f:
+                    f.write(m.group(1))
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    try:
+        rc = proc.wait(timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(10)
+        rc = 'timeout'
+    reader.join(10)
+    return rc, ''.join(lines)
+
+
+def with_passkey_file(device_args, out):
+    """The device options with PASSKEY_FILE made a path in `out` (None: the
+    case types no passkey)"""
+    if PASSKEY_FILE not in device_args:
+        return device_args, None
+    path = os.path.join(out, 'passkey.txt')
+    if os.path.exists(path):
+        os.remove(path)
+    return [path if a == PASSKEY_FILE else a for a in device_args], path
+
+
+def check_passkey(case, text, emu_text, expect_passkey):
+    """A passkey case: one number shown, typed by the device, then cleared.
+    Any other case: no number shown at all (Just Works as before)."""
+    failures = []
+    shown = PASSKEY_LINE.findall(text)
+    if expect_passkey:
+        if len(shown) != 1:
+            failures.append(f'{len(shown)} "hid passkey shown" line(s), expected 1')
+        if 'hid: typing the passkey and Enter' not in emu_text:
+            failures.append('the device did not type the passkey (see hid.log)')
+        if 'hid passkey cleared' not in text:
+            failures.append('the number was not cleared after pairing')
+        # The number never in a log line, only in the line for the test
+        for d in shown:
+            if any(d in line for line in text.splitlines()
+                   if not PASSKEY_LINE.match(line) and re.search(r'passkey|number|\bpin\b', line, re.I)):
+                failures.append(f'{case}: the passkey appears in another output line')
+                break
+    elif shown or 'hid: asked to type a passkey' in emu_text:
+        failures.append('a number was shown or asked for, expected Just Works')
+    return failures
+
+
+# case: (emu_hid.py options, bluecaster-core options; None: the scan mode)
+HID_CASES = {
+    # --hid-inject: over --hci-tcp the input must still only be counted
+    'hid-connect': ([], ['--hid-device', HID_ADDRESS, '--hid-connect', HID_ADDRESS, '--hid-inject']),
+    'hid-incoming': (['--initiate'], ['--hid-device', HID_ADDRESS]),
+    'hid-refused': (['--initiate'], ['--hid-device', HID_OTHER_ADDRESS]),
+    'hid-release': (['--initiate', '--disconnect-after', '1'], ['--hid-device', HID_ADDRESS]),
+    'hid-off': (['--initiate'], None),
+    # Two runs on one configuration: the device connects by itself and
+    # types at once; the second run decodes from the first report with the
+    # descriptor kept from the first
+    'hid-kept-descriptor': (['--initiate', '--start-delay', '0'], ['--hid-device', HID_ADDRESS]),
+    # The keyboard lights from --hid-leds (Num Lock + Scroll Lock) reach the
+    # device as an output report once it is connected
+    'hid-leds': (['--initiate'], ['--hid-device', HID_ADDRESS, '--hid-leds', str(HID_LEDS)]),
+    # A keyboard that asks for a passkey (keyboard only, MITM): BlueCaster
+    # shows a number, the device types it (PASSKEY_FILE: see run_cli)
+    # Through a real input helper process that records what it would pass
+    # to Windows instead (--hid-helper-record, debug builds only)
+    'hid-incoming-helper': (['--initiate'], ['--hid-device', HID_ADDRESS, HELPER_RECORD]),
+    'hid-release-helper': (['--initiate', '--disconnect-after', '1'], ['--hid-device', HID_ADDRESS, HELPER_RECORD]),
+    'hid-passkey': (['--passkey-file', PASSKEY_FILE],
+                    ['--hid-device', HID_ADDRESS, '--hid-connect', HID_ADDRESS]),
+}
+
+
+def check_helper(cli_args, text, final, expect, held):
+    """With --hid-helper-record: one helper ran and recorded every event
+    (each one of the script maps to a Windows input), Windows "took" them
+    all, nothing was dropped, and `held` keys were still held at the end.
+    Without it: no helper at all."""
+    m = HELPER_LINE.search(text)
+    if HELPER_RECORD not in cli_args:
+        return [f'a helper line without {HELPER_RECORD}: {m.group(0)}'] if m else []
+    if 'is a test switch of debug builds' in text:
+        return [f'{HELPER_RECORD} needs a debug build of bluecaster-core (--bluecaster)']
+    if m is None:
+        return ['no "hid helper:" line (see bluecaster.log)']
+    h = parse_hid_line(m.group(1))
+    failures = []
+    events = final.get('events', 0)
+    if h.get('started') != 1 or h.get('connected') != 1:
+        failures.append(f'helper started={h.get("started")} connected={h.get("connected")}, expected 1 and 1')
+    if h.get('recorded') != events:
+        failures.append(f'the helper recorded {h.get("recorded")} inputs, expected {events} (one per event)')
+    if h.get('held') != held:
+        failures.append(f'{h.get("held")} key(s) held in the record at the end, expected {held}')
+    if final.get('dropped') != 0:
+        failures.append(f'dropped={final.get("dropped")}, expected 0')
+    expect['injected'] = events
+    return failures
+
+
+def check_hid_leds(cli_args, emu_text, final):
+    """The keyboard lights: with --hid-leds the device gets them as output
+    report 1 (one byte, the boot keyboard's bits); without it (dry run, no
+    test lights) nothing is sent"""
+    outputs = [o.strip() for o in re.findall(r'hid: output report ([0-9a-f ]+)', emu_text)]
+    if '--hid-leds' in cli_args:
+        expected = f'01 {HID_LEDS:02x}'
+        if expected not in outputs:
+            return [f'the device got output reports {outputs}, expected "{expected}" (see hid.log)']
+        if final.get('leds', 0) < 1:
+            return [f'leds={final.get("leds")}, expected >= 1']
+        return []
+    if outputs or final.get('leds'):
+        return [f'keyboard lights sent without --hid-leds ({outputs}, leds={final.get("leds")})']
+    return []
+
+
+def l2cap_signals(path):
+    """BR/EDR L2CAP signaling of a PacketLogger capture: (sent, code, data)
+    for connection requests (code 2), their responses (3) and disconnection
+    requests (6); sent is True for what the capture's host sent. Plus the number of HID input reports
+    (DATA | input, 0xA1) the host received on dynamic channels."""
+    signals, reports = [], 0
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+    except OSError:
+        return signals, reports
+    i = 0
+    while i + 13 <= len(data):
+        length, = struct.unpack_from('>I', data, i)
+        kind, payload = data[i + 12], data[i + 13:i + 4 + length]
+        i += 4 + length
+        if kind not in (0x02, 0x03) or len(payload) < 8:
+            continue
+        flags = struct.unpack_from('<H', payload, 0)[0] >> 12 & 0x3
+        if flags == 0x1:
+            continue  # a continuation fragment (these PDUs are all small)
+        cid = struct.unpack_from('<H', payload, 6)[0]
+        body = payload[8:]
+        if cid == 0x0001:
+            j = 0
+            while j + 4 <= len(body):
+                code, _, size = body[j], body[j + 1], struct.unpack_from('<H', body, j + 2)[0]
+                if code in (0x02, 0x03, 0x06):
+                    signals.append((kind == 0x02, code, body[j + 4:j + 4 + size]))
+                j += 4 + size
+        elif cid >= 0x0040 and kind == 0x03 and body[:1] == b'\xa1':
+            reports += 1
+    return signals, reports
+
+
+def hid_channels(signals):
+    """{psm: (initiated by the capture's host, final result)} of the HID
+    channels: the last response to each request (pending ones come first);
+    'closed' when the answering side ended a pending one with a
+    disconnection request instead (BTstack's way of declining a HID device)"""
+    channels = {}
+    for sent, code, d in signals:
+        if code == 0x02 and len(d) >= 4:
+            psm, scid = struct.unpack_from('<HH', d)
+            if psm in (HID_PSM_CONTROL, HID_PSM_INTERRUPT):
+                channels[(not sent, scid)] = [psm, sent, None]
+        elif code == 0x03 and len(d) >= 6:
+            dcid, scid, result = struct.unpack_from('<HHH', d)
+            # The response comes from the side that did not ask. BTstack puts
+            # the asker's CID first when it refuses an unknown PSM.
+            key = (sent, scid) if (sent, scid) in channels else (sent, dcid)
+            if key in channels:
+                channels[key][2] = result
+        elif code == 0x06 and len(d) >= 4:
+            dcid, _ = struct.unpack_from('<HH', d)
+            if (sent, dcid) in channels and channels[(sent, dcid)][2] in (None, 1):
+                channels[(sent, dcid)][2] = 'closed'
+    return {psm: (sent, result) for psm, sent, result in channels.values()}
+
+
+def run_hid_kept_descriptor(args, case, port):
+    """hid-kept-descriptor: the first run may drop the first reports
+    (BTstack reads the descriptor only after the channels are open) and
+    keeps the descriptor; the second decodes every report"""
+    out = os.path.join(args.out, case)
+    shutil.rmtree(out, ignore_errors=True)
+    config = os.path.join(out, 'config')
+    first, detail1 = run_hid_case(args, case, port, os.path.join(out, 'first'), config)
+    # The first run's own failures are expected (undecoded reports): only
+    # that it ran matters
+    first = [f for f in first if not f.startswith(('undecoded=', 'events='))]
+    kept = glob.glob(os.path.join(config, '**', 'hid_descriptors', '*.bin'), recursive=True)
+    if not kept:
+        first.append('no report descriptor kept after the first run')
+    second, detail2 = run_hid_case(args, case, port + 1, os.path.join(out, 'second'), config)
+    if 'report descriptor known' not in read_text(os.path.join(out, 'second', 'bluecaster.log')):
+        second.append('the kept descriptor was not in use when the channels opened')
+    return [f'first run: {f}' for f in first] + [f'second run: {f}' for f in second],         f'first: {detail1}; second: {detail2}'
+
+
+def parse_hid_line(line):
+    return {k: int(v) for k, v in re.findall(r'(\w+)=(\d+)', line)}
+
+
+def run_hid_case(args, case, port, out=None, config=None):
+    """bluecaster-core --cli --hid-test against emu_hid.py"""
+    device_args, cli_args = HID_CASES[case]
+    if case == 'hid-kept-descriptor' and out is None:
+        return run_hid_kept_descriptor(args, case, port)
+    out = out or os.path.join(args.out, case)
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
+    failures = []
+    port = free_port(port)
+    emu_log = os.path.join(out, 'hid.log')
+    device_args, passkey_file = with_passkey_file(device_args, out)
+    emu = start_sink(port, os.path.join(out, 'hid.pklg'), emu_log, script='emu_hid.py',
+                     extra=['--address', HID_ADDRESS] + device_args)
+    seconds = HID_SECONDS if cli_args is not None else SCAN_SECONDS
+    mode = ['--hid-test', str(HID_SECONDS)] + cli_args if cli_args is not None else ['--scan', str(SCAN_SECONDS)]
+    try:
+        env = dict(os.environ, BLUECASTER_CONFIG_DIR=config or os.path.join(out, 'config'), BLUECASTER_LOG='debug')
+        rc, text = run_cli([args.bluecaster, '--cli', '--hci-tcp', f'127.0.0.1:{port}',
+                            '--hci-capture', os.path.join(out, 'bluecaster.pklg')] + mode,
+                           env, seconds + 60, passkey_file)
+        with open(os.path.join(out, 'bluecaster.log'), 'w', encoding='utf-8') as f:
+            f.write(text)
+    finally:
+        emu.terminate()
+        emu.wait(10)
+    emu_text = read_text(emu_log)
+    if rc != 0:
+        failures.append(f'BlueCaster exited with {rc} (see bluecaster.log)')
+    signals, captured_reports = l2cap_signals(os.path.join(out, 'bluecaster.pklg'))
+    channels = hid_channels(signals)
+    sent = re.search(r'hid: sent (\d+) of (\d+) reports', emu_text)
+    sent = int(sent.group(1)) if sent else 0
+
+    if cli_args is None:
+        # Off: nothing answers on the HID PSMs, the device's control
+        # channel is refused as an unknown PSM (0x0002)
+        control = channels.get(HID_PSM_CONTROL)
+        if control is None or control[0]:
+            failures.append(f'no HID control channel request from the device in the capture ({channels})')
+        elif control[1] != 0x0002:
+            failures.append(f'control channel answered {control[1]}, expected 2 (PSM not supported)')
+        if HID_PSM_INTERRUPT in channels:
+            failures.append('an interrupt channel was asked for')
+        if not re.search(r'hid: control channel (refused|failed)', emu_text):
+            failures.append('the device did not report its control channel refused or failed')
+        if re.search(r'^hid', text, re.M):
+            failures.append('HID lines from a core without --hid-*')
+        return failures, f'control channel {channels.get(HID_PSM_CONTROL)}, {captured_reports} reports captured'
+
+    lines = [parse_hid_line(line) for line in text.splitlines() if line.startswith('hid: t=')]
+    final = next((parse_hid_line(line) for line in text.splitlines() if line.startswith('hid final:')), None)
+    if HELPER_RECORD in cli_args and 'is a test switch of debug builds' in text:
+        return [f'{HELPER_RECORD} needs a debug build of bluecaster-core (--bluecaster)'], 'release build'
+    if final is None:
+        return failures + ['no "hid final:" line (see bluecaster.log)'], 'no counts'
+    detail = ' '.join(f'{k}={v}' for k, v in final.items())
+    peak = max((c.get('connected', 0) for c in lines), default=0)
+    expect = {'injected': 0, 'blocked': 0, 'undecoded': 0}
+    if case == 'hid-refused':
+        expect.update(connected=0, reports=0, events=0)
+        if final.get('refused', 0) < 1:
+            failures.append(f'refused={final.get("refused")}, expected >= 1')
+        if peak:
+            failures.append(f'connected={peak} at some point, expected 0 throughout')
+        control = channels.get(HID_PSM_CONTROL)
+        if control is None or control[0] or control[1] in (None, 0, 1):
+            failures.append(f'the control channel was not refused or closed in the capture ({control})')
+        if HID_PSM_INTERRUPT in channels and channels[HID_PSM_INTERRUPT][1] == 0:
+            failures.append('an interrupt channel was accepted')
+        if 'hid: control channel refused' not in emu_text:
+            failures.append('the device did not report its control channel refused')
+    else:
+        release = case in ('hid-release', 'hid-release-helper')
+        expect.update(reports=HID_SCRIPT_REPORTS, events=HID_SCRIPT_EVENTS + release, refused=0,
+                      connected=0 if release else 1)
+        if sent != HID_SCRIPT_REPORTS:
+            failures.append(f'the device sent {sent} reports, expected {HID_SCRIPT_REPORTS} (see hid.log)')
+        if captured_reports != HID_SCRIPT_REPORTS:
+            failures.append(f'{captured_reports} input reports in the capture, expected {HID_SCRIPT_REPORTS}')
+        if peak != 1:
+            failures.append(f'connected={peak} at most, expected 1')
+        by_bluecaster = case in ('hid-connect', 'hid-passkey')
+        for psm in (HID_PSM_CONTROL, HID_PSM_INTERRUPT):
+            ch = channels.get(psm)
+            if ch is None or ch[0] != by_bluecaster or ch[1] != 0:
+                failures.append(f'PSM 0x{psm:04X}: {ch}, expected opened by '
+                                f'{"BlueCaster" if by_bluecaster else "the device"} with result 0')
+        if release:
+            if 'hid: dropping the link' not in emu_text:
+                failures.append('the device did not drop the link')
+            # The key still held at the drop goes up: one event after the reports
+            before = [c for c in lines if c.get('reports') == HID_SCRIPT_REPORTS and c.get('connected') == 1]
+            if not any(c.get('events') == HID_SCRIPT_EVENTS for c in before):
+                failures.append(f'never events={HID_SCRIPT_EVENTS} while connected after the last report')
+    if '--hid-inject' in cli_args and '--hid-inject is not used with --hci-tcp' not in text:
+        failures.append('--hid-inject over --hci-tcp: no word that the input is only counted')
+    if case != 'hid-refused':
+        failures += check_hid_leds(cli_args, emu_text, final)
+        # The script's last key stays held until the link drops
+        failures += check_helper(cli_args, text, final, expect, 0 if release else 1)
+    failures += check_passkey(case, text, emu_text, passkey_file is not None)
+    for key, value in expect.items():
+        if final.get(key) != value:
+            failures.append(f'{key}={final.get(key)}, expected {value}')
+    # Counts only: neither the device's address nor anything typed in the
+    # HID host's own lines
+    for line in text.splitlines():
+        if re.search(r'\bhid\b|keyboards and mice', line, re.I) and HID_ADDRESS in line:
+            failures.append(f'an address in a HID line: {line.strip()[:120]}')
+            break
+    return failures, detail
+
+
+HID_LE_ADDRESS = '00:A2:D0:00:00:05'
+HID_LE_OTHER_ADDRESS = '00:A2:D0:00:00:0A'
+HID_LE_SECONDS = 16
+# case: (emu_hid_le.py options, bluecaster-core options)
+HID_LE_CASES = {
+    # --hid-inject: over --hci-tcp the input must still only be counted
+    'hid-le-connect': ([], ['--hid-le-device', HID_LE_ADDRESS, '--hid-connect', HID_LE_ADDRESS, '--hid-inject']),
+    'hid-le-reconnect': (['--drop-after', '1'], ['--hid-le-device', HID_LE_ADDRESS]),
+    'hid-le-release': (['--drop-after', '1', '--stay-away'], ['--hid-le-device', HID_LE_ADDRESS]),
+    'hid-le-not-listed': ([], ['--hid-le-device', HID_LE_OTHER_ADDRESS]),
+    'hid-le-scan': ([], None),
+    'hid-le-audio-untouched': (['--discover-host'], ['--hid-le-device', HID_LE_ADDRESS, '--hid-connect', HID_LE_ADDRESS]),
+    # The keyboard lights from --hid-leds written to the Output report
+    'hid-le-leds': ([], ['--hid-le-device', HID_LE_ADDRESS, '--hid-leds', str(HID_LEDS)]),
+    # Listed with its first private address ({rpa}: the device's READY
+    # line), it pairs and tells its identity; it drops the link and comes
+    # back with another private address, which only its IRK resolves
+    'hid-le-privacy': (['--privacy', '--drop-after', '1'], ['--hid-le-device', '{rpa}/random']),
+    # A bonded device sends input at once when the link is encrypted again
+    'hid-le-early-report': (['--drop-after', '1', '--report-on-encrypt'], ['--hid-le-device', HID_LE_ADDRESS]),
+    # A keyboard that asks for MITM: BlueCaster shows a number, the device
+    # types it (PASSKEY_FILE: see run_cli)
+    'hid-le-release-helper': (['--drop-after', '1', '--stay-away'], ['--hid-le-device', HID_LE_ADDRESS, HELPER_RECORD]),
+    'hid-le-passkey': (['--passkey-file', PASSKEY_FILE],
+                       ['--hid-le-device', HID_LE_ADDRESS, '--hid-connect', HID_LE_ADDRESS]),
+}
+# The cases with a second link (the device drops the first one and comes back)
+HID_LE_TWO_LINKS = ('hid-le-reconnect', 'hid-le-privacy', 'hid-le-early-report')
+# The services of LE Audio the PC's GATT server has with it on (PACS, ASCS,
+# CAS, CSIS, VCS, MCS / GMCS, TBS / GTBS, TMAS, GMAS, BASS, PBA)
+LE_AUDIO_SERVICES = ['1843', '1844', '1845', '1846', '1848', '1849', '184B', '184C', '184D', '184E', '184F',
+                     '1850', '1853', '1855', '1856', '1858']
+
+
+def le_capture(path):
+    """What BlueCaster's PacketLogger capture shows of LE: SMP Pairing
+    Requests it sent, LE Enable Encryption commands, ATT Write Requests of a
+    CCC value enabling notifications, successful LE (Enhanced) Connection
+    Complete events"""
+    counts = dict(pairing_requests=0, encryptions=0, subscriptions=0, connections=0)
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+    except OSError:
+        return counts
+    i = 0
+    while i + 13 <= len(data):
+        length, = struct.unpack_from('>I', data, i)
+        kind, payload = data[i + 12], data[i + 13:i + 4 + length]
+        i += 4 + length
+        if kind == 0x00 and len(payload) >= 2 and struct.unpack_from('<H', payload, 0)[0] == 0x2019:
+            counts['encryptions'] += 1
+        elif kind == 0x01 and len(payload) >= 4 and payload[0] == 0x3E and payload[2] in (0x01, 0x0A):
+            counts['connections'] += payload[3] == 0
+        elif kind == 0x02 and len(payload) >= 9:
+            cid = struct.unpack_from('<H', payload, 6)[0]
+            body = payload[8:]
+            if cid == 0x0006 and body[:1] == b'\x01':
+                counts['pairing_requests'] += 1
+            elif cid == 0x0004 and len(body) == 5 and body[0] == 0x12 and body[3:5] == b'\x01\x00':
+                counts['subscriptions'] += 1
+    return counts
+
+
+def run_core(args, out, port, mode, emu_args, seconds):
+    """emu_hid_le.py and one bluecaster-core run against it: (exit code,
+    BlueCaster's output, the device's log)"""
+    os.makedirs(out, exist_ok=True)
+    port = free_port(port)
+    emu_log = os.path.join(out, 'hid.log')
+    emu_args, passkey_file = with_passkey_file(emu_args, out)
+    emu = start_sink(port, os.path.join(out, 'hid.pklg'), emu_log, script='emu_hid_le.py',
+                     extra=['--address', HID_LE_ADDRESS] + emu_args)
+    # {rpa}: the first private address the device advertises with
+    rpa = re.search(r'\brpa=(\S+)', emu.ready_line)
+    mode = [m.replace('{rpa}', rpa.group(1) if rpa else '') for m in mode]
+    try:
+        env = dict(os.environ, BLUECASTER_CONFIG_DIR=os.path.join(out, 'config'), BLUECASTER_LOG='debug')
+        rc, text = run_cli([args.bluecaster, '--cli', '--hci-tcp', f'127.0.0.1:{port}',
+                            '--hci-capture', os.path.join(out, 'bluecaster.pklg')] + mode,
+                           env, seconds + 60, passkey_file)
+        with open(os.path.join(out, 'bluecaster.log'), 'w', encoding='utf-8') as f:
+            f.write(text)
+    finally:
+        emu.terminate()
+        emu.wait(10)
+    return rc, text, read_text(emu_log)
+
+
+def run_hid_le_case(args, case, port):
+    """bluecaster-core --cli --hid-test (or the scan modes) against emu_hid_le.py"""
+    device_args, cli_args = HID_LE_CASES[case]
+    out = os.path.join(args.out, case)
+    shutil.rmtree(out, ignore_errors=True)
+    failures = []
+    if cli_args is None:
+        # Keyboards and mice on: listed as one; off (LE Audio's scan): not
+        rc, text, _ = run_core(args, os.path.join(out, 'on'), port, ['--hid-scan', '6'], device_args, 6)
+        on = [line for line in text.splitlines() if line.startswith(HID_LE_ADDRESS)]
+        if rc != 0:
+            failures.append(f'--hid-scan exited with {rc} (see on/bluecaster.log)')
+        if not any('(LE keyboard or mouse, public)' in line for line in on):
+            failures.append(f'--hid-scan did not list the device as an LE keyboard or mouse ({on})')
+        rc, text, _ = run_core(args, os.path.join(out, 'off'), port + 1, ['--scan', '6', '--le-audio'], device_args, 6)
+        off = [line for line in text.splitlines() if line.startswith(HID_LE_ADDRESS)]
+        if rc != 0:
+            failures.append(f'--scan --le-audio exited with {rc} (see off/bluecaster.log)')
+        if off:
+            failures.append(f'listed with keyboards and mice off: {off}')
+        if 'LE Audio: scanning beside the classic scan' not in text:
+            failures.append('the LE Audio scan did not run (no LE scan to leave the device out of)')
+        return failures, f'on: {len(on)} entry, off: {len(off)} entries'
+
+    rc, text, emu_text = run_core(args, out, port, ['--hid-test', str(HID_LE_SECONDS)] + cli_args, device_args,
+                                  HID_LE_SECONDS)
+    if rc != 0:
+        failures.append(f'BlueCaster exited with {rc} (see bluecaster.log)')
+    cap = le_capture(os.path.join(out, 'bluecaster.pklg'))
+    lines = [parse_hid_line(line) for line in text.splitlines() if line.startswith('hid: t=')]
+    final = next((parse_hid_line(line) for line in text.splitlines() if line.startswith('hid final:')), None)
+    if HELPER_RECORD in cli_args and 'is a test switch of debug builds' in text:
+        return [f'{HELPER_RECORD} needs a debug build of bluecaster-core (--bluecaster)'], 'release build'
+    if final is None:
+        return failures + ['no "hid final:" line (see bluecaster.log)'], 'no counts'
+    detail = ' '.join(f'{k}={v}' for k, v in final.items()) + ' ' + ' '.join(f'{k}={v}' for k, v in cap.items())
+    peak = max((c.get('connected', 0) for c in lines), default=0)
+    sent = [int(n) for n in re.findall(r'hid: sent (\d+) of \d+ reports', emu_text)]
+    links = emu_text.count('hid: link up')
+    expect = {'injected': 0, 'blocked': 0, 'undecoded': 0, 'refused': 0}
+    if case == 'hid-le-not-listed':
+        expect.update(connected=0, reports=0, events=0)
+        if peak:
+            failures.append(f'connected={peak} at some point, expected 0 throughout')
+        if links or cap['connections']:
+            failures.append(f'the device was connected to ({links} link(s), {cap["connections"]} in the capture)')
+        if cap['subscriptions']:
+            failures.append(f'{cap["subscriptions"]} subscription(s) in the capture, expected 0')
+    else:
+        rounds = 2 if case in HID_LE_TWO_LINKS else 1
+        released = case in HID_LE_TWO_LINKS or case in ('hid-le-release', 'hid-le-release-helper')
+        # The mouse move sent at once on the second encryption
+        early = 1 if case == 'hid-le-early-report' else 0
+        expect.update(reports=HID_SCRIPT_REPORTS * rounds + early,
+                      events=HID_SCRIPT_EVENTS * rounds + released + early,
+                      connected=0 if case in ('hid-le-release', 'hid-le-release-helper') else 1)
+        if sum(sent) != HID_SCRIPT_REPORTS * rounds:
+            failures.append(f'the device sent {sent} reports, expected {HID_SCRIPT_REPORTS} x {rounds} (see hid.log)')
+        if peak != 1:
+            failures.append(f'connected={peak} at most, expected 1')
+        if links != rounds or cap['connections'] != rounds:
+            failures.append(f'{links} link(s) at the device, {cap["connections"]} in the capture, expected {rounds}')
+        # One pairing; a reconnection encrypts with the stored bond
+        if cap['pairing_requests'] != 1 or emu_text.count('hid: paired') != 1:
+            failures.append(f'{cap["pairing_requests"]} Pairing Request(s), {emu_text.count("hid: paired")} pairing(s) '
+                            'at the device, expected 1')
+        if cap['encryptions'] != rounds:
+            failures.append(f'{cap["encryptions"]} encryption(s), expected {rounds}')
+        if cap['subscriptions'] != 3 * rounds:
+            failures.append(f'{cap["subscriptions"]} subscription(s), expected {3 * rounds}')
+        if released:
+            if 'hid: dropping the link' not in emu_text:
+                failures.append('the device did not drop the link')
+            before = [c for c in lines if c.get('reports') == HID_SCRIPT_REPORTS and c.get('connected') == 1]
+            if not any(c.get('events') == HID_SCRIPT_EVENTS for c in before):
+                failures.append(f'never events={HID_SCRIPT_EVENTS} while connected after the first script')
+        if case in ('hid-le-reconnect', 'hid-le-early-report') and 'connected by itself' not in text:
+            failures.append('no background connection in bluecaster.log')
+        if case == 'hid-le-early-report':
+            if 'hid: sent one report at once on encryption' not in emu_text:
+                failures.append('the device did not send its report at once on the second encryption (see hid.log)')
+            if 'kept input report(s) are listened to' not in text:
+                failures.append('the kept report handles were not listened to on the second link')
+        if case == 'hid-le-privacy':
+            rpas = re.findall(r'hid: advertising with private address \d+ \((\S+)\)', emu_text)
+            if len(rpas) < 2 or len(set(rpas)) != len(rpas):
+                failures.append(f'the device did not come back with another private address ({len(rpas)} seen)')
+            if 'found by its private address connected' not in text:
+                failures.append('the second link was not made from the private address the PC resolved')
+            if 'listed with its identity address from now on' not in text:
+                failures.append('the device was not listed with its identity address after pairing')
+            for line in text.splitlines():
+                if re.search(r'\bhid\b|keyboards? (and|or) m|LE: ', line, re.I) and any(
+                        r.upper() in line.upper() for r in rpas):
+                    failures.append(f'a private address in a HID line: {line.strip()[:120]}')
+                    break
+    if case == 'hid-le-audio-untouched':
+        services = re.search(r'hid: host services (.*)', emu_text)
+        if services is None:
+            failures.append("the device did not read BlueCaster's GATT services (see hid.log)")
+        else:
+            found = [u for u in LE_AUDIO_SERVICES if u in services.group(1).upper()]
+            if found:
+                failures.append(f'LE Audio services in BlueCaster\'s GATT server: {found}')
+            if '1800' not in services.group(1):
+                failures.append(f'GAP service not in what the device read: {services.group(1)[:200]}')
+        if 'LE: modules HOGP' not in text:
+            failures.append('not "LE: modules HOGP" alone in bluecaster.log')
+        for word in ('LE Audio: initializing', 'LE Audio: found', 'LE Audio: ready'):
+            if word in text:
+                failures.append(f'"{word}" in bluecaster.log with LE Audio off')
+    failures += check_passkey(case, text, emu_text, PASSKEY_FILE in device_args)
+    if '--hid-inject' in cli_args and '--hid-inject is not used with --hci-tcp' not in text:
+        failures.append('--hid-inject over --hci-tcp: no word that the input is only counted')
+    if case != 'hid-le-not-listed':
+        failures += check_hid_leds(cli_args, emu_text, final)
+        failures += check_helper(cli_args, text, final, expect, 0)
+    for key, value in expect.items():
+        if final.get(key) != value:
+            failures.append(f'{key}={final.get(key)}, expected {value}')
+    # Counts only: no address in the lines about keyboards and mice
+    for line in text.splitlines():
+        if re.search(r'\bhid\b|keyboards? (and|or) m', line, re.I) and HID_LE_ADDRESS in line.upper():
+            failures.append(f'an address in a HID line: {line.strip()[:120]}')
+            break
+    return failures, detail
+
+
+# The check of a device being added: case -> (LE, sends its script).
+# BlueCaster connects it as the app adds one, with a countdown of
+# HID_CONFIRM_SECONDS from when it is ready.
+HID_CONFIRM_CASES = {
+    'hid-confirm': (False, True),
+    'hid-confirm-silent': (False, False),
+    'hid-le-confirm': (True, True),
+    'hid-le-confirm-silent': (True, False),
+}
+HID_CONFIRM_SECONDS = 4
+
+
+def run_hid_confirm_case(args, case, port):
+    """bluecaster-core --cli --hid-test --hid-connect --hid-confirm against
+    emu_hid.py or emu_hid_le.py, the device with or without its script"""
+    le, types = HID_CONFIRM_CASES[case]
+    out = os.path.join(args.out, case)
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out)
+    failures = []
+    device_args = []
+    if not types:
+        empty = os.path.join(out, 'no-reports.txt')
+        with open(empty, 'w', encoding='ascii') as f:
+            f.write('# no input at all\n')
+        device_args = ['--reports', empty]
+    address = HID_LE_ADDRESS if le else HID_ADDRESS
+    listed = ['--hid-le-device' if le else '--hid-device', address]
+    mode = ['--hid-test', str(HID_LE_SECONDS if le else HID_SECONDS)] + listed + [
+        '--hid-connect', address, '--hid-confirm', str(HID_CONFIRM_SECONDS)]
+    if le:
+        rc, text, emu_text = run_core(args, out, port, mode, device_args, HID_LE_SECONDS)
+    else:
+        port = free_port(port)
+        emu_log = os.path.join(out, 'hid.log')
+        emu = start_sink(port, os.path.join(out, 'hid.pklg'), emu_log, script='emu_hid.py',
+                         extra=['--address', HID_ADDRESS] + device_args)
+        try:
+            env = dict(os.environ, BLUECASTER_CONFIG_DIR=os.path.join(out, 'config'), BLUECASTER_LOG='debug')
+            rc, text = run_cli([args.bluecaster, '--cli', '--hci-tcp', f'127.0.0.1:{port}',
+                                '--hci-capture', os.path.join(out, 'bluecaster.pklg')] + mode,
+                               env, HID_SECONDS + 60)
+            with open(os.path.join(out, 'bluecaster.log'), 'w', encoding='utf-8') as f:
+                f.write(text)
+        finally:
+            emu.terminate()
+            emu.wait(10)
+        emu_text = read_text(emu_log)
+    if rc != 0:
+        failures.append(f'BlueCaster exited with {rc} (see bluecaster.log)')
+    lines = text.splitlines()
+    final = next((parse_hid_line(line) for line in lines if line.startswith('hid final:')), None)
+    if final is None:
+        return failures + ['no "hid final:" line (see bluecaster.log)'], 'no counts'
+    checks = [line.strip() for line in lines if line.startswith('hid check ')]
+    detail = f'{" / ".join(checks) or "no check lines"}; ' + ' '.join(f'{k}={v}' for k, v in final.items())
+    if 'hid check waiting' not in checks:
+        failures.append('no "hid check waiting": the countdown never started')
+    if types:
+        if checks[-1:] != ['hid check confirmed']:
+            failures.append(f'expected "hid check confirmed" last, got {checks}')
+        expect = dict(connected=1, reports=HID_SCRIPT_REPORTS, events=HID_SCRIPT_EVENTS)
+        # Still connected until the test ends (the link goes down at exit)
+        after = lines[next((i for i, line in enumerate(lines) if line == 'hid check confirmed'), len(lines)):]
+        if any(parse_hid_line(line).get('connected') != 1 for line in after if line.startswith('hid: t=')):
+            failures.append('a confirmed device was disconnected during the test')
+    else:
+        if checks[-1:] != ['hid check removed no_input']:
+            failures.append(f'expected "hid check removed no_input" last, got {checks}')
+        expect = dict(connected=0, reports=0, events=0)
+        if 'hid: link down' not in emu_text:
+            failures.append('the device was not disconnected after the countdown (see hid.log)')
+        if 'the new device is removed again (no_input)' not in text:
+            failures.append('no log line of the removal')
+        # Not before the countdown ran out: the removal comes after a count
+        # line of at least HID_CONFIRM_SECONDS
+        removed_at = next((i for i, line in enumerate(lines) if line.startswith('hid check removed')), None)
+        seconds = [int(m.group(1)) for line in lines[:removed_at or 0] if (m := re.match(r'hid: t=(\d+)', line))]
+        if removed_at is not None and max(seconds, default=0) < HID_CONFIRM_SECONDS:
+            failures.append(f'removed after {max(seconds, default=0)} s, before the {HID_CONFIRM_SECONDS} s countdown')
+    for key, value in expect.items():
+        if final.get(key) != value:
+            failures.append(f'{key}={final.get(key)}, expected {value}')
+    for line in lines:
+        if re.search(r'\bhid\b|keyboards? (and|or) m', line, re.I) and address in line.upper():
+            failures.append(f'an address in a HID line: {line.strip()[:120]}')
+            break
+    return failures, detail
+
+
+def main_hid(args):
+    known = list(HID_CASES) + list(HID_LE_CASES) + list(HID_CONFIRM_CASES)
+    wanted = args.hid or known
+    unknown = [n for n in wanted if n not in known]
+    if unknown:
+        sys.exit(f'Unknown HID case(s) {unknown}; known: {known}')
+    results = []
+    for index, case in enumerate(wanted):
+        print(f'--- {case} ...', flush=True)
+        run = (run_hid_confirm_case if case in HID_CONFIRM_CASES
+               else run_hid_le_case if case in HID_LE_CASES else run_hid_case)
+        failures, detail = run(args, case, args.base_port + 600 + 2 * index)
+        # The recording helper exists in debug builds only: with the whole
+        # suite on a release build these cases are skipped, asked for by
+        # name they fail
+        if detail == 'release build' and not args.hid:
+            print('    SKIP  needs a debug build of bluecaster-core')
+            continue
+        results.append((case, failures))
+        print(f'    {"PASS" if not failures else "FAIL"}  {detail}')
+        for failure in failures:
+            print(f'      - {failure}')
+    passed = sum(1 for _, f in results if not f)
+    print(f'\n{passed}/{len(results)} HID cases passed. Details: {args.out}')
+    sys.exit(0 if passed == len(results) else 1)
+
+
 def main():
     parser = argparse.ArgumentParser(description='End-to-end A2DP test of BlueCaster against a virtual sink')
     parser.add_argument('--codecs', nargs='+', choices=CODECS + list(NEGOTIATION),
@@ -1662,6 +2930,8 @@ def main():
                         help='codecs and negotiation cases (%(default)s)')
     parser.add_argument('--le-audio', nargs='*', metavar='CASE',
                         help='run the LE Audio cases instead (default: all of them)')
+    parser.add_argument('--auracast', nargs='*', metavar='CASE',
+                        help='run the Auracast cases instead (default: all of them)')
     parser.add_argument('--scan', nargs='*', metavar='CASE',
                         help=f'run the device scan cases instead ({", ".join(SCAN_CASES)}; default: all of them)')
     parser.add_argument('--link', nargs='*', metavar='CASE',
@@ -1670,6 +2940,10 @@ def main():
                         help=f'run the HFP audio cases instead ({", ".join(VOICE_CASES)}; default: all of them)')
     parser.add_argument('--le-pairing', nargs='*', metavar='CASE',
                         help=f'run the dual-mode pairing cases instead ({", ".join(LE_PAIRING_CASES)}; '
+                             'default: all of them)')
+    parser.add_argument('--hid', nargs='*', metavar='CASE',
+                        help='run the keyboard and mouse cases instead '
+                             f'({", ".join(list(HID_CASES) + list(HID_LE_CASES) + list(HID_CONFIRM_CASES))}; '
                              'default: all of them)')
     parser.add_argument('--duration', type=int, default=5, help='seconds of streaming per codec')
     parser.add_argument('--max-packet', type=int, help='passed to BlueCaster --max-packet (default: its own)')
@@ -1688,12 +2962,15 @@ def main():
                        (args.bluecaster, 'build BlueCaster'), (args.decoder, 'build bluecaster_decode')):
         voice_decodes = args.voice is not None and any(c.endswith('-roundtrip') for c in args.voice or VOICE_CASES)
         if path == args.decoder and (args.scan is not None or args.link is not None or args.le_pairing is not None
+                                     or args.hid is not None or args.auracast is not None
                                      or (args.voice is not None and not voice_decodes)):
-            continue  # a scan streams nothing, a link or voice case decodes nothing (but a round trip)
+            continue  # a scan or HID case streams nothing, a link or voice case decodes nothing (but a round trip)
         if not os.path.exists(path):
             sys.exit(f'Missing {path} ({hint})')
     if args.le_audio is not None:
         main_le(args)
+    if args.auracast is not None:
+        main_auracast(args)
     if args.scan is not None:
         main_scan(args)
     if args.link is not None:
@@ -1702,6 +2979,8 @@ def main():
         main_voice(args)
     if args.le_pairing is not None:
         main_le_pairing(args)
+    if args.hid is not None:
+        main_hid(args)
 
     results = []
     for index, codec in enumerate(args.codecs):

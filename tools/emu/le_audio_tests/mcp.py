@@ -23,6 +23,10 @@ the commands are only logged, nothing reaches the media players of the PC.
                      notifications (CCC values persist for a bonded client)
     mcp-ccid         both earbuds get CCID List [CCID_GMCS] and Streaming
                      Audio Contexts Media in the Enable metadata
+    mcp-read-agent, mcp-control-agent
+                     mcp-read and mcp-control with --session-agent: the
+                     simulated player runs in the session agent, its state
+                     reaches the core as events, the commands as requests
 """
 
 import re
@@ -54,6 +58,12 @@ CASES = [
     Case('mcp-resume', 'stereo', STEREO,
          sink_args=['--mcp-client', '--mcp-resume', '--drop-link-after', '4'],
          bluecaster_args=['--mcp-dry-run'], tags=('mcp', 'mcp-resume'), streams=2, lossy=True, duration=14),
+    Case('mcp-read-agent', 'stereo', STEREO, sink_args=['--mcp-client', '--mcp-check-db-hash'],
+         bluecaster_args=['--mcp-dry-run', '--session-agent'], tags=('mcp', 'mcp-read', 'mcp-agent')),
+    Case('mcp-control-agent', 'stereo', STEREO,
+         sink_args=['--mcp-client', '--mcp-mtu', '64',
+                    '--mcp-ops', 'play,pause!,next,prev,move-relative:1500,stop'],
+         bluecaster_args=['--mcp-dry-run', '--session-agent'], tags=('mcp', 'mcp-control', 'mcp-agent'), duration=8),
 ]
 
 
@@ -214,6 +224,21 @@ def _check_resume(ctx):
     return failures
 
 
+def _check_agent(ctx):
+    """The simulated player ran in the session agent, not in the core"""
+    bluecaster = ctx['bluecaster_log']
+    failures = []
+    if 'MCP: watching the media session through the session agent (agent 1)' not in bluecaster:
+        failures.append('the core did not watch the media session through the agent')
+    if '[agent] media: watching the media session (dry run true)' not in bluecaster:
+        failures.append('the agent did not watch the media session as a dry run')
+    if '[agent] MCP: dry run: simulated player' not in bluecaster:
+        failures.append('the simulated player did not start in the agent')
+    if re.search(r'(?<!\[agent\] )MCP: dry run: ', bluecaster):
+        failures.append('the core ran a simulated player itself')
+    return failures
+
+
 def check(case, ctx):
     if 'mcp' not in case.tags:
         return []
@@ -223,7 +248,7 @@ def check(case, ctx):
     failures += _check_ccid(ctx)
     for tag, fn in (('mcp-read', _check_read), ('mcp-control', _check_control),
                     ('mcp-unsupported', _check_unsupported), ('mcp-long-read', _check_long_read),
-                    ('mcp-resume', _check_resume)):
+                    ('mcp-resume', _check_resume), ('mcp-agent', _check_agent)):
         if tag in case.tags:
             failures += fn(ctx)
     return failures

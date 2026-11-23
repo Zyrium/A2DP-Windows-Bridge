@@ -977,6 +977,29 @@ SOFTWARE.
 
 ---
 
+## 22. Developer firmware: tools/nrf5340-hci (Zephyr)
+
+`tools/nrf5340-hci/` is the source of a firmware that makes an nRF5340 DK a
+USB Bluetooth controller for testing Auracast. It is a developer tool:
+**it is not part of the release** and is only built from source with the
+nRF Connect SDK, which is not in this repository.
+
+These files are modified copies of Zephyr sources (nRF Connect SDK v3.4.1)
+and stay under **Apache-2.0** only, not the project's `Apache-2.0 OR MIT`
+(§13):
+
+| File | Copied from | Copyright |
+|------|-------------|-----------|
+| `src/bt_hci_iso.c` | `zephyr/subsys/usb/device_next/class/bt_hci.c` | Intel Corporation; Nordic Semiconductor ASA |
+| `src/main.c` | `zephyr/samples/bluetooth/hci_usb/src/main.c` | Intel Corporation |
+| `CMakeLists.txt`, `prj.conf`, `sysbuild/hci_ipc_ll_sw.conf` | the `hci_usb` and `hci_ipc` samples' build files | Zephyr project contributors |
+
+Each keeps its copyright and `SPDX-License-Identifier: Apache-2.0` header
+where the original has one, and `src/bt_hci_iso.c` states what was changed
+(Apache-2.0 §4(b)). The Apache-2.0 text is in `LICENSE-APACHE`.
+
+---
+
 ## License Compatibility Matrix
 
 | Component | License | Compatible with Apache-2.0 / MIT? | Notes |
@@ -994,6 +1017,7 @@ SOFTWARE.
 | rijndael | Public domain | Yes | — |
 | tinydir | BSD-2-Clause | Yes | Permissive; notice reproduced in §7 |
 | liblc3 | Apache-2.0 | Yes | Permissive (§17) |
+| Zephyr sources in `tools/nrf5340-hci` | Apache-2.0 | Yes | Source only, not in the release; those files stay Apache-2.0 (§22) |
 | micro-ecc | BSD-2-Clause | Yes | Permissive; notice shipped as `licenses/third-party/micro-ecc-LICENSE.txt` (§18) |
 | Rust crates | Apache-2.0, MIT, BSD, ISC, Zlib, Unicode-3.0, CDLA-Permissive-2.0, MPL-2.0 | Yes | Texts in `licenses/third-party/rust-crates.txt`; MPL-2.0 files stay under MPL (§9) |
 | SolidJS, @tauri-apps/api, Fluent UI System Icons | MIT (Apache-2.0 OR MIT) | Yes | Permissive |

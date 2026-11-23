@@ -70,6 +70,9 @@ pub type GattDone = Box<dyn FnOnce(&mut LeCtx<'_>, u8)>;
 /// Completion of a read: the status and the whole value (long reads
 /// included)
 pub type GattValue = Box<dyn FnOnce(&mut LeCtx<'_>, u8, &[u8])>;
+/// Completion of a read by type: the status and (handle, value) of every
+/// attribute found
+pub type GattValues = Box<dyn FnOnce(&mut LeCtx<'_>, u8, Vec<(u16, Vec<u8>)>)>;
 /// A notification / indication value
 pub type GattNotify = Box<dyn FnMut(&mut LeCtx<'_>, &[u8])>;
 /// Completion of a discovery: the status and the services
@@ -79,6 +82,8 @@ pub type GattDiscovered = Box<dyn FnOnce(&mut LeCtx<'_>, u8, Vec<GattService>)>;
 /// tests). Each starts one query and returns its BTstack status.
 pub(crate) trait GattBackend {
     fn read_long(&self, con: u16, value_handle: u16) -> u8;
+    /// Every attribute of a type in a handle range (descriptors too)
+    fn read_by_type(&self, con: u16, start_handle: u16, end_handle: u16, uuid16: u16) -> u8;
     /// With response; a long write when the value does not fit the MTU
     fn write(&self, con: u16, value_handle: u16, value: &[u8]) -> u8;
     /// Write command (ATT Write Without Response): no answer comes back
@@ -92,6 +97,10 @@ pub(crate) trait GattBackend {
 impl GattBackend for Stack {
     fn read_long(&self, con: u16, value_handle: u16) -> u8 {
         self.gatt_read_long_value(con, value_handle)
+    }
+
+    fn read_by_type(&self, con: u16, start_handle: u16, end_handle: u16, uuid16: u16) -> u8 {
+        self.gatt_read_by_type(con, start_handle, end_handle, uuid16)
     }
 
     fn write(&self, con: u16, value_handle: u16, value: &[u8]) -> u8 {
@@ -134,6 +143,7 @@ pub(crate) enum Completion {
     Value { done: Option<GattValue>, status: u8, value: Vec<u8>, handle: u16 },
     Done { done: Option<GattDone>, status: u8, handle: u16 },
     Discovered { done: Option<GattDiscovered>, status: u8, services: Vec<GattService> },
+    Values { done: Option<GattValues>, status: u8, values: Vec<(u16, Vec<u8>)> },
     Notify { con: u16, handle: u16, value: Vec<u8> },
 }
 
@@ -160,6 +170,12 @@ impl Completion {
                     f(ctx, status, services)
                 }
             }
+            Completion::Values { done, status, values } => {
+                tracing::trace!("LE Audio: GATT read by type done (0x{status:02x}), {} value(s)", values.len());
+                if let Some(f) = done {
+                    f(ctx, status, values)
+                }
+            }
             Completion::Notify { con, handle, value } => {
                 tracing::trace!("LE Audio: GATT notification 0x{handle:04X} on 0x{con:04X}: {value:02X?}");
                 let Some(mut listeners) = ctx.core.gatt.take_listeners(con, handle) else { return };
@@ -175,7 +191,7 @@ impl Completion {
     fn summary(&self) -> (u16, u8) {
         match self {
             Completion::Value { status, handle, .. } | Completion::Done { status, handle, .. } => (*handle, *status),
-            Completion::Discovered { status, .. } => (0, *status),
+            Completion::Discovered { status, .. } | Completion::Values { status, .. } => (0, *status),
             Completion::Notify { handle, .. } => (*handle, 0),
         }
     }
@@ -248,6 +264,13 @@ enum Op {
         value: Vec<u8>,
         done: Option<GattDone>,
     },
+    ReadByType {
+        start: u16,
+        end: u16,
+        uuid16: u16,
+        values: Vec<(u16, Vec<u8>)>,
+        done: Option<GattValues>,
+    },
     Subscribe {
         chr: GattChar,
         config: u16,
@@ -278,6 +301,10 @@ impl Op {
             }
             Op::Write { handle, value, .. } => b.write(con, *handle, value),
             Op::WriteNoResponse { handle, value, .. } => b.write_without_response(con, *handle, value),
+            Op::ReadByType { start, end, uuid16, values, .. } => {
+                values.clear();
+                b.read_by_type(con, *start, *end, *uuid16)
+            }
             // A characteristic with room for one descriptor only: that is
             // its CCC (mandatory with notify / indicate), written without
             // looking for it first (one ATT round trip less)
@@ -313,6 +340,11 @@ impl Op {
                         value.resize(end, 0);
                     }
                     value[v.offset as usize..end].copy_from_slice(v.value);
+                }
+            }
+            Op::ReadByType { values, .. } => {
+                if let Some((_, handle, v)) = events::gatt_characteristic_value_query_result(packet) {
+                    values.push((handle, v.to_vec()));
                 }
             }
             Op::Discover { services, index, .. } => {
@@ -391,6 +423,7 @@ impl Op {
             Op::Write { handle, done, .. } | Op::WriteNoResponse { handle, done, .. } => {
                 Completion::Done { done, status, handle }
             }
+            Op::ReadByType { values, done, .. } => Completion::Values { done, status, values },
             Op::Subscribe { chr, done, .. } => Completion::Done { done, status, handle: chr.value_handle },
             Op::Discover { services, done, .. } => Completion::Discovered { done, status, services },
             Op::Barrier { done } => Completion::Done { done, status, handle: 0 },
@@ -421,6 +454,13 @@ impl GattClient {
     /// MTU)
     pub fn read(&mut self, con: u16, value_handle: u16, done: GattValue) {
         self.enqueue(con, Op::Read { handle: value_handle, value: Vec::new(), done: Some(done) });
+    }
+
+    /// Every attribute of type `uuid16` in a handle range, with its handle
+    /// (ATT Read By Type: finds descriptors without discovering them). No
+    /// such attribute: status 0x0A (Attribute Not Found).
+    pub fn read_by_type(&mut self, con: u16, start: u16, end: u16, uuid16: u16, done: GattValues) {
+        self.enqueue(con, Op::ReadByType { start, end, uuid16, values: Vec::new(), done: Some(done) });
     }
 
     /// Write with response (a long write when the value does not fit the
@@ -540,6 +580,8 @@ impl GattClient {
                     Op::WriteNoResponse { handle, value, .. } => {
                         format!("write-no-resp 0x{handle:04X} {value:02X?}")
                     }
+                    Op::ReadByType { start, end, uuid16, .. } =>
+                        format!("read by type 0x{uuid16:04X} in 0x{start:04X}-0x{end:04X}"),
                     Op::Subscribe { chr, config, .. } => format!("CCC 0x{config:04X} of 0x{:04X}", chr.value_handle),
                     Op::Discover { .. } => "discovery".to_string(),
                     Op::Barrier { .. } => "barrier".to_string(),
@@ -667,6 +709,9 @@ mod tests {
     impl GattBackend for Fake {
         fn read_long(&self, con: u16, h: u16) -> u8 {
             self.answer(format!("read {con:x} {h:x}"))
+        }
+        fn read_by_type(&self, con: u16, s: u16, e: u16, u: u16) -> u8 {
+            self.answer(format!("type {con:x} {s:x}-{e:x} {u:x}"))
         }
         fn write(&self, con: u16, h: u16, v: &[u8]) -> u8 {
             self.answer(format!("write {con:x} {h:x} {v:?}"))
@@ -803,6 +848,28 @@ mod tests {
         assert_eq!(summaries(&mut g), [(0x10, 0x1F)]);
         g.pump_all(&b);
         assert!(b.calls().is_empty());
+    }
+
+    #[test]
+    fn read_by_type_collects_every_attribute_found() {
+        let b = Fake::default();
+        let mut g = GattClient::new();
+        g.attach(0x40);
+        g.read_by_type(0x40, 0x10, 0x30, 0x2908, Box::new(|_, _, _| {}));
+        g.pump_all(&b);
+        assert_eq!(b.calls(), ["type 40 10-30 2908"]);
+        let value = |h: u8, v: [u8; 2]| {
+            [GATT_EVENT_CHARACTERISTIC_VALUE_QUERY_RESULT, 0, 0x40, 0, 0, 0, 0, 0, h, 0, 2, 0, v[0], v[1]]
+        };
+        g.on_event(&b, &value(0x14, [1, 1]));
+        g.on_event(&b, &value(0x18, [2, 1]));
+        g.on_event(&b, &complete(0x40, 0));
+        match &g.take_ready()[..] {
+            [Completion::Values { status: 0, values, .. }] => {
+                assert_eq!(values, &[(0x14, vec![1, 1]), (0x18, vec![2, 1])])
+            }
+            _ => panic!("expected the values"),
+        }
     }
 
     #[test]

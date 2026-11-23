@@ -3,9 +3,9 @@
 //!
 //! One SDU set is one SDU per CIS for the same frame interval (10 or 7.5
 //! ms), in plan order. The encode thread (pipeline) pushes sets; the
-//! BTstack thread (bt-host iso_send) pops one per round on
-//! HCI_EVENT_CIS_CAN_SEND_NOW. bt-host shares the queue between the two
-//! behind a mutex (`LeSduSink`).
+//! BTstack thread (bt-host iso_send) pops one per SDU interval (unicast)
+//! or per round of HCI_EVENT_BIS_CAN_SEND_NOW (broadcast). bt-host shares
+//! the queue between the two behind a mutex (`LeSduSink`).
 //!
 //! Buffering: before audio starts and after an underrun the queue holds
 //! sets back until it has `prefill` of them: queue depth + 3 at first, one
@@ -13,8 +13,9 @@
 //! ([`CAPACITY`]) drops the oldest set. While nothing can be popped the
 //! sender sends the encoded silence set ([`SduQueue::silence`]).
 //!
-//! The guard keeps the sent sets at most queue depth + 2 intervals ahead
-//! of real time (the controller queue takes queue-depth sets at once).
+//! The guard keeps the broadcast's rounds at most queue depth + 2
+//! intervals ahead of real time (the controller queue takes queue-depth
+//! sets at once).
 //!
 //! No allocation per round: [`SduQueue::configure`] reserves the queue and
 //! a pool of spare sets shaped like the silence set. The encode thread

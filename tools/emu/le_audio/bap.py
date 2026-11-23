@@ -15,7 +15,9 @@ released ASE whose CIS is still up stays in Releasing until the client
 disconnects the CIS (as many real servers do; Bumble's ASCS goes to Idle
 by itself). --available-contexts-after S: no sink context available until
 S seconds after the LE connection (then all, notified), so Enable has to
-wait for it.
+wait for it. --reject-enable: every Enable is rejected with Unspecified
+Error (0x0E) in QoS Configured, as Pixel Buds Pro 2 did while their classic
+link was up: the CIG is set but no CIS was ever created.
 """
 
 import asyncio
@@ -52,6 +54,8 @@ def add_arguments(parser):
                         help='keep a released ASE in Releasing until the client drops its CIS')
     parser.add_argument('--available-contexts-after', type=float, metavar='SECONDS',
                         help='no available sink context until SECONDS after the LE connection')
+    parser.add_argument('--reject-enable', action='store_true',
+                        help='reject every Enable with Unspecified Error (0x0E)')
 
 
 def patch_release(sink, ascs, ase, wait_for_cis):
@@ -103,6 +107,12 @@ def patch_release(sink, ascs, ase, wait_for_cis):
     ase.on_cis_disconnection = on_cis_disconnection
 
 
+def reject_enable(sink, ase):
+    """--reject-enable: Enable of an ASE in QoS Configured refused"""
+    log.info('%s: rejecting Enable of ASE %d (--reject-enable)', sink.name, ase.ase_id)
+    return (AseResponseCode.UNSPECIFIED_ERROR, AseReasonCode.NONE)
+
+
 def configure_sink(sink, args):
     device = sink.device
     record = PacRecord(
@@ -150,6 +160,8 @@ def configure_sink(sink, args):
     for ase in ascs.ase_state_machines.values():
         ase.on('state_change', lambda ase=ase: log.info('%s: ASE %d -> %s', sink.name, ase.ase_id, ase.state.name))
         patch_release(sink, ascs, ase, getattr(args, 'ascs_release_waits_for_cis', False))
+        if getattr(args, 'reject_enable', False):
+            ase.on_enable = lambda metadata, ase=ase: reject_enable(sink, ase)
 
     # ASCS: general announcement, available sink contexts, no metadata;
     # CAS: general announcement

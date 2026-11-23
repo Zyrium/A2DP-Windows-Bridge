@@ -106,6 +106,9 @@ pub struct LogOptions {
     /// Retention, the daily cap and verbose logging that stays on, as the
     /// settings have them at start (`Settings::log`)
     pub dev: DevLog,
+    /// The session agent: its lines go to the connected core
+    /// (session_host::LogForwardLayer), to the console only while none is
+    pub agent: bool,
 }
 
 /// Keeps the file writer's worker running; drop it last (at exit) so the
@@ -253,9 +256,15 @@ pub fn init(opts: &LogOptions) -> LogGuard {
         }
         None => (None, None),
     };
-    let console_layer = opts
-        .console
-        .then(|| tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_target(false).with_timer(timer));
+    let agent = opts.agent;
+    let console_layer = opts.console.then(|| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_target(false)
+            .with_timer(timer)
+            .with_filter(tracing_subscriber::filter::filter_fn(move |_| !agent || !session_host::agent::forwarding()))
+    });
+    let forward_layer = opts.agent.then_some(session_host::LogForwardLayer);
 
     let hub = hub();
     hub.set_clock(offset);
@@ -263,6 +272,7 @@ pub fn init(opts: &LogOptions) -> LogGuard {
         .with(filter)
         .with(file_layer)
         .with(console_layer)
+        .with(forward_layer)
         .with(BroadcastLayer::new(hub.clone()))
         .try_init();
     if installed.is_err() {
@@ -292,7 +302,12 @@ fn log_header(verbose: Option<VerboseState>, dev: &DevLog) {
         std::env::consts::ARCH,
         std::process::id(),
         audio_capture::windows_build(),
-        std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
+        // The service's log names no path
+        if bluecaster_core::paths::service_mode() {
+            "service".to_string()
+        } else {
+            std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
+        }
     );
     if let Ok(env) = std::env::var("BLUECASTER_LOG") {
         tracing::info!("log filter BLUECASTER_LOG={env}");

@@ -225,10 +225,13 @@ export function LogPanel(props: { view: LogView }) {
           {t("ui.diag.clear")}
         </Button>
         <span class="log-tools-gap" />
-        <span class="hint">{t("ui.diag.logs_unmasked")}</span>
-        <Button icon="folder_open" kind="subtle" disabled={!logDir()} onClick={() => void core.transport.openFolder(logDir())}>
-          {t("ui.diag.open_logs")}
-        </Button>
+        {/* None while the core runs as a service: its log folder is protected */}
+        <Show when={logDir()}>
+          <span class="hint">{t("ui.diag.logs_unmasked")}</span>
+          <Button icon="folder_open" kind="subtle" onClick={() => void core.transport.openFolder(logDir())}>
+            {t("ui.diag.open_logs")}
+          </Button>
+        </Show>
       </div>
       <div class="log" ref={box} role="log" aria-live="off" tabindex="0" aria-label={t("dbgc.section_log")} onKeyDown={onLogKey}>
         <Show when={shown().length > 0} fallback={<p class="muted empty-line">{t("ui.diag.no_log")}</p>}>

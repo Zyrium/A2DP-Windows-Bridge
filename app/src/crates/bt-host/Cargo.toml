@@ -13,6 +13,8 @@ codec.workspace = true
 le-audio.workspace = true
 # dpapi.rs: the pairing keys encrypted at rest
 win-sys.workspace = true
+# hid.rs: keyboard and mouse reports to Windows input (experimental)
+hid-input.workspace = true
 tracing.workspace = true
 rtrb.workspace = true
 

@@ -1,0 +1,15 @@
+[package]
+name = "pcm-link"
+description = "Audio between two processes: a lock-free ring in shared memory, a wake event, and length-prefixed JSON control frames"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+win-sys.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

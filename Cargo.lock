@@ -225,8 +225,11 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audio-capture"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
+ "pcm-link",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
@@ -340,14 +343,16 @@ dependencies = [
 
 [[package]]
 name = "bluecaster-core"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "audio-capture",
  "bt-host",
  "codec",
  "dsp",
  "hci-transport",
+ "hid-input",
  "if-addrs",
+ "input-helper",
  "ipc",
  "le-audio",
  "pipeline",
@@ -355,6 +360,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "session-host",
  "sha2",
  "socket2",
  "thiserror 2.0.21",
@@ -363,12 +369,11 @@ dependencies = [
  "ureq",
  "voice-link",
  "win-sys",
- "windows",
 ]
 
 [[package]]
 name = "bluecaster-core-exe"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "audio-capture",
  "base64 0.22.1",
@@ -381,10 +386,12 @@ dependencies = [
  "embed-resource",
  "flate2",
  "hci-transport",
+ "input-helper",
  "ipc",
  "qcy-protocol",
  "serde",
  "serde_json",
+ "session-host",
  "sha2",
  "tao",
  "time",
@@ -399,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "bluecaster-driver"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "embed-resource",
  "serde",
@@ -411,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "bluecaster-ui"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "ipc",
  "serde",
@@ -486,11 +493,12 @@ dependencies = [
 
 [[package]]
 name = "bt-host"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "btstack-sys",
  "codec",
  "hci-transport",
+ "hid-input",
  "le-audio",
  "rtrb",
  "tracing",
@@ -499,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "btstack-sys"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "cc",
  "extern-version",
@@ -675,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "codec"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "aptx-adaptive",
  "btstack-sys",
@@ -712,9 +720,9 @@ dependencies = [
 
 [[package]]
 name = "cookie"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
 dependencies = [
  "time",
  "version_check",
@@ -1077,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "dsp"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "nnnoiseless",
  "serde",
@@ -1219,7 +1227,7 @@ dependencies = [
 
 [[package]]
 name = "extern-version"
-version = "3.0.2"
+version = "3.0.4"
 
 [[package]]
 name = "fastrand"
@@ -1238,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "fdkaac-sys"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "cc",
  "codec",
@@ -1323,9 +1331,9 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -1730,7 +1738,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hci-transport"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "btstack-sys",
  "nusb",
@@ -1761,6 +1769,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hid-input"
+version = "3.0.4"
+dependencies = [
+ "thiserror 2.0.21",
+ "tracing",
+ "win-sys",
+]
 
 [[package]]
 name = "html5ever"
@@ -2058,6 +2075,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "input-helper"
+version = "3.0.4"
+dependencies = [
+ "hid-input",
+ "tokio",
+ "tracing",
+ "win-sys",
+]
+
+[[package]]
 name = "io-kit-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2069,13 +2096,14 @@ dependencies = [
 
 [[package]]
 name = "ipc"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "ts-rs",
+ "win-sys",
 ]
 
 [[package]]
@@ -2311,14 +2339,14 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lc3-sys"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "ldac-sys"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "cc",
  "extern-version",
@@ -2326,14 +2354,14 @@ dependencies = [
 
 [[package]]
 name = "le-audio"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "tracing",
 ]
 
 [[package]]
 name = "lhdcv5-sys"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "cc",
  "extern-version",
@@ -2932,7 +2960,7 @@ dependencies = [
 
 [[package]]
 name = "openaptx-sys"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "cc",
  "extern-version",
@@ -2952,7 +2980,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "opus-sys"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "cc",
  "extern-version",
@@ -3037,6 +3065,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pcm-link"
+version = "3.0.4"
+dependencies = [
+ "serde",
+ "serde_json",
+ "win-sys",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3103,7 +3140,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pipeline"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "bt-host",
  "codec",
@@ -3313,7 +3350,7 @@ dependencies = [
 
 [[package]]
 name = "qcy-protocol"
-version = "3.0.2"
+version = "3.0.4"
 
 [[package]]
 name = "quick-error"
@@ -3936,6 +3973,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "170fb83ab34de17dc69aa7c67482b22218ddb85da56546f9bd6b929e32a05930"
 dependencies = [
  "stable_deref_trait",
+]
+
+[[package]]
+name = "session-host"
+version = "3.0.4"
+dependencies = [
+ "audio-capture",
+ "ipc",
+ "le-audio",
+ "pcm-link",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "voice-link",
+ "win-sys",
+ "windows",
 ]
 
 [[package]]
@@ -5151,9 +5208,9 @@ dependencies = [
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",
@@ -5218,7 +5275,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voice-link"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "audio-capture",
  "btstack-sys",
@@ -5506,7 +5563,7 @@ dependencies = [
 
 [[package]]
 name = "win-sys"
-version = "3.0.2"
+version = "3.0.4"
 dependencies = [
  "nusb",
  "thiserror 2.0.21",

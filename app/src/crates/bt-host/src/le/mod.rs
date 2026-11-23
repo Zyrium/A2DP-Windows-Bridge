@@ -147,6 +147,8 @@ pub struct LeRequest {
     pub mic_rate: Option<u32>,
 }
 
+pub use le_audio::broadcast::BroadcastLayout;
+
 /// What a broadcast was asked for (`stream.start_broadcast`, `--auracast`)
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LeBroadcast {
@@ -156,6 +158,11 @@ pub struct LeBroadcast {
     pub code: Option<String>,
     /// One mono BIS instead of left and right
     pub mono: bool,
+    /// The channels and broadcasts (Mono when `mono`)
+    pub layout: le_audio::broadcast::BroadcastLayout,
+    /// A matrix layout's rear at another preset (same frame duration);
+    /// None: the request's
+    pub rear_preset: Option<String>,
 }
 
 /// One advertiser seen by [`crate::BtHost::le_scan`] /
@@ -232,6 +239,11 @@ pub struct LeStreamStats {
     /// Sets the buffer fills before sending audio (queue + 3, growing to
     /// queue + 7 after underruns)
     pub prefill: u32,
+    /// SDUs dropped unsent: their CIS had no room in the controller in
+    /// time (or the send failed)
+    pub late_sdus: u64,
+    /// CIS that are up but had no SDU completed for 2 s (the others play)
+    pub cis_stalled: u32,
 }
 
 /// A device as the worker sees it (a copy; v1 DeviceInfo)

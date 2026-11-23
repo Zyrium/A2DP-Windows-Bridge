@@ -39,8 +39,10 @@ const MAX_VALUE: usize = 2048;
 const ENTRY_LEN: usize = 60;
 const ENTRY_LEN_SIGNED: usize = 100;
 
+/// "BTD" + index, but not "BTDB", att_server's Database Hash (le_device_db
+/// has no index 66, see btstack_config.h)
 fn is_bond_tag(tag: u32) -> bool {
-    tag >> 8 == u32::from_be_bytes([0, b'B', b'T', b'D'])
+    tag >> 8 == u32::from_be_bytes([0, b'B', b'T', b'D']) && tag != u32::from_be_bytes(*b"BTDB")
 }
 
 /// The bonds with an LTK in the file `path`; Err when it cannot be read
@@ -89,6 +91,26 @@ pub fn parse(data: &[u8]) -> Vec<StoredLeBond> {
     let mut entries = entries(data);
     entries.sort_by_key(|(t, _)| *t);
     entries.into_iter().filter(|(t, _)| is_bond_tag(*t)).filter_map(|(_, v)| entry(&v)).collect()
+}
+
+/// Drops the bonds of the identity `addr` from the file `path` while no
+/// stack holds it (a running one deletes through BTstack instead:
+/// [`crate::BtHost::forget_le_bond`]). Returns how many were dropped; a
+/// missing file has none.
+pub fn forget(path: &Path, addr: &[u8; 6]) -> std::io::Result<usize> {
+    let data = match win_sys::dpapi::read_secret(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut kept = entries(&data);
+    let before = kept.len();
+    kept.retain(|(t, v)| !(is_bond_tag(*t) && entry(v).is_some_and(|b| b.addr == *addr)));
+    let dropped = before - kept.len();
+    if dropped > 0 {
+        win_sys::dpapi::write_secret(path, &format(&kept))?;
+    }
+    Ok(dropped)
 }
 
 /// The LE TLV of a running stack: in memory, the whole file rewritten
@@ -274,6 +296,59 @@ mod tests {
         assert_eq!(bonds.len(), 1);
         assert_eq!(bonds[0].ltk, [0x33; 16]);
         assert_eq!(TlvFile::open(&file).entries, vec![(BTD1, bond_value(b, 0x33, false))]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file of a build with 16 bonds, all taken, and att_server's 256 CCC
+    /// values: every entry comes out and goes back as it was
+    #[test]
+    fn a_full_file_of_16_bonds_is_kept() {
+        use btstack_sys::TlvStore;
+        let dir = std::env::temp_dir().join(format!("bluecaster-tlv-16-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("le_audio_bonds.tlv");
+        let tag = |t: &[u8; 3], i: u8| u32::from_be_bytes([t[0], t[1], t[2], i]);
+        let mut held: Vec<(u32, Vec<u8>)> =
+            (0..16).map(|i| (tag(b"BTD", i), bond_value([0xC0, 1, 2, 3, 4, i], 0x20 + i, false))).collect();
+        held.extend((0..=255).map(|n| (tag(b"BTC", n), vec![n, 0, 0, 0, 9, 0, 1, n % 16])));
+        // The Database Hash, whose tag looks like that of bond 66
+        held.push((u32::from_be_bytes(*b"BTDB"), vec![0xAB; 16]));
+        held.push((tag(b"AWS", 2), vec![1]));
+        win_sys::dpapi::write_secret(&file, &tlv(&held)).unwrap();
+
+        assert_eq!(read(&file).unwrap().len(), 16);
+        assert_eq!(held.iter().filter(|(t, _)| is_bond_tag(*t)).count(), 16);
+        let mut store = TlvFile::open(&file);
+        assert_eq!(store.entries, held);
+        // The last bond there is room for now
+        store.store(tag(b"BTD", 63), &bond_value([0xC0, 1, 2, 3, 4, 63], 0x77, false));
+        let bonds = read(&file).unwrap();
+        assert_eq!(bonds.len(), 17);
+        assert_eq!(bonds[16].ltk, [0x77; 16]);
+        assert_eq!(TlvFile::open(&file).entries[..held.len()], held[..]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_forgotten_bond_leaves_the_file() {
+        let dir = std::env::temp_dir().join(format!("bluecaster-tlv-forget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("le_audio_bonds.tlv");
+        assert_eq!(forget(&file, &[1; 6]).unwrap(), 0);
+        let a = [0xC0, 1, 2, 3, 4, 5];
+        let b = [0xD0, 1, 2, 3, 4, 5];
+        let gatt = u32::from_be_bytes(*b"GATT");
+        let data = tlv(&[(BTD0, bond_value(a, 0x22, false)), (gatt, vec![1]), (BTD1, bond_value(b, 0x33, false))]);
+        win_sys::dpapi::write_secret(&file, &data).unwrap();
+        assert_eq!(forget(&file, &a).unwrap(), 1);
+        assert_eq!(forget(&file, &a).unwrap(), 0);
+        let bonds = read(&file).unwrap();
+        assert_eq!(bonds.len(), 1);
+        assert_eq!(bonds[0].addr, b);
+        // Other entries stay
+        assert_eq!(TlvFile::open(&file).entries.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -135,6 +135,7 @@ python tools/emu/run_test.py                        # every codec and negotiatio
 |:-------|:------------|
 | `--codecs sbc aac ...` | 只测试这些编解码器（`sbc sbcxq aac aptx aptxhd aptxll ldac lhdcv5 faststream opus opus05`）或协商用例（采样率、低 bitpool、SBC 帧配置、aptX Adaptive 等；`-h` 会列出它们）；默认：全部 |
 | `--le-audio [case ...]` | 改为运行 LE Audio 用例（默认：全部） |
+| `--auracast [case ...]` | 改为运行 Auracast 用例（默认：全部） |
 | `--scan [case ...]` | 改为运行设备扫描用例（`eir`、`name-request`） |
 | `--link [case ...]` | 改为运行链路用例（`disconnect`、`device-link`、`device-a2dp`、`device-stream`、`restart-on-link`） |
 | `--duration <s>` | 每种编解码器的串流秒数（默认 5） |

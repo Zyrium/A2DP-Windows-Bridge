@@ -12,6 +12,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { version = "1", features = ["io-util", "net"] }
 ts-rs = { version = "12", features = ["serde-json-impl"] }
+# service_state.rs: the service manager's record, Program Files, file versions
+win-sys.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "net", "rt", "macros"] }

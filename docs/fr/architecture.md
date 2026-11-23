@@ -186,7 +186,7 @@ flowchart TD
 |:-------|:---------|:-----|
 | capture | MMCSS « Audio » | Lit WASAPI ; comble les passages silencieux par du silence |
 | encode | MMCSS « Pro Audio » | Convertit le PCM dans le format d'entrée de l'encodeur, encode des blocs d'encodeur complets (le reste attend le tour suivant) et regroupe les trames en charges utiles média, par tours d'environ 10 ms, pour que les paquets partent régulièrement |
-| bt-runloop | -- | La boucle d'exécution de BTstack ; envoie un paquet en file d'attente dès que L2CAP le permet. À chaque mise en file d'un paquet, la file d'envoi (64 paquets) abandonne les paquets qui ont attendu 350 ms, les plus anciens d'abord |
+| bt-runloop | -- | La boucle d'exécution de BTstack ; envoie un paquet en file d'attente dès que L2CAP le permet. À chaque mise en file d'un paquet, la file d'envoi (64 paquets) abandonne les paquets qui ont attendu 350 ms (100 ms avec la faible latence LHDC V5), les plus anciens d'abord |
 | USB | -- | Transferts WinUSB : trois lectures en cours sur chaque pipe IN (événements, données ACL), un écrivain pour les commandes et un pour les données ACL (jusqu'à 8 transferts en cours) |
 | core | Normale | Machine à états, IPC (tokio ; les files du relais RFCOMM par connexion), paramètres, statistiques (4 Hz), recherche de mises à jour |
 
@@ -425,7 +425,7 @@ quand il se termine.
 
 | Encodeur | Bibliothèque | Débit | Caractéristiques |
 |---------|---------|---------|----------|
-| LHDC V5 | lhdcv5-enc (portage en C de l'encodeur AOSP) | 400/500/900/1000 kbps (Basse/Moyenne/Moyenne-haute/Haute), au plus le maximum annoncé par le récepteur, ABR 160–400 kbps | 16/24 bits, trames de 5 ms, en-tête de charge utile média de 2 octets, en-tête RTP |
+| LHDC V5 | lhdcv5-enc (portage en C de l'encodeur AOSP) | 400/500/900/1000 kbps (Basse/Moyenne/Moyenne-haute/Haute), au plus le maximum annoncé par le récepteur, ABR 160–400 kbps | 16/24 bits, trames de 5 ms, en-tête de charge utile média de 2 octets, en-tête RTP ; faible latence si le récepteur l'annonce (encode toutes les 10 ms au lieu de 20 ; avec ABR désactivé, ajoute la protection de file ci-dessous) |
 | LDAC | libldac (AOSP) | 330/660/990 kbps | Modes Haute/Moyenne/Basse (HQ/SQ/MQ), ABR |
 | aptX Adaptive | aptx-adaptive (encodeur en Rust pur d'AKS-Logic/aptx-adaptive-linux, MIT) | 427 kbps en Haute, 265 kbps en Faible latence (récepteurs R2 : 270) ; l'ABR descend à 364/318 (R2 : 270/204) | 48 kHz stéréo (96 kHz en Haute si vous le choisissez, vers un récepteur R2 qui l'annonce : 646/340/255 kbps), 24 bits ; un paquet codec par paquet média derrière l'en-tête RTP propre à BlueCaster ; ABR en Haute ; Auto le classe après LHDC V5 et LDAC |
 | Opus | libopus 1.6.1 | 256 kbps (stéréo ; mono : moitié) | Opus A2DP d'Android : 48 kHz, trames de 20 ms (10 ms si le récepteur ne propose que cela), VBR contraint plafonné à la charge utile média, une trame par paquet, en-tête de charge utile média de 1 octet, en-tête RTP |
@@ -436,6 +436,12 @@ quand il se termine.
 | SBC XQ | le même encodeur SBC | ~385/505/552 kbps | Dual channel, bitpool 47 / 43 à 44,1 / 48 kHz (Haute) ; uniquement si le SBC du récepteur autorise le dual channel et un bitpool d'au moins 29 (le bitpool est alors plafonné au maximum du récepteur, comme PipeWire) ; partage le stream endpoint, l'en-tête de charge utile média et l'en-tête RTP de SBC |
 | SBC | Portage en Rust de l'encodeur Bluedroid | jusqu'à ~345 kbps | Base A2DP obligatoire ; identique bit à bit à l'encodeur C (testé sur toutes les configurations) |
 | FastStream | le même encodeur SBC | 198/216 kbps (44.1/48 kHz) | Codec constructeur CSR, sens musique uniquement (pas de voie retour vocale) : SBC joint stereo bitpool 29, trames complétées à 72 octets, 3 par paquet, sans en-tête de charge utile média ni en-tête RTP (comme PipeWire) ; jamais choisi par Auto |
+
+**Protection de file LHDC V5** (faible latence activée, ABR désactivé) : tant que
+la file d'envoi contient en moyenne 12 paquets ou plus sur une seconde, l'encodeur
+descend d'un niveau (1000, 900, puis 500 kbps), à au moins 2 s d'intervalle. Après
+une minute calme, il remonte d'un niveau. Si une remontée ne tient pas 30 s,
+l'attente double, jusqu'à 10 minutes.
 
 Tous les encodeurs implémentent le trait `codec::Encoder` : ils indiquent le format PCM
 et le nombre de trames consommées par appel, et renvoient des trames codec.
@@ -474,8 +480,10 @@ Tailles des Information Elements des codecs (y compris les 6 octets de Vendor ID
   fréquences d'échantillonnage (0x20 44.1k, 0x10 48k, 0x04 96k, 0x01 192k), octet 7 profondeur de bits
   (0x04 16 bits, 0x02 24 bits) et limites de débit min/max du récepteur, octet 8
   sous-version du codec (0x01 = V5 ver.1) et 0x10 = trames de 5 ms, octets 9-10
-  fonctions optionnelles (low latency, lossless, JAS, AR, META), dont aucune
-  n'est proposée par BlueCaster. Stéréo uniquement. Les limites de débit du récepteur sont renvoyées dans la
+  fonctions optionnelles (low latency, lossless, JAS, AR, META). BlueCaster demande
+  la faible latence (octet 9, 0x40) quand Faible latence est activé dans les réglages
+  LHDC V5 et que le récepteur l'annonce. BlueCaster ne propose aucune des autres
+  fonctions. Stéréo uniquement. Les limites de débit du récepteur sont renvoyées dans la
   configuration et appliquées à l'encodeur, comme le fait Android. Les paquets média
   portent un en-tête de charge utile de 2 octets : nombre de trames << 2 (bits de latence à 0) et un
   numéro de séquence
@@ -522,6 +530,7 @@ ci-dessous :
 | `profiles.json` | Profils |
 | `devices\devices.txt` | Appareils connus |
 | `devices\le_audio_devices.txt` | LE Audio : les entrées LE Audio de la liste des appareils |
+| `devices\le_audio_sets.txt` | LE Audio : les ensembles coordonnés des appareils enregistrés (seulement les adresses des membres ; les deux écouteurs d'une paire forment un seul appareil) |
 | `devices\device_codecs.json` | Ce que chaque appareil classique a proposé lors de sa dernière connexion (et si des écouteurs OPPO se sont vu demander le Hi-Res) |
 | `pairing\link_keys.txt` | Clés de liaison : les casques associés avec la v1 ou la 2.0.x se reconnectent sans nouvelle association |
 | `pairing\le_audio_bonds.tlv`, `pairing\le_audio_csip.txt` | LE Audio : les liaisons LE (avec les valeurs CCC persistantes du serveur GATT) et les ensembles coordonnés |

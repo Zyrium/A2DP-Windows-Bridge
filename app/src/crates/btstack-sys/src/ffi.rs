@@ -42,6 +42,17 @@ unsafe extern "C" {
     pub fn bluecaster_sco_request_can_send_now(sco_handle: u16);
     pub fn bluecaster_sco_packet_length(sco_handle: u16) -> u16;
     pub fn bluecaster_hfp_ag_deinit();
+    pub fn bluecaster_hid_host_init();
+    pub fn bluecaster_hid_host_deinit();
+    pub fn bluecaster_hid_host_connect(addr: *const u8, out_cid: *mut u16) -> u8;
+    pub fn bluecaster_hid_pairing_target(addr: *const u8);
+    pub fn bluecaster_sm_passkey_display(display: c_int);
+    pub fn bluecaster_hid_host_accept(hid_cid: u16) -> u8;
+    pub fn bluecaster_hid_host_decline(hid_cid: u16) -> u8;
+    pub fn bluecaster_hid_host_disconnect(hid_cid: u16);
+    pub fn bluecaster_hid_host_descriptor(hid_cid: u16, out: *mut u8, max: u16) -> u16;
+    pub fn bluecaster_hid_host_send_output(hid_cid: u16, report_id: u16, data: *const u8, len: u16) -> u8;
+    pub fn bluecaster_hid_host_output_closed(hid_cid: u16);
     pub fn bluecaster_rfcomm_init();
     pub fn bluecaster_rfcomm_deinit();
     pub fn bluecaster_rfcomm_create_channel(addr: *const u8, server_channel: u8, out_cid: *mut u16) -> u8;
@@ -223,6 +234,10 @@ unsafe extern "C" {
     pub fn bluecaster_gap_connection_type(con: u16) -> c_int;
     pub fn bluecaster_gap_delete_bonding(addr_type: u8, addr: *const u8);
     pub fn bluecaster_cmd_disconnect(handle: u16, reason: u8) -> u8;
+    pub fn bluecaster_gap_auto_connection_start(addr_type: u8, addr: *const u8) -> u8;
+    pub fn bluecaster_gap_auto_connection_stop_all() -> u8;
+    pub fn bluecaster_gap_connection_scan(interval: u16, window: u16);
+    pub fn bluecaster_le_supported() -> c_int;
 
     // ---- shim.c: TLV ----
     pub fn bluecaster_tlv_get(tag: u32, buffer: *mut u8, size: u32) -> c_int;
@@ -234,6 +249,7 @@ unsafe extern "C" {
     pub fn bluecaster_gatt_find_included_services(con: u16, start: u16, end: u16) -> u8;
     pub fn bluecaster_gatt_discover_characteristics(con: u16, start: u16, end: u16) -> u8;
     pub fn bluecaster_gatt_read_long_value(con: u16, value_handle: u16) -> u8;
+    pub fn bluecaster_gatt_read_by_type(con: u16, start: u16, end: u16, uuid16: u16) -> u8;
     pub fn bluecaster_gatt_write_value(
         con: u16,
         value_handle: u16,
@@ -279,6 +295,7 @@ unsafe extern "C" {
     // ---- shim.c: broadcast ----
     #[allow(clippy::too_many_arguments)]
     pub fn bluecaster_broadcast_advertise(
+        slot: u8,
         sid: u8,
         adv_interval_min: u16,
         adv_interval_max: u16,
@@ -290,7 +307,7 @@ unsafe extern "C" {
         pa_len: u16,
         out_handle: *mut u8,
     ) -> u8;
-    pub fn bluecaster_broadcast_advertise_stop() -> u8;
+    pub fn bluecaster_broadcast_advertise_stop(slot: u8) -> u8;
     #[allow(clippy::too_many_arguments)]
     pub fn bluecaster_big_create(
         big_handle: u8,
@@ -337,6 +354,8 @@ unsafe extern "C" {
     pub fn sm_le_device_index(con: u16) -> c_int;
 
     // ---- BTstack: LE device DB ----
+    pub fn bluecaster_ccc_tag(slot: u32) -> u32;
+    pub fn bluecaster_ccc_slots() -> u32;
     pub fn le_device_db_max_count() -> c_int;
     pub fn le_device_db_add(addr_type: c_int, addr: *mut u8, irk: *mut u8) -> c_int;
     #[allow(clippy::too_many_arguments)]

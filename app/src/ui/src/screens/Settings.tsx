@@ -114,14 +114,21 @@ export function Settings() {
       </Section>
 
       <Section title={t("ui.settings.startup")}>
-        <Toggle label={t("settings.start_with_windows")} checked={s().start_with_windows} onChange={(v) => set({ start_with_windows: v })} />
+        {/* The service add-on starts with Windows whatever this says: on
+            and not changeable while connected to it */}
+        <Toggle
+          label={t("settings.start_with_windows")}
+          checked={s().start_with_windows || snap().service_mode}
+          disabled={snap().service_mode}
+          onChange={(v) => set({ start_with_windows: v })}
+        />
         {/* At logon: on starts BlueCaster with --background (only the tray
             icon), off opens the window; it applies only with Windows */}
         <Toggle
           label={t("ui.settings.start_minimized")}
           hint={t("ui.settings.start_minimized_logon")}
           checked={s().start_minimized}
-          disabled={!s().start_with_windows}
+          disabled={!s().start_with_windows || snap().service_mode}
           onChange={(v) => set({ start_minimized: v })}
         />
         <Toggle label={t("settings.minimize_to_tray")} checked={s().minimize_to_tray} onChange={(v) => set({ minimize_to_tray: v })} />
@@ -191,7 +198,7 @@ export function Settings() {
                 <Match when={phase().state === "unavailable" && phase()}>
                   {(p) => {
                     const reason = (p() as Extract<UpdatePhase, { state: "unavailable" }>).reason;
-                    return <div class="hint">{t(reason === "unsigned" ? "ui.update.unsigned" : "ui.update.portable")}</div>;
+                    return <div class="hint">{t(reason === "portable" ? "ui.update.portable" : "ui.update.unsigned")}</div>;
                   }}
                 </Match>
                 <Match when={phase().state === "downloading" && phase()}>
@@ -233,15 +240,18 @@ export function Settings() {
           checked={s().developer_mode}
           onChange={(v) => set({ developer_mode: v })}
         />
-        <div class="row">
-          <span class="row-text">
-            <span class="row-label">{t("ui.settings.config_folder")}</span>
-            <span class="hint mono">{snap().config_dir}</span>
-          </span>
-          <Button icon="folder_open" onClick={() => core.transport.openFolder(snap().config_dir)}>
-            {t("ui.settings.open_config_folder")}
-          </Button>
-        </div>
+        {/* A core that runs as a service keeps its folder protected */}
+        <Show when={!snap().service_mode}>
+          <div class="row">
+            <span class="row-text">
+              <span class="row-label">{t("ui.settings.config_folder")}</span>
+              <span class="hint mono">{snap().config_dir}</span>
+            </span>
+            <Button icon="folder_open" onClick={() => core.transport.openFolder(snap().config_dir)}>
+              {t("ui.settings.open_config_folder")}
+            </Button>
+          </div>
+        </Show>
         <div class="row">
           <span class="row-text">
             <span class="row-label">{t("ui.setup.title")}</span>
@@ -265,7 +275,16 @@ export function Settings() {
         danger
         onConfirm={() => {
           setQuitting(false);
-          void app.run(() => core.request("app.quit"));
+          void app.run(async () => {
+            try {
+              await core.request("app.quit");
+            } catch (e) {
+              // A core that runs as a service stays: app.close closes the
+              // window and the tray icon instead
+              if (IpcError.from(e).code !== "ipc.not_in_service") throw e;
+              await core.request("app.close");
+            }
+          });
         }}
         onCancel={() => setQuitting(false)}
       >

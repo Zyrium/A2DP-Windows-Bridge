@@ -1,0 +1,32 @@
+[package]
+name = "session-host"
+description = "The core's session-bound work behind one facade: done in this process, or in the session agent over a named pipe (requests, events, PCM channels)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+audio-capture.workspace = true
+pcm-link.workspace = true
+# render: the headset microphone's renderer (WASAPI, drift control) and WAV file
+voice-link.workspace = true
+# The instance suffix of the pipe name, and the frame format
+ipc.workspace = true
+win-sys.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# agent.rs: the layer that forwards the agent's log lines to the core
+tracing-subscriber.workspace = true
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "io-util", "macros"] }
+# media: LE Audio's media control model and the Windows media session
+# (WinRT, safe API)
+le-audio.workspace = true
+windows = { version = "0.62", features = ["Foundation", "ApplicationModel", "Media_Control"] }
+# handover: the local time in the names of the files given to the user
+time = { version = "0.3", features = ["local-offset"] }
+
+[lints]
+workspace = true

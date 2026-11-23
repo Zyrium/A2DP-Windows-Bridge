@@ -3,4 +3,8 @@
 /**
  * One codec's settings in a profile (Profile.codec_settings)
  */
-export type CodecValues = { quality: string, sample_rate: number, bit_depth: number, abr: boolean, sbc_bitpool: number, sbcxq_bitpool: number, sbc_min_bitpool: number, sbcxq_min_bitpool: number, sbc_blocks: number, sbc_subbands: number, sbc_allocation: string, sbc_channel_mode: string, unlisted_options: boolean, };
+export type CodecValues = { quality: string, sample_rate: number, bit_depth: number, abr: boolean, 
+/**
+ * LHDC V5: low latency asked for (issue #543)
+ */
+lhdcv5_low_latency: boolean, sbc_bitpool: number, sbcxq_bitpool: number, sbc_min_bitpool: number, sbcxq_min_bitpool: number, sbc_blocks: number, sbc_subbands: number, sbc_allocation: string, sbc_channel_mode: string, unlisted_options: boolean, };

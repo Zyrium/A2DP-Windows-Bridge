@@ -135,6 +135,7 @@ Ein Codec gilt als bestanden, wenn alle folgenden Bedingungen erfüllt sind:
 |:-------|:------------|
 | `--codecs sbc aac ...` | Nur diese Codecs testen (`sbc sbcxq aac aptx aptxhd aptxll ldac lhdcv5 faststream opus opus05`) oder Aushandlungsfälle (Abtastraten, niedrige Bitpools, SBC-Frame-Aufbauten, aptX Adaptive, ...; `-h` listet sie auf); Standard: alle |
 | `--le-audio [case ...]` | Stattdessen die Fälle für LE Audio ausführen (Standard: alle) |
+| `--auracast [case ...]` | Stattdessen die Fälle für Auracast ausführen (Standard: alle) |
 | `--scan [case ...]` | Stattdessen die Fälle der Gerätesuche ausführen (`eir`, `name-request`) |
 | `--link [case ...]` | Stattdessen die Verbindungsfälle ausführen (`disconnect`, `device-link`, `device-a2dp`, `device-stream`, `restart-on-link`) |
 | `--duration <s>` | Sekunden Streaming pro Codec (Standard 5) |

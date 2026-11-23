@@ -386,9 +386,7 @@ describe("Diagnostics", () => {
     expect(
       screen.getByText("Output Source").closest(".lq-row"),
     ).toHaveTextContent("Default device");
-    expect(view.container.querySelector(".lq-group .hint")).toHaveTextContent(
-      /^Output source format: \d+ Hz/,
-    );
+    expect(screen.getByText("Format").closest(".lq-row")).toHaveTextContent(/^Format\d+ Hz \/ \d+-bit$/);
   });
 
   it("shows the device's chip to everyone and the link's details in developer mode only", async () => {

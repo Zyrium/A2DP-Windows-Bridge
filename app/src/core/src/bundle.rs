@@ -96,8 +96,16 @@ pub fn create(state: &CoreState, mask: bool, hci: bool) -> Result<DiagBundle, St
     let path = dir.join(format!("bluecaster-diag-{stamp}.zip"));
     std::fs::write(&path, &data).map_err(|e| format!("{}: {e}", path.display()))?;
     prune(&dir);
-    tracing::info!("diagnostic bundle: {files} files, {} bytes -> {}", data.len(), path.display());
-    Ok(DiagBundle { path: path.display().to_string(), bytes: data.len() as u64, files })
+    if paths::service_mode() {
+        tracing::info!("diagnostic bundle: {files} files, {} bytes", data.len());
+    } else {
+        tracing::info!("diagnostic bundle: {files} files, {} bytes -> {}", data.len(), path.display());
+    }
+    // Service mode: the user's copy (the core's folder is protected)
+    let path = crate::handover::for_user(session_host::handover::Kind::Bundle, &path, &data, || {
+        "the bundle could not be given to the user".to_string()
+    })?;
+    Ok(DiagBundle { path, bytes: data.len() as u64, files })
 }
 
 /// The zip path of a file of the settings folder: its path there, with /
@@ -348,10 +356,10 @@ fn system_text(config: &Path) -> String {
     }
 
     s.push_str("\n== Audio output devices ==\n");
-    match audio_capture::render_devices() {
+    match session_host::devices::render_devices() {
         Ok(devices) => {
             for d in devices {
-                let mix = audio_capture::mix_format(Some(&d.id));
+                let mix = session_host::devices::mix_format(Some(&d.id));
                 let _ = writeln!(
                     s,
                     "{}{}{}: {}",

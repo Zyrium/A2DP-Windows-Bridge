@@ -44,6 +44,12 @@ function fakeTransport() {
     },
     async updateInstall() {},
     onUpdatePhase() {},
+    async serviceState() {
+      return { state: "not_added" };
+    },
+    async serviceSetup() {
+      return { outcome: "done", service: { state: "not_added" } };
+    },
   };
   return {
     transport,
@@ -168,6 +174,18 @@ describe("core store", () => {
     expect(core.link()).toHaveLength(1);
     // ...and the next state event is still in order
     f.event(6, { kind: "scanning", value: true });
+    expect(f.calls.filter((c) => c.method === "state.snapshot")).toHaveLength(0);
+  });
+
+  it("ignores headphone buttons, which carry no revision of their own", async () => {
+    const f = fakeTransport();
+    const core = createRoot(() => createCore(f.transport));
+    await tick();
+    f.send({ type: "snapshot", rev: 5, state: sampleSnapshot() });
+    f.event(5, { kind: "media_button", value: { button: "play", pressed: true, le_audio: false } });
+    expect(core.state.rev).toBe(5);
+    f.event(6, { kind: "scanning", value: true });
+    expect(core.state.snap?.scanning).toBe(true);
     expect(f.calls.filter((c) => c.method === "state.snapshot")).toHaveLength(0);
   });
 

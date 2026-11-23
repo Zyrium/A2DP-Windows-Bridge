@@ -87,6 +87,9 @@ pub struct Profile {
     #[serde(default = "hq")]
     pub quality: String,
     pub abr: bool,
+    /// LHDC V5: low latency asked for (issue #543)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub lhdcv5_low_latency: bool,
     /// Legacy (v1, and v2 before issue #86's Codecs redesign): whether a
     /// codec the device does not offer falls back to another. Kept in the
     /// file but no longer used: a profile falls back to the first codec in
@@ -235,6 +238,7 @@ impl Default for Profile {
             codec: auto(),
             quality: hq(),
             abr: false,
+            lhdcv5_low_latency: false,
             codec_fallback: true,
             codec_forced: false,
             unlisted_options: false,
@@ -285,6 +289,9 @@ pub struct CodecValues {
     pub sample_rate: u32,
     pub bit_depth: u32,
     pub abr: bool,
+    /// LHDC V5: low latency asked for ([`Profile::lhdcv5_low_latency`])
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub lhdcv5_low_latency: bool,
     #[serde(skip_serializing_if = "is_zero")]
     pub sbc_bitpool: u8,
     #[serde(skip_serializing_if = "is_zero")]
@@ -311,6 +318,7 @@ impl CodecValues {
     pub fn apply_to(&self, req: &mut StreamRequest) {
         req.quality = Quality::from_key(&self.quality);
         req.abr = self.abr;
+        req.lhdcv5_low_latency = self.lhdcv5_low_latency;
         req.sbc_bitpool = self.sbc_bitpool;
         req.sbcxq_bitpool = self.sbcxq_bitpool;
         req.sbc_min_bitpool = self.sbc_min_bitpool;
@@ -338,6 +346,7 @@ impl Default for CodecValues {
             sample_rate: 0,
             bit_depth: 0,
             abr: false,
+            lhdcv5_low_latency: false,
             sbc_bitpool: 0,
             sbcxq_bitpool: 0,
             sbc_min_bitpool: 0,
@@ -398,6 +407,7 @@ impl Profile {
             sample_rate: self.sample_rate,
             bit_depth: self.bit_depth,
             abr: self.abr,
+            lhdcv5_low_latency: self.lhdcv5_low_latency,
             sbc_bitpool: self.sbc_bitpool,
             sbcxq_bitpool: self.sbcxq_bitpool,
             sbc_min_bitpool: self.sbc_min_bitpool,
@@ -442,6 +452,7 @@ impl Profile {
             sample_rate: d.sample_rate,
             bit_depth: d.bit_depth,
             abr: d.abr,
+            lhdcv5_low_latency: d.lhdcv5_low_latency,
             sbc_bitpool: d.sbc_bitpool,
             sbcxq_bitpool: d.sbcxq_bitpool,
             sbc_min_bitpool: d.sbc_min_bitpool,
@@ -643,6 +654,7 @@ impl Profile {
             auto_order: self.order(),
             quality: Quality::from_key(&self.quality),
             abr: self.abr,
+            lhdcv5_low_latency: self.lhdcv5_low_latency,
             sbc_bitpool: self.sbc_bitpool,
             sbcxq_bitpool: self.sbcxq_bitpool,
             sbc_min_bitpool: self.sbc_min_bitpool,

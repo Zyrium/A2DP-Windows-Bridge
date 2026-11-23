@@ -84,6 +84,30 @@ fn realtek_pid_resolution_btstack_table() {
     );
 }
 
+/// The OEM table's entries from Realtek's Windows drivers: each ID once, none
+/// that BTstack's table already takes (with Realtek's VID) or another
+/// vendor's loader lists, each resolving to its chip
+#[test]
+fn oem_table_entries() {
+    let table = bt_host::realtek_usb_firmware();
+    for (i, m) in OEM_TABLE.iter().enumerate() {
+        let id = format!("{:04X}:{:04X}", m.vid, m.pid);
+        assert!(OEM_TABLE[i + 1..].iter().all(|o| (o.vid, o.pid) != (m.vid, m.pid)), "{id} twice");
+        assert!(!(m.vid == REALTEK_VID && table.iter().any(|&(_, p, _)| p == m.pid)), "{id} is in BTstack's table");
+        assert!(!LOADER_CHIPS.iter().any(|&(_, v, p)| (v, p) == (m.vid, m.pid)), "{id} is another loader's");
+        assert_eq!(resolve_realtek_pid(m.vid, m.pid, table), Some(m.realtek_pid), "{id}");
+        assert_eq!(vendor_for_usb(m.vid, m.pid, Some(m.realtek_pid)), ChipVendor::Realtek);
+    }
+    // Laptop modules and dongles of the drivers' tables
+    let chip_of = |vid, pid| resolve_realtek_pid(vid, pid, table).and_then(realtek_chip_name);
+    assert_eq!(chip_of(0x13D3, 0x3571), Some("RTL8852BU"));
+    assert_eq!(chip_of(0x0489, 0xE122), Some("RTL8852CU"));
+    assert_eq!(chip_of(0x04CA, 0x4005), Some("RTL8822CU"));
+    assert_eq!(chip_of(0x0BDA, 0xB85E), Some("RTL8851BU"));
+    assert_eq!(chip_of(0x2357, 0x0607), Some("RTL8761BU"));
+    assert_eq!(display_name(0x13D3, 0x3529, Some(0xC821), ChipVendor::Realtek), "RTL8821CU (0x13D3:0x3529)");
+}
+
 #[test]
 fn vendors_and_names() {
     assert_eq!(vendor_for_usb(0x2357, 0x0604, Some(0x8771)), ChipVendor::Realtek);
@@ -92,6 +116,15 @@ fn vendors_and_names() {
     assert_eq!(vendor_for_usb(0x0A5C, 0x21E8, None), ChipVendor::Broadcom);
     assert_eq!(vendor_for_usb(0x0B05, 0x17CB, None), ChipVendor::Broadcom); // ASUS BT400
     assert_eq!(vendor_for_usb(0x0B05, 0x1234, None), ChipVendor::Unknown);
+    // Broadcom chips under the module maker's VID, from Broadcom's Windows
+    // driver: Dell DW380, Lite-On, AzureWave, Foxconn, Toshiba, Lenovo
+    for (vid, pid) in
+        [(0x413C, 0x8197), (0x04CA, 0x2003), (0x13D3, 0x3404), (0x0489, 0xE032), (0x0930, 0x0221), (0x17EF, 0x7201)]
+    {
+        assert_eq!(vendor_for_usb(vid, pid, None), ChipVendor::Broadcom, "{vid:04X}:{pid:04X}");
+        assert_eq!(chip_support_tag(ChipVendor::Broadcom, vid, pid), None);
+    }
+    assert_eq!(vendor_for_usb(0x413C, 0x8198, None), ChipVendor::Unknown);
     assert_eq!(vendor_for_usb(0x0A12, 0x0001, None), ChipVendor::Csr);
     assert_eq!(vendor_for_usb(0x0E8D, 0x0608, None), ChipVendor::MediaTek);
     assert_eq!(vendor_for_usb(0x0CF3, 0xE300, None), ChipVendor::Qualcomm);
@@ -113,7 +146,7 @@ fn vendors_and_names() {
 fn display_names_like_v1() {
     assert_eq!(display_name(0x2357, 0x0604, Some(0x8771), ChipVendor::Realtek), "RTL8761BU (0x2357:0x0604)");
     assert_eq!(display_name(0x8087, 0x0032, None, ChipVendor::Intel), "Intel (0x8087:0x0032)");
-    assert_eq!(display_name(0x0E8D, 0x7663, None, ChipVendor::MediaTek), "MediaTek (0x0E8D:0x7663) [unsupported]");
+    assert_eq!(display_name(0x0E8D, 0x7630, None, ChipVendor::MediaTek), "MediaTek (0x0E8D:0x7630) [unsupported]");
     assert_eq!(display_name(0x0E8D, 0x6639, None, ChipVendor::MediaTek), "MediaTek (0x0E8D:0x6639)");
     assert_eq!(display_name(0x0E8D, 0x0608, None, ChipVendor::MediaTek), "MediaTek (0x0E8D:0x0608)");
     // An MT7921 module under AzureWave's VID
@@ -124,6 +157,11 @@ fn display_names_like_v1() {
     assert_eq!(display_name(0x0CF3, 0xE300, None, ChipVendor::Qualcomm), "Qualcomm (0x0CF3:0xE300)");
     assert_eq!(vendor_for_usb(0x0489, 0xE0C7, None), ChipVendor::Qualcomm);
     assert_eq!(display_name(0x0CF3, 0xE400, None, ChipVendor::Qualcomm), "Qualcomm (0x0CF3:0xE400) [unsupported]");
+    // Qualcomm WCN785x, also in a Surface under Microsoft's VID (that ID only)
+    assert_eq!(display_name(0x0CF3, 0xE700, None, ChipVendor::Qualcomm), "Qualcomm (0x0CF3:0xE700)");
+    assert_eq!(vendor_for_usb(0x0489, 0xE0F3, None), ChipVendor::Qualcomm);
+    assert_eq!(vendor_for_usb(0x045E, 0x0C9E, None), ChipVendor::Qualcomm);
+    assert_eq!(vendor_for_usb(0x045E, 0x0C9D, None), ChipVendor::Unknown);
     assert_eq!(display_name(0x0A12, 0x0001, None, ChipVendor::Csr), "CSR (0x0A12:0x0001)");
     assert_eq!(display_name(0x0BDA, 0x1234, None, ChipVendor::Realtek), "0x0BDA:0x1234");
     assert_eq!(display_name(0x1234, 0x5678, None, ChipVendor::Unknown), "0x1234:0x5678");

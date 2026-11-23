@@ -124,6 +124,19 @@ bt_chip_pid: number, bt_chip_fw_stem: string,
  */
 realtek_custom_firmware: boolean, 
 /**
+ * The adapter BlueCaster uses when several are on WinUSB: its
+ * AdapterInfo::instance_id; empty: automatic (the first one found).
+ * A change restarts Bluetooth (at once when idle).
+ */
+adapter_id: string, 
+/**
+ * The adapter Auracast broadcasts go on (developer mode), an
+ * AdapterInfo::instance_id: Bluetooth restarts on it for a broadcast,
+ * and back on `adapter_id` for the next scan or connection; empty: the
+ * one everything else uses
+ */
+auracast_adapter_id: string, 
+/**
  * auto, off, or Wi-Fi channels such as "6,11"
  */
 afh: string, remote_sink: string, 
@@ -144,4 +157,10 @@ le_audio_low_latency: boolean,
  * device (on by default): on, every A2DP profile streams as Auto; off,
  * each with the codec chosen for it (read when the next stream starts)
  */
-auto_codec: boolean, };
+auto_codec: boolean, 
+/**
+ * Developer mode: keyboards and mice through BlueCaster (experimental,
+ * issue #413), in force while developer_mode is on. settings.set can
+ * only turn it off; hid.enable turns it on.
+ */
+hid_host: boolean, };

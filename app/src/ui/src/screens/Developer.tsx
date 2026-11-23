@@ -28,6 +28,7 @@ import {
   TabBar,
   Toggle,
 } from "../components/controls";
+import { HidSection } from "../components/HidHost";
 import type { IconName } from "../components/icons";
 import { t } from "../i18n";
 import type {
@@ -192,6 +193,7 @@ export function Developer() {
               onChange={(v) => void saveSettings(app, { include_alphas: v })}
             />
           </Section>
+          <HidSection />
           <div>
             <Button
               icon="arrow_reset"
@@ -921,15 +923,17 @@ function Logging(props: {
         title={t("ui.dev.log_files")}
         actions={
           <>
-            <Button
-              icon="folder_open"
-              kind="subtle"
-              disabled={!logDir()}
-              title={t("ui.diag.logs_unmasked")}
-              onClick={() => void core.transport.openFolder(logDir())}
-            >
-              {t("ui.diag.open_logs")}
-            </Button>
+            {/* None while the core runs as a service: its log folder is protected */}
+            <Show when={logDir()}>
+              <Button
+                icon="folder_open"
+                kind="subtle"
+                title={t("ui.diag.logs_unmasked")}
+                onClick={() => void core.transport.openFolder(logDir())}
+              >
+                {t("ui.diag.open_logs")}
+              </Button>
+            </Show>
             <Button
               icon="arrow_reset"
               disabled={!changed()}

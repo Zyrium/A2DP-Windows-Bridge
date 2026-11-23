@@ -44,6 +44,7 @@ const SBC: StreamInfo = {
   abr: false,
   bitrate_capped: false,
   hi_res_set: false,
+  low_latency: false,
   source: null,
   le: null,
   details: null,

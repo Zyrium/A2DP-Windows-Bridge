@@ -949,6 +949,7 @@ describe("helpers", () => {
       source: "tone",
       max_media_payload: null,
       abr: false,
+      lhdcv5_low_latency: false,
       codec_fallback: true,
     });
   });

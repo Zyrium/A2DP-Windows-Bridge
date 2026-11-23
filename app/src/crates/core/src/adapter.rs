@@ -119,14 +119,17 @@ const BUILTIN_VENDOR_CLASS: &[(u16, u16)] = &[
 
 /// VID:PIDs the USB transport opens besides Bluetooth-class devices (bt-host
 /// adds BTstack's Realtek table, CSR and Intel): v1's built-in vendor-class
-/// list, the OEM adapters with a Realtek chip, and the WinUSB adapters whose
+/// list, the OEM adapters with a Realtek chip, the adapters of Broadcom's
+/// Windows driver (bt_host::broadcom), and the WinUSB adapters whose
 /// interface 0 was found to be vendor-class Bluetooth with the HCI pipes
 pub fn usb_known_ids(vendor_class: &[(u16, u16)]) -> Vec<(u16, u16)> {
     let mut ids: Vec<(u16, u16)> = BUILTIN_VENDOR_CLASS.to_vec();
     ids.extend(chips::OEM_TABLE.iter().map(|m| (m.vid, m.pid)));
-    for id in vendor_class {
-        if !ids.contains(id) {
-            ids.push(*id);
+    // The adapters of Broadcom's Windows driver, some of them vendor-class
+    let broadcom = bt_host::broadcom::ADAPTERS.iter().map(|a| (a.0, a.1));
+    for id in broadcom.chain(vendor_class.iter().copied()) {
+        if !ids.contains(&id) {
+            ids.push(id);
         }
     }
     ids
@@ -140,9 +143,46 @@ pub fn realtek_driver_firmware(fw_stem: &str) -> Option<std::path::PathBuf> {
     bt_host::realtek_btnic::driver_firmware(fw_stem.strip_suffix(".bin").unwrap_or(fw_stem))
 }
 
+/// The same, from the driver package whose INF names the
+/// adapter's USB VID:PID ([`bt_host::realtek_btnic::own_driver_firmware`])
+pub fn realtek_own_driver_firmware(fw_stem: &str, vid: u16, pid: u16) -> Option<std::path::PathBuf> {
+    bt_host::realtek_btnic::own_driver_firmware(fw_stem.strip_suffix(".bin").unwrap_or(fw_stem), vid, pid)
+}
+
+/// The adapter of `id` (Settings::adapter_id, any case) among those on
+/// WinUSB, if no other program has it; None for an empty `id`
+fn chosen_adapter<'a>(winusb: &[&'a Adapter], id: &str) -> Option<&'a Adapter> {
+    let id = id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    winusb.iter().copied().find(|a| a.device.instance_id.eq_ignore_ascii_case(id) && !a.device.in_use())
+}
+
+/// The adapter `id` (Settings::adapter_id's form) is on WinUSB and free,
+/// or none is chosen: a stack started now opens that one, not the first
+/// adapter found
+pub fn chosen_present(id: &str) -> bool {
+    if id.trim().is_empty() {
+        return true;
+    }
+    let present = adapters(false);
+    let winusb: Vec<&Adapter> =
+        present.iter().filter(|a| a.device.driver_kind == win_sys::driver::DriverKind::WinUsb).collect();
+    chosen_adapter(&winusb, id).is_some()
+}
+
+/// The adapter a stack opens first (Settings::adapter_id's form): for a
+/// broadcast in developer mode the Auracast adapter when one is set,
+/// otherwise the adapter to use
+pub fn adapter_for(settings: &Settings, broadcast: bool) -> &str {
+    let auracast = settings.auracast_adapter_id.trim();
+    if broadcast && settings.debug_mode && !auracast.is_empty() { auracast } else { settings.adapter_id.trim() }
+}
+
 /// Fills the chipset part of `config` from the settings and the present
 /// adapters
-pub fn configure(config: &mut HostConfig, settings: &Settings, _config_dir: &Path) {
+pub fn configure(config: &mut HostConfig, settings: &Settings, config_dir: &Path) {
     config.afh = Some(Box::new(WifiAfh::default()));
     if matches!(config.transport, TransportConfig::Tcp(_)) {
         return; // a virtual controller: no chipset, no firmware
@@ -177,8 +217,26 @@ pub fn configure(config: &mut HostConfig, settings: &Settings, _config_dir: &Pat
         }
         tracing::debug!("adapter: usb selector {sel:?}");
     }
-    let pid =
-        chips::resolve_chip_pid(settings.bt_chip_pid, &settings.bt_chip_fw_stem, winusb.iter().map(|a| a.realtek_pid));
+    // The adapter chosen in the settings, when it is on WinUSB and free: it
+    // is opened first, and only its chip counts for the Realtek setup and
+    // the vendor firmware loaders (an Intel card beside it on WinUSB would
+    // otherwise send the Intel bootloader commands to the chosen one)
+    let chosen = chosen_adapter(&winusb, &settings.adapter_id);
+    if !settings.adapter_id.is_empty() && chosen.is_none() {
+        // Not its instance ID: that ends in the adapter's serial number or
+        // address, and logs are sent to others
+        tracing::warn!("adapter: the chosen adapter is not on WinUSB or not free: the first one found is used");
+    }
+    if let (TransportConfig::Usb(sel), Some(a)) = (&mut config.transport, chosen) {
+        tracing::info!("adapter: {:04X}:{:04X} (chosen) is opened first", a.device.vid, a.device.pid);
+        sel.preferred = Some(a.device.instance_id.clone());
+    }
+    let detected: Vec<&Adapter> = chosen.map_or_else(|| winusb.clone(), |a| vec![a]);
+    let pid = chips::resolve_chip_pid(
+        settings.bt_chip_pid,
+        &settings.bt_chip_fw_stem,
+        detected.iter().map(|a| a.realtek_pid),
+    );
     if pid != 0 {
         let chip_name = chips::realtek_chip_name(pid);
         // The adapter's own VID:PID when it differs from the PID BTstack is
@@ -204,6 +262,7 @@ pub fn configure(config: &mut HostConfig, settings: &Settings, _config_dir: &Pat
         // would bring that one up with this chip's setup, and its quick init
         // read as "firmware not loaded". The adapter of this chip goes first.
         if let TransportConfig::Usb(sel) = &mut config.transport
+            && chosen.is_none()
             && winusb.len() > 1
             && let Some(a) = winusb.iter().find(|a| a.realtek_pid == Some(pid) && !a.device.in_use())
         {
@@ -234,7 +293,14 @@ pub fn configure(config: &mut HostConfig, settings: &Settings, _config_dir: &Pat
         if settings.realtek_custom_firmware {
             tracing::info!("custom firmware: the firmware folder's {fw}");
         } else {
-            config.realtek_firmware_file = realtek_driver_firmware(fw);
+            // The adapter's own driver package first (its
+            // vendor's board-tuned firmware), else the newest generic one.
+            // The adapter is the one the transport opens first (see above).
+            let own = detected
+                .iter()
+                .find(|a| a.realtek_pid == Some(pid) && !a.device.in_use())
+                .and_then(|a| realtek_own_driver_firmware(fw, a.device.vid, a.device.pid));
+            config.realtek_firmware_file = own.or_else(|| realtek_driver_firmware(fw));
             if config.realtek_firmware_file.is_none() {
                 tracing::info!("no firmware for this chip in Realtek's Windows driver on this PC: the folder's {fw}");
             }
@@ -245,8 +311,8 @@ pub fn configure(config: &mut HostConfig, settings: &Settings, _config_dir: &Pat
         // firmware, Broadcom may take a PatchRAM
         // One held by another program cannot be loaded either (v1 skipped
         // it too)
-        config.intel_loader = winusb.iter().any(|a| a.vendor == ChipVendor::Intel && !a.device.in_use());
-        for a in winusb.iter().filter(|a| {
+        config.intel_loader = detected.iter().any(|a| a.vendor == ChipVendor::Intel && !a.device.in_use());
+        for a in detected.iter().filter(|a| {
             matches!(a.vendor, ChipVendor::Intel | ChipVendor::MediaTek | ChipVendor::Qualcomm) && a.device.in_use()
         }) {
             tracing::info!(
@@ -257,20 +323,24 @@ pub fn configure(config: &mut HostConfig, settings: &Settings, _config_dir: &Pat
             );
         }
         // MediaTek: only the chips its loader knows, never one in use
-        config.mediatek_loader = winusb.iter().any(|a| {
+        config.mediatek_loader = detected.iter().any(|a| {
             a.vendor == ChipVendor::MediaTek
                 && chips::chip_supported(a.vendor, a.device.vid, a.device.pid)
                 && !a.device.in_use()
         });
-        // Qualcomm: the same
-        config.qualcomm_loader = winusb.iter().any(|a| {
+        // Qualcomm: the same; the AR30xx have a loader of their own
+        let ar30xx = |a: &Adapter| chips::QUALCOMM_AR30XX.contains(&(a.device.vid, a.device.pid));
+        config.qualcomm_loader = detected.iter().any(|a| {
             a.vendor == ChipVendor::Qualcomm
+                && !ar30xx(a)
                 && chips::chip_supported(a.vendor, a.device.vid, a.device.pid)
                 && !a.device.in_use()
         });
+        config.atheros_loader =
+            detected.iter().any(|a| a.vendor == ChipVendor::Qualcomm && ar30xx(a) && !a.device.in_use());
         // A Realtek chip whose firmware comes from Realtek's Windows driver
         // (the RTL8852BD): the first one present, never one in use
-        config.realtek_driver_chip = winusb
+        config.realtek_driver_chip = detected
             .iter()
             .find(|a| {
                 a.vendor == ChipVendor::Realtek
@@ -278,17 +348,22 @@ pub fn configure(config: &mut HostConfig, settings: &Settings, _config_dir: &Pat
                     && !a.device.in_use()
             })
             .map(|a| (a.device.vid, a.device.pid));
-        config.broadcom_ids =
-            winusb.iter().filter(|a| a.vendor == ChipVendor::Broadcom).map(|a| (a.device.vid, a.device.pid)).collect();
+        config.broadcom_ids = detected
+            .iter()
+            .filter(|a| a.vendor == ChipVendor::Broadcom)
+            .map(|a| (a.device.vid, a.device.pid))
+            .collect();
+        config.broadcom_marks = Some(std::sync::Arc::new(BroadcomPatchMarks { dir: config_dir.to_path_buf() }));
         tracing::debug!(
-            "adapter: intel bootloader download {}, mediatek download {}, qualcomm download {}, realtek driver chip {:04X?}, broadcom patchram ids {:04X?}",
+            "adapter: intel bootloader download {}, mediatek download {}, qualcomm download {}, atheros download {}, realtek driver chip {:04X?}, broadcom patchram ids {:04X?}",
             config.intel_loader,
             config.mediatek_loader,
             config.qualcomm_loader,
+            config.atheros_loader,
             config.realtek_driver_chip,
             config.broadcom_ids
         );
-        for a in &winusb {
+        for a in &detected {
             if !chips::chip_supported(a.vendor, a.device.vid, a.device.pid) {
                 tracing::warn!(
                     "{} adapter {:04X}:{:04X}: firmware loading for this chip is not implemented; it may not work",
@@ -463,6 +538,36 @@ struct AdapterCaps {
     /// Device Manager's name while Windows' Bluetooth ran it
     #[serde(default, skip_serializing_if = "Option::is_none")]
     windows_name: Option<String>,
+    /// The app version Broadcom's patch failed with on it (bt-host's
+    /// broadcom loader): while it is this app's, the ROM runs
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    broadcom_patch_failed: Option<String>,
+}
+
+/// The failed-patch marks of bt-host's Broadcom loader, in
+/// adapter_caps.json (per VID:PID, with the app version)
+pub struct BroadcomPatchMarks {
+    pub dir: std::path::PathBuf,
+}
+
+impl bt_host::broadcom::PatchMarks for BroadcomPatchMarks {
+    fn failed_with(&self, vid: u16, pid: u16) -> Option<String> {
+        load_caps(&self.dir).get(&caps_key(vid, pid)).and_then(|c| c.broadcom_patch_failed.clone())
+    }
+
+    fn set_failed(&self, vid: u16, pid: u16, version: Option<&str>) {
+        let mut caps = load_caps(&self.dir);
+        let entry = caps.entry(caps_key(vid, pid)).or_default();
+        if entry.broadcom_patch_failed.as_deref() == version {
+            return;
+        }
+        entry.broadcom_patch_failed = version.map(str::to_owned);
+        tracing::debug!(
+            "adapter caps: {} Broadcom patch failed {version:?}, saving adapter_caps.json",
+            caps_key(vid, pid)
+        );
+        write_caps(&self.dir, &caps);
+    }
 }
 
 fn caps_key(vid: u16, pid: u16) -> String {
@@ -634,6 +739,45 @@ mod tests {
     }
 
     #[test]
+    fn a_broadcast_goes_on_the_auracast_adapter() {
+        let s = |adapter: &str, auracast: &str, debug_mode: bool| Settings {
+            adapter_id: adapter.into(),
+            auracast_adapter_id: auracast.into(),
+            debug_mode,
+            ..Settings::default()
+        };
+        let both = s("BT600", "NRF", true);
+        assert_eq!(adapter_for(&both, true), "NRF");
+        assert_eq!(adapter_for(&both, false), "BT600");
+        // None set for Auracast: the same adapter as everything else
+        assert_eq!(adapter_for(&s("BT600", "", true), true), "BT600");
+        assert_eq!(adapter_for(&s("", " ", true), true), "");
+        // Developer mode off: Auracast is not offered, its adapter not used
+        assert_eq!(adapter_for(&s("BT600", "NRF", false), true), "BT600");
+    }
+
+    #[test]
+    fn the_chosen_adapter_is_found_when_free() {
+        let adapter = |d: UsbDevice| Adapter {
+            device: d,
+            realtek_pid: None,
+            vendor: ChipVendor::Intel,
+            display_name: String::new(),
+        };
+        let intel = adapter(device(0x8087, 0x0033, None));
+        let realtek = adapter(device(0x0BDA, 0x8771, None));
+        let busy = adapter(device(0x0B05, 0x190E, Some(Err("open failed (error 5): taken".into()))));
+        let all = [&intel, &realtek, &busy];
+        let found = |id: &str| chosen_adapter(&all, id).map(|a| a.device.pid);
+        assert_eq!(found(""), None);
+        assert_eq!(found(r"usb\vid_0bda&pid_8771\1"), Some(0x8771));
+        assert_eq!(found(r" USB\VID_8087&PID_0033\1 "), Some(0x0033));
+        // Another program has it, or it is not on WinUSB (not in the list)
+        assert_eq!(found(r"USB\VID_0B05&PID_190E\1"), None);
+        assert_eq!(found(r"USB\VID_1234&PID_5678\1"), None);
+    }
+
+    #[test]
     fn le_audio_remembered_per_adapter() {
         let dir = std::env::temp_dir().join(format!("bluecaster-caps-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -660,6 +804,27 @@ mod tests {
         // The other values stay
         assert_eq!(address(&dir, 0x0BDA, 0xA729).as_deref(), Some("00:11:22:33:44:55"));
         assert_eq!(le_audio(&dir, 0x0BDA, 0xA729), Some(false));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn broadcom_patch_marks_are_kept_per_adapter() {
+        use bt_host::broadcom::PatchMarks;
+        let dir = std::env::temp_dir().join(format!("bluecaster-bcm-marks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        save_hci_version(&dir, 0x0B05, 0x17CB, 6);
+        let marks = BroadcomPatchMarks { dir: dir.clone() };
+        assert_eq!(marks.failed_with(0x0B05, 0x17CB), None);
+        marks.set_failed(0x0B05, 0x17CB, Some("3.0.2"));
+        assert_eq!(marks.failed_with(0x0B05, 0x17CB).as_deref(), Some("3.0.2"));
+        assert_eq!(marks.failed_with(0x0A5C, 0x21E8), None);
+        // The adapter's other values stay; dropping the mark leaves them
+        assert_eq!(hci_version(&dir, 0x0B05, 0x17CB), Some(6));
+        marks.set_failed(0x0B05, 0x17CB, None);
+        assert_eq!(marks.failed_with(0x0B05, 0x17CB), None);
+        assert_eq!(hci_version(&dir, 0x0B05, 0x17CB), Some(6));
+        let text = std::fs::read_to_string(crate::paths::adapter_caps_file(&dir)).unwrap();
+        assert!(!text.contains("broadcom_patch_failed"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

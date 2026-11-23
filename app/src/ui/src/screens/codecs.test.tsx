@@ -1206,6 +1206,8 @@ describe("codec settings", () => {
     expect(warning()).toBeNull();
     fireEvent.click(within(dialog).getByRole("button", { name: t("modal.close") }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    // The cards (and their "...") stay disabled until the last save lands
+    await settled(moto);
     dialog = await codecSettings(moto, "codec.aac");
     expect(listed()).toBeChecked();
     fireEvent.click(listed());

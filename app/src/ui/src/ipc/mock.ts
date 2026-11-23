@@ -8,7 +8,11 @@
 // on Windows' Bluetooth driver), ?mock=error (the last connection failed),
 // ?mock=offline (update checks and receivers cannot be reached),
 // ?mock=le (LE Audio on, with an LE Audio profile), ?window=flyout (the
-// flyout view).
+// flyout view). The service add-on: ?mock=service (added, running),
+// ?mock=service_stopped, ?mock=service_needs_update, ?mock=service_newer
+// (all three on the connection screen); not added is every other scenario. ?dev turns
+// developer mode on (its Developer screen has the add-on's row);
+// ?servicedecline answers No on the simulated administrator prompt.
 
 import { englishText } from "../i18n";
 import {
@@ -22,6 +26,9 @@ import { FlowTracker, flowView } from "../lib/flow";
 import { leAudioOn as leOn, MIC_PROCESSING_OFF } from "../lib/profile";
 import type {
   ConnStatus,
+  ServiceAction,
+  ServiceSetupResult,
+  ServiceState,
   Transport,
   UpdatePhase,
   WindowKind,
@@ -29,6 +36,9 @@ import type {
 import type {
   AdapterInfo,
   AudioApp,
+  AuracastMix,
+  AuracastMixPreset,
+  AuracastMixState,
   MixerApp,
   AudioDevice,
   CaptureState,
@@ -39,6 +49,9 @@ import type {
   Event,
   FirmwareFile,
   FlowView,
+  HidCheck,
+  HidHealth,
+  HidPasskey,
   LinkSample,
   LinkTotals,
   LogLevel,
@@ -77,9 +90,19 @@ export type MockScenario =
   | "huawei"
   /** Realtek's Windows driver on this PC has the RTL8761BU's firmware (issue #86) */
   | "realtek_driver"
+  /** A Realtek adapter and a built-in Intel card, both on WinUSB */
+  | "adapters"
   /** Headset microphone on for the WH-1000XM5 (to CABLE
    *  Input) and for the LE Audio earbuds: a stream reports its voice link */
-  | "voice";
+  | "voice"
+  /** The core runs as a Windows service: no folder named, app.quit refused */
+  | "service"
+  /** The service add-on is added but stopped: the connection screen */
+  | "service_stopped"
+  /** The service add-on is an older version than the app: the connection screen */
+  | "service_needs_update"
+  /** The service add-on is newer than the app: the connection screen */
+  | "service_newer";
 
 export interface MockOptions {
   scenario?: MockScenario;
@@ -116,6 +139,25 @@ const RTL: AdapterInfo = {
   windows_name: "TP-Link Bluetooth USB Adapter",
 };
 
+/** A built-in Intel card on WinUSB beside the Realtek one ("adapters" scenario) */
+const INTEL: AdapterInfo = {
+  ...RTL,
+  instance_id: "USB\\VID_8087&PID_0033\\5&19A12CFC&0&14",
+  vid: 0x8087,
+  pid: 0x0033,
+  display_name: "Intel AX211 (0x8087:0x0033)",
+  device_name: "WinUSB Device",
+  vendor: "Intel",
+  realtek_chip: null,
+  firmware_present: null,
+  firmware_files: [],
+  firmware_download: false,
+  vendor_note: { key: "firmware.vendor_intel", args: [] },
+  address: "F4:26:79:00:00:01",
+  bt_version: "5.3",
+  windows_name: "Intel(R) Wireless Bluetooth(R)",
+};
+
 /** A chip BlueCaster has no firmware loader for (the first run lists it too) */
 const MEDIATEK: AdapterInfo = {
   ...RTL,
@@ -146,6 +188,7 @@ export function sampleProfile(over: Partial<Profile> = {}): Profile {
     codec: "ldac",
     quality: "hq",
     abr: false,
+    lhdcv5_low_latency: false,
     codec_fallback: true,
     codec_forced: false,
     unlisted_options: false,
@@ -254,12 +297,15 @@ export function sampleSettings(over: Partial<Settings> = {}): Settings {
     bt_chip_pid: 0,
     bt_chip_fw_stem: "",
     realtek_custom_firmware: false,
+    adapter_id: "",
+    auracast_adapter_id: "",
     afh: "auto",
     remote_sink: "",
     le_audio_experimental: false,
     le_audio_low_latency: false,
     // Off, as schema 5 sets it: WH-1000XM5 chose LDAC
     auto_codec: false,
+    hid_host: false,
     ...over,
   };
 }
@@ -279,6 +325,8 @@ export function sampleDevice(
     codecs_on_request: [],
     le_audio: false,
     le_audio_set: false,
+    hid_le: null,
+    set_addresses: [],
     ...over,
   };
 }
@@ -301,18 +349,21 @@ export const XM5_CODEC_CAPS = [
     sample_rates: [44100, 48000],
     bit_depths: [],
     max_bitrate: 0,
+    lhdcv5_low_latency: false,
   },
   {
     codec: "aac",
     sample_rates: [44100, 48000],
     bit_depths: [],
     max_bitrate: 320000,
+    lhdcv5_low_latency: false,
   },
   {
     codec: "ldac",
     sample_rates: [44100, 48000, 88200, 96000],
     bit_depths: [],
     max_bitrate: 0,
+    lhdcv5_low_latency: false,
   },
 ];
 
@@ -329,18 +380,21 @@ export const MOTO_BUDS = sampleDevice({
       sample_rates: [44100, 48000],
       bit_depths: [],
       max_bitrate: 0,
+      lhdcv5_low_latency: false,
     },
     {
       codec: "aac",
       sample_rates: [44100, 48000],
       bit_depths: [],
       max_bitrate: 0x020000,
+      lhdcv5_low_latency: false,
     },
     {
       codec: "lhdcv5",
       sample_rates: [44100, 48000],
       bit_depths: [16, 24],
       max_bitrate: 0,
+      lhdcv5_low_latency: false,
     },
   ],
 });
@@ -353,7 +407,7 @@ export const APTXAD_48K = sampleDevice({
   saved: true,
   codecs: ["sbc", "aac", "aptxad"],
   codec_caps: [
-    { codec: "aptxad", sample_rates: [48000], bit_depths: [], max_bitrate: 0 },
+    { codec: "aptxad", sample_rates: [48000], bit_depths: [], max_bitrate: 0, lhdcv5_low_latency: false },
   ],
 });
 export const APTXAD_96K = sampleDevice({
@@ -367,6 +421,7 @@ export const APTXAD_96K = sampleDevice({
       sample_rates: [48000, 96000],
       bit_depths: [],
       max_bitrate: 0,
+      lhdcv5_low_latency: false,
     },
   ],
 });
@@ -377,6 +432,7 @@ const LE_BUDS = sampleDevice({
   name: "Galaxy Buds2 Pro",
   le_audio: true,
   le_audio_set: true,
+  set_addresses: ["F4:4E:FD:00:11:23"],
 });
 
 /** The RTL8761B firmware of Realtek's Windows driver (core realtek_btnic) */
@@ -456,7 +512,9 @@ export function sampleSnapshot(scenario: MockScenario = "normal"): Snapshot {
           ]
         : scenario === "realtek_driver"
           ? [{ ...RTL, firmware_driver: true, firmware_from_driver: true, firmware_files: [RTL_DRIVER_FILE] }]
-          : [RTL],
+          : scenario === "adapters"
+            ? [RTL, INTEL]
+            : [RTL],
       error: null,
       le_audio:
         scenario === "le_unsupported" ? false : scenario === "le" ? true : null,
@@ -550,8 +608,8 @@ export function sampleSnapshot(scenario: MockScenario = "normal"): Snapshot {
       current_version: "2.0.0-alpha.1",
       error: null,
     },
-    config_dir,
-    log_dir: `${config_dir}\\logs`,
+    config_dir: scenario === "service" ? "" : config_dir,
+    log_dir: scenario === "service" ? "" : `${config_dir}\\logs`,
     capture: null,
     clock_ms: null,
     v1_running: false,
@@ -570,6 +628,13 @@ export function sampleSnapshot(scenario: MockScenario = "normal"): Snapshot {
           ]
         : [],
     audio_endpoints: 0,
+    hid_devices: [],
+    hid_candidates: [],
+    hid_passkey: null,
+    hid_checks: [],
+    hid_rolled_back: null,
+    hid_health: null,
+    service_mode: scenario === "service",
     vendors: [
       { id: "huawei", name: "Huawei", options: [] },
       { id: "oppo", name: "OPPO", options: ["every_connection"] },
@@ -597,6 +662,16 @@ const SCAN_RESULTS: Device[] = [
     rssi: -70,
   }),
 ];
+
+/** The Bluetooth LE keyboards and mice a scan finds (HID host on): the
+ *  classic MX Keys' LE side, and a mouse found only over LE */
+const HID_LE_RESULTS: Device[] = [
+  sampleDevice({ address: "38:18:4C:55:66:77", name: "MX Keys", audio: false, rssi: -72, hid_le: 0 }),
+  sampleDevice({ address: "E1:5A:2B:3C:4D:5E", name: "LE Mouse", audio: false, rssi: -66, hid_le: 1 }),
+];
+
+/** The keyboard whose pairing shows a number to type (hid.add) */
+export const MOCK_PASSKEY_KEYBOARD = "38:18:4C:55:66:77";
 
 /** What the scan's LE Audio part finds (LE Audio on): the dual-mode
  *  earbuds' LE Audio entry (a coordinated set) and an LE Audio speaker */
@@ -862,6 +937,7 @@ const LDAC_DETAILS: CodecDetails = {
     sample_rates: [44100, 48000, 88200, 96000],
     bit_depths: [],
     max_bitrate: 0,
+    lhdcv5_low_latency: false,
   },
 };
 
@@ -880,6 +956,7 @@ const CODEC_INFO: Record<string, StreamInfo> = {
     abr: false,
     bitrate_capped: false,
     hi_res_set: false,
+    low_latency: false,
     source: null,
     le: null,
     details: LDAC_DETAILS,
@@ -898,6 +975,7 @@ const CODEC_INFO: Record<string, StreamInfo> = {
     abr: false,
     bitrate_capped: false,
     hi_res_set: false,
+    low_latency: false,
     source: null,
     le: null,
     details: AAC_DETAILS,
@@ -916,6 +994,7 @@ const CODEC_INFO: Record<string, StreamInfo> = {
     abr: false,
     bitrate_capped: false,
     hi_res_set: false,
+    low_latency: false,
     source: null,
     le: null,
     details: SBC_DETAILS,
@@ -934,6 +1013,7 @@ const CODEC_INFO: Record<string, StreamInfo> = {
     abr: false,
     bitrate_capped: false,
     hi_res_set: false,
+    low_latency: false,
     source: null,
     le: null,
     details: { ...LDAC_DETAILS, frame_samples: 128 },
@@ -969,6 +1049,7 @@ function lc3Info(lowLatency: boolean, set: boolean): StreamInfo {
     abr: false,
     bitrate_capped: false,
     hi_res_set: false,
+    low_latency: false,
     source: null,
     le: {
       preset,
@@ -1065,8 +1146,42 @@ function sourceOf(mode: string, id: string, name: string): SourceInfo {
   }
 }
 
+/** The service add-on's version in ?mock=service_needs_update: older
+ *  than the app, as after the app's own updater ran */
+export const MOCK_OLD_SERVICE = "1.9.0";
+/** ... and in ?mock=service_newer: newer than the app */
+export const MOCK_NEW_SERVICE = "9.0.0";
+
 export class MockCore implements Transport {
   private mixer = MIXER_APPS;
+  private auracastMix: AuracastMix = {
+    auto: true,
+    center_db: -3,
+    lfe_db: -6,
+    surround_db: 0,
+    normalize: false,
+    matrix: [
+      [1, 0, 0.708, 0.501, 0, 0, 0, 0],
+      [0, 1, 0.708, 0.501, 0, 0, 0, 0],
+      [0, 0, 0, 0, 0.707, 0, 0.707, 0],
+      [0, 0, 0, 0, 0, 0.707, 0, 0.707],
+    ],
+    delay_ms: [0, 0, 0, 0],
+    invert: [false, false, false, false],
+  };
+  private mixPresets: AuracastMixPreset[] = [];
+  private mixState(): AuracastMixState {
+    const builtin = { name: "standard", mix: this.auracastMix, builtin: true };
+    return {
+      mix: this.auracastMix,
+      presets: [builtin, ...this.mixPresets],
+      live: false,
+      channels: 8,
+      present: [true, true, true, true, true, true, true, true],
+      rear: true,
+      effective: this.auracastMix.matrix,
+    };
+  }
   /** Addresses paired in Windows' Bluetooth (device.windows_paired) */
   windowsPaired: string[] = [];
   windowsPairedThrough: string[] | null = null;
@@ -1102,6 +1217,20 @@ export class MockCore implements Transport {
   /** Ends the running scan (device.scan_stop) */
   private scanStop: (() => void) | null = null;
   private connectFailure: string | null = null;
+  /** The HID host's code handed out last (hid.code; one use) */
+  private hidCode: string | null = null;
+  /** What the HID host counted (hid.status) */
+  private hidCounts = { reports: 0, undecoded: 0, events: 0, injected: 0, blocked: 0, refused: 0 };
+  /** Ends the wait for the number to be typed (hid.add of MOCK_PASSKEY_KEYBOARD) */
+  private hidTyped: (() => void) | null = null;
+  /** What a new device does during its check (hid.add): "input" types
+   *  after 3 s and stays, "silent" sends nothing and is removed when the
+   *  countdown ends, "manual" waits for hidInput / hidCheckTimeout */
+  hidCheckOutcome: "input" | "silent" | "manual" = "input";
+  /** The countdown of a new device, as the core's 30 s */
+  hidCheckWindowMs = 30_000;
+  /** hid.enable's self-test fails for this reason (null: it passes) */
+  hidSelfTestFails: "helper" | "refused" | "timeout" | null = null;
   private logs: LogLevel | null = null;
   private receiverSub = false;
   /** Every line, as the core keeps them, and the flow it follows */
@@ -1153,6 +1282,13 @@ export class MockCore implements Transport {
   private navigate: (route: string) => void = () => {};
   private updatePhase: UpdatePhase = { state: "idle" };
   private onPhase: (p: UpdatePhase) => void = () => {};
+  /** The service add-on (serviceState, serviceSetup) */
+  service: ServiceState = { state: "not_added" };
+  /** The simulated administrator prompt is answered No */
+  serviceDeclines = false;
+  /** The set-up tool's exit code (0: done) */
+  serviceExitCode = 0;
+  private onStatus: (s: ConnStatus) => void = () => {};
 
   constructor(opts: MockOptions = {}) {
     this.scenario = opts.scenario ?? "normal";
@@ -1166,6 +1302,16 @@ export class MockCore implements Transport {
     this.window = opts.window ?? "main";
     this.speed = opts.speed ?? 1;
     this.onCall = opts.onCall;
+    this.service =
+      this.scenario === "service"
+        ? { state: "running", version: this.version }
+        : this.scenario === "service_stopped"
+          ? { state: "stopped", version: this.version }
+          : this.scenario === "service_needs_update"
+            ? { state: "needs_update", version: MOCK_OLD_SERVICE }
+            : this.scenario === "service_newer"
+              ? { state: "app_older", version: MOCK_NEW_SERVICE }
+              : { state: "not_added" };
   }
 
   // ---- Transport ---------------------------------------------------------
@@ -1175,13 +1321,35 @@ export class MockCore implements Transport {
     onStatus: (s: ConnStatus) => void,
   ) {
     this.onMessage = onMessage;
+    this.onStatus = onStatus;
     onStatus({ state: "connecting" });
-    this.later(400, () => {
+    this.later(400, () => this.connectNow());
+  }
+
+  /** What the window's backend does with the service add-on's state:
+   *  connected (to the service or the user's own core), or the screen
+   *  that asks for its update or start */
+  private connectNow() {
+    const onStatus = this.onStatus;
+    const onMessage = this.onMessage;
+    if (this.service.state === "needs_update") {
+      onStatus({ state: "service_needs_update", version: this.service.version, app: this.version });
+      return;
+    }
+    if (this.service.state === "app_older") {
+      onStatus({ state: "service_newer", version: this.service.version, app: this.version });
+      return;
+    }
+    if (this.service.state === "stopped") {
+      onStatus({ state: "service_stopped" });
+      return;
+    }
+    {
       onMessage({
         type: "welcome",
         protocol: 1,
         server: "bluecaster-core/2.0.0-alpha.1 (mock)",
-        features: ["rfcomm"],
+        features: ["rfcomm", "hid-host"],
       });
       onStatus({
         state: "connected",
@@ -1192,7 +1360,35 @@ export class MockCore implements Transport {
         rev: this.rev,
         state: structuredClone(this.snap),
       });
-    });
+    }
+  }
+
+  async serviceState(): Promise<ServiceState> {
+    return structuredClone(this.service);
+  }
+
+  /** The administrator prompt and the set-up tool, then the window
+   *  connects to the core that serves now: the service, or (removed) the
+   *  user's own */
+  async serviceSetup(action: ServiceAction, removeData = false): Promise<ServiceSetupResult> {
+    this.onCall?.("service.setup", { action, remove_data: removeData });
+    await new Promise((r) => this.later(600, () => r(undefined)));
+    if (this.serviceDeclines) return { outcome: "declined", service: structuredClone(this.service) };
+    if (this.serviceExitCode !== 0) {
+      return { outcome: "failed", code: this.serviceExitCode, service: structuredClone(this.service) };
+    }
+    const was = this.service.state;
+    this.service = action === "remove" ? { state: "not_added" } : { state: "running", version: this.version };
+    this.snap.service_mode = this.service.state === "running";
+    // The core that served stops (or none served): the window connects again
+    if (was !== this.service.state) {
+      if (was === "running" || was === "not_added") {
+        this.onMessage({ type: "event", rev: this.rev, event: { kind: "bye" } });
+      }
+      this.onStatus({ state: "connecting" });
+      this.later(400, () => this.connectNow());
+    }
+    return { outcome: "done", service: structuredClone(this.service) };
   }
 
   async call(method: string, params?: unknown): Promise<unknown> {
@@ -1458,6 +1654,9 @@ export class MockCore implements Transport {
           // As the core's serde default for a client that sends none
           setup_done: next.setup_done ?? true,
           cables_dialog_shown: next.cables_dialog_shown ?? true,
+          // As the core: settings.set only turns it off, developer mode
+          // off turns it off for good
+          hid_host: before.hid_host && !!next.hid_host && !!next.developer_mode,
         };
         this.emit({ kind: "settings", value: this.snap.settings });
         let le_audio_deferred = false;
@@ -1483,7 +1682,8 @@ export class MockCore implements Transport {
         if (
           before.bt_chip_pid !== this.snap.settings.bt_chip_pid ||
           before.bt_chip_fw_stem !== this.snap.settings.bt_chip_fw_stem ||
-          before.realtek_custom_firmware !== this.snap.settings.realtek_custom_firmware
+          before.realtek_custom_firmware !== this.snap.settings.realtek_custom_firmware ||
+          before.adapter_id !== this.snap.settings.adapter_id
         ) {
           // As the core's reload_adapter: the firmware state for the new
           // chip, then an idle stack is released so the firmware loads again
@@ -1750,13 +1950,48 @@ export class MockCore implements Transport {
         this.emit({ kind: "update", value: this.snap.update });
         return this.snap.update;
       }
+      case "hid.code":
+      case "hid.enable":
+      case "hid.disable":
+      case "hid.status":
+      case "hid.add":
+      case "hid.connect":
+      case "hid.remove":
+      case "hid.check_cancel":
+      case "hid.check_dismiss":
+        return this.hid(method, p);
       case "app.hidden_to_tray":
         if (!this.trayHintShown) {
           this.trayHintShown = true;
           console.info("[mock] tray balloon: tray.minimized_hint");
         }
         return null;
+      case "auracast.set_source": {
+        const st = this.snap.stream;
+        if (st.state !== "streaming" || !st.info) return false;
+        st.info = { ...st.info, source: sourceOf(String(p.source), "", "") };
+        this.emit({ kind: "stream", value: st });
+        return true;
+      }
+      // The mixer: kept here, its matrix as set (no automatic one)
+      case "auracast.mix":
+        return this.mixState();
+      case "auracast.mix_set":
+        this.auracastMix = p.mix as AuracastMix;
+        return this.mixState();
+      case "auracast.mix_preset_save":
+        this.mixPresets = [
+          ...this.mixPresets.filter((x) => x.name !== p.name),
+          { name: p.name as string, mix: p.mix as AuracastMix, builtin: false },
+        ];
+        return this.mixState();
+      case "auracast.mix_preset_delete":
+        this.mixPresets = this.mixPresets.filter((x) => x.name !== p.name);
+        return this.mixState();
       case "app.quit":
+        if (this.snap.service_mode) throw errorInfo("ipc.not_in_service", "error.not_in_service");
+        return null;
+      case "app.close":
         return null;
       default:
         throw errorInfo("ipc.bad_request", "ipc.error.bad_request", [
@@ -1811,6 +2046,197 @@ export class MockCore implements Transport {
   /** Windows' default output (audio.devices), if not the speakers */
   defaultOutput: string | null = null;
 
+  /** The HID host's requests, as the core answers them */
+  private async hid(method: string, p: Record<string, unknown>): Promise<unknown> {
+    const s = this.snap.settings;
+    const on = s.developer_mode && s.hid_host;
+    const developerOnly = () => {
+      if (!s.developer_mode) throw errorInfo("developer.off", "ipc.error.developer_only");
+    };
+    const setOn = (v: boolean) => {
+      this.snap.settings = { ...this.snap.settings, hid_host: v };
+      this.emit({ kind: "settings", value: this.snap.settings });
+    };
+    const devices = (list: typeof this.snap.hid_devices) => {
+      this.snap.hid_devices = list;
+      this.emit({ kind: "hid_devices", value: list });
+    };
+    const address = String(p.address ?? "").toUpperCase();
+    switch (method) {
+      case "hid.code":
+        developerOnly();
+        this.hidCode = String(Math.floor(Math.random() * 1_000_000)).padStart(6, "0");
+        return { code: this.hidCode };
+      case "hid.enable": {
+        developerOnly();
+        if (!p.other_input_at_hand || !p.risk_understood) throw errorInfo("hid.not_confirmed", "error.hid.not_confirmed");
+        const handed = this.hidCode;
+        this.hidCode = null;
+        if (!handed || String(p.code).trim() !== handed) throw errorInfo("hid.wrong_code", "error.hid.wrong_code");
+        setOn(true);
+        // The self-test right after: a failure turns it off again
+        const failed = this.hidSelfTestFails;
+        this.setHidHealth(failed ? { state: "failed", reason: failed } : { state: "ok", reason: null });
+        if (failed) {
+          setOn(false);
+          const key = {
+            helper: "ui.dev.hid_test_off_start",
+            refused: "ui.dev.hid_test_off_refused",
+            timeout: "ui.dev.hid_test_off_timeout",
+          }[failed];
+          throw errorInfo(key, key);
+        }
+        return null;
+      }
+      case "hid.disable":
+        if (s.hid_host) setOn(false);
+        this.snap.hid_candidates = [];
+        this.emit({ kind: "hid_candidates", value: [] });
+        devices(this.snap.hid_devices.map((d) => ({ ...d, connected: false })));
+        return null;
+      case "hid.status":
+        if (on) {
+          this.hidCounts.reports += 12;
+          this.hidCounts.events += 10;
+          this.hidCounts.injected += 10;
+        }
+        return { devices: this.snap.hid_devices, counts: on ? { ...this.hidCounts } : null };
+      case "hid.add": {
+        developerOnly();
+        if (!on) throw errorInfo("hid.off", "error.hid.off");
+        const known = this.snap.hid_devices.some((d) => d.address === address);
+        if (!known && this.snap.hid_devices.length >= 8) throw errorInfo("hid.too_many", "error.hid.too_many");
+        const name = String(p.name ?? "");
+        const le = typeof p.le === "number";
+        if (!known) devices([...this.snap.hid_devices, { address, name, connected: false, le }]);
+        // Pairing takes a while
+        await new Promise((r) => this.later(1500, () => r(undefined)));
+        if (address === MOCK_PASSKEY_KEYBOARD) {
+          // This keyboard asks for a number: shown until the user types it
+          // (typeHidPasskey) or a while has passed
+          const passkey = String(Math.floor(Math.random() * 1_000_000)).padStart(6, "0");
+          this.setHidPasskey({ address, passkey });
+          await new Promise<void>((r) => {
+            this.hidTyped = r;
+            this.later(8000, r);
+          });
+          this.hidTyped = null;
+          this.setHidPasskey(null);
+        }
+        devices(this.snap.hid_devices.map((d) => (d.address === address ? { ...d, connected: true } : d)));
+        // A new device stays only once its input arrives
+        if (!known) this.startHidCheck(address, name, typeof p.le === "number" ? p.le : null);
+        return null;
+      }
+      case "hid.check_cancel":
+        if (this.snap.hid_checks.some((c) => c.address === address)) this.endHidCheck(address, "cancelled");
+        return null;
+      case "hid.check_dismiss":
+        if (this.snap.hid_rolled_back) {
+          this.snap.hid_rolled_back = null;
+          this.emitHidCheck();
+        }
+        return null;
+      case "hid.connect":
+        developerOnly();
+        if (!on) throw errorInfo("hid.off", "error.hid.off");
+        if (!this.snap.hid_devices.some((d) => d.address === address))
+          throw errorInfo("hid.connect_failed", "error.hid.connect_failed");
+        await new Promise((r) => this.later(800, () => r(undefined)));
+        devices(this.snap.hid_devices.map((d) => (d.address === address ? { ...d, connected: true } : d)));
+        return null;
+      default:
+        devices(this.snap.hid_devices.filter((d) => d.address !== address));
+        if (this.snap.hid_checks.some((c) => c.address === address)) {
+          this.snap.hid_checks = this.snap.hid_checks.filter((c) => c.address !== address);
+          this.emitHidCheck();
+        }
+        return null;
+    }
+  }
+
+  private emitHidCheck() {
+    this.emit({ kind: "hid_check", value: { checks: this.snap.hid_checks, rolled_back: this.snap.hid_rolled_back } });
+  }
+
+  /** The countdown of a device just added (the core's check) */
+  private startHidCheck(address: string, name: string, le: number | null) {
+    const kind = address === MOCK_PASSKEY_KEYBOARD ? "keyboard" : le === 1 ? "mouse" : "";
+    const check: HidCheck = {
+      address,
+      name,
+      kind,
+      waiting: true,
+      remaining_ms: this.hidCheckWindowMs,
+      window_ms: this.hidCheckWindowMs,
+    };
+    this.hidCheckLe.set(address, le);
+    this.snap.hid_rolled_back = null;
+    this.snap.hid_checks = [...this.snap.hid_checks.filter((c) => c.address !== address), check];
+    this.emitHidCheck();
+    if (this.hidCheckOutcome === "input") this.later(3000, () => this.hidInput(address));
+    // Real timers: the countdown is in real time whatever the mock's speed
+    if (this.hidCheckOutcome !== "manual") {
+      const t = setTimeout(() => {
+        this.timers.delete(t);
+        this.hidCheckTimeout(address);
+      }, this.hidCheckWindowMs);
+      this.timers.add(t);
+    }
+  }
+
+  private hidCheckLe = new Map<string, number | null>();
+
+  /** The device's check ends: confirmed, removed after the countdown, or
+   *  removed by the user */
+  private endHidCheck(address: string, outcome: "confirmed" | "no_input" | "cancelled") {
+    const check = this.snap.hid_checks.find((c) => c.address === address);
+    if (!check) return;
+    this.snap.hid_checks = this.snap.hid_checks.filter((c) => c.address !== address);
+    if (outcome !== "confirmed") {
+      this.snap.hid_devices = this.snap.hid_devices.filter((d) => d.address !== address);
+      this.emit({ kind: "hid_devices", value: this.snap.hid_devices });
+      if (outcome === "no_input") {
+        const le = this.hidCheckLe.get(address) ?? null;
+        this.snap.hid_rolled_back = { address, name: check.name, le, reason: outcome };
+      }
+    }
+    this.emitHidCheck();
+  }
+
+  /** Input of the device being added reached Windows: it stays */
+  hidInput(address: string) {
+    this.endHidCheck(address.toUpperCase(), "confirmed");
+  }
+
+  /** The countdown of the device being added ran out: it is removed */
+  hidCheckTimeout(address: string) {
+    this.endHidCheck(address.toUpperCase(), "no_input");
+  }
+
+  /** The self-test's result (the banner warns when it failed) */
+  setHidHealth(h: HidHealth | null) {
+    this.snap.hid_health = h;
+    this.emit({ kind: "hid_health", value: h });
+  }
+
+  /** Developer mode and keyboards and mice on (?hidon) */
+  setHidOn() {
+    this.snap.settings.developer_mode = true;
+    this.snap.settings.hid_host = true;
+  }
+
+  /** The number to type on a keyboard being added (null: none any more) */
+  setHidPasskey(p: HidPasskey | null) {
+    this.snap.hid_passkey = p;
+    this.emit({ kind: "hid_passkey", value: p });
+  }
+
+  /** The user typed the number on the keyboard and pressed Enter */
+  typeHidPasskey() {
+    this.hidTyped?.();
+  }
+
   /** Windows' audio devices changed (a cable installed by its own setup) */
   audioEndpointsChanged() {
     this.snap.audio_endpoints += 1;
@@ -1819,6 +2245,18 @@ export class MockCore implements Transport {
 
   setOtherRadio(radio: Snapshot["adapter"]["other_radio"]) {
     this.snap.adapter.other_radio = radio;
+  }
+  /** The saved devices' names, in the list's order (their profiles follow) */
+  nameSaved(names: readonly string[]) {
+    let i = 0;
+    this.snap.devices = this.snap.devices.map((d) => {
+      if (!d.saved || i >= names.length) return d;
+      const name = names[i++];
+      for (const p of this.snap.profiles) {
+        if (p.device_address.toUpperCase() === d.address.toUpperCase() && p.le_audio === d.le_audio) p.device_name = name;
+      }
+      return { ...d, name };
+    });
   }
   /** The adapter hung after a crash (issue #86): gone from the list, an
    *  unknown USB device in its place, the stack's start failed */
@@ -1844,6 +2282,10 @@ export class MockCore implements Transport {
         vendor_note: { key: "firmware.vendor_mediatek", args: [] },
       },
     ];
+  }
+
+  setDeveloperMode() {
+    this.snap.settings.developer_mode = true;
   }
 
   setLoader(loader: Snapshot["adapter"]["loader"]) {
@@ -2103,7 +2545,24 @@ export class MockCore implements Transport {
   }
 
   private setAdapter(status: Snapshot["adapter"]["status"]) {
-    this.snap.adapter = { ...this.snap.adapter, status, error: null };
+    // As the core: the chosen adapter on WinUSB, else the first one, is open
+    // while the stack runs
+    const winusb = this.snap.adapter.adapters.filter((a) => a.driver === "winusb");
+    const id = (this.snap.settings.adapter_id ?? "").toLowerCase();
+    const open = winusb.find((a) => id !== "" && a.instance_id.toLowerCase() === id) ?? winusb[0];
+    const active =
+      status === "ready" && open
+        ? {
+            display_name: open.display_name,
+            windows_name: open.windows_name,
+            vid: open.vid,
+            pid: open.pid,
+            vendor: open.vendor,
+            chip: open.realtek_chip,
+            bt_version: open.bt_version,
+          }
+        : null;
+    this.snap.adapter = { ...this.snap.adapter, status, error: null, active };
     this.emit({ kind: "adapter", value: this.snap.adapter });
   }
 
@@ -2252,6 +2711,15 @@ export class MockCore implements Transport {
         : code !== null && (len(code) < 4 || len(code) > 16)
           ? "the broadcast code needs 4 to 16 bytes"
           : null;
+    // As the core: after the answer the session before ends (Idle), then
+    // the broadcast is set up
+    this.later(0, () => {
+      const settingUp = this.snap.stream;
+      if (settingUp.state !== "connecting") return;
+      this.setStream("idle", "status.disconnected");
+      this.snap.stream = settingUp;
+      this.emit({ kind: "stream", value: this.snap.stream });
+    });
     this.connect({
       address: "00:00:00:00:00:00",
       le: true,
@@ -2656,6 +3124,10 @@ export class MockCore implements Transport {
         this.snap.devices = merged;
         this.snap.scanning = false;
         this.emit({ kind: "devices", value: merged });
+        // Kept apart from the device list, as the core does
+        const s = this.snap.settings;
+        this.snap.hid_candidates = s.developer_mode && s.hid_host ? HID_LE_RESULTS : [];
+        this.emit({ kind: "hid_candidates", value: this.snap.hid_candidates });
         this.emit({ kind: "scanning", value: false });
         resolve(found);
       };
@@ -3283,9 +3755,31 @@ export function mockFromUrl(): MockCore {
   const scenario = (q.get("mock") as MockScenario | null) ?? "normal";
   const win = q.get("window") === "flyout" ? "flyout" : "main";
   const mock = new MockCore({ scenario, window: win, language: q.get("lang") ?? undefined });
+  // ?dev: developer mode on (the Developer screen)
+  if (q.has("dev")) mock.setDeveloperMode();
+  mock.serviceDeclines = q.has("servicedecline");
   mock.noVirtual = q.has("novirtual");
   mock.hifiCable = q.has("hificable");
   mock.captureDrops = q.has("capturedrops");
+  // Keyboards and mice (Developer): ?hidon turns them on; ?hidcheck=silent
+  // or manual: what a new device does during its countdown (default: it
+  // types after 3 s); ?hidwindow=<seconds>: the countdown; ?hidtest=helper,
+  // refused or timeout: turning on fails its self-test; ?hidhealth=failed:
+  // a self-test at start failed (the banner's warning)
+  if (q.has("hidon")) mock.setHidOn();
+  const hidCheck = q.get("hidcheck");
+  if (hidCheck === "silent" || hidCheck === "manual") mock.hidCheckOutcome = hidCheck;
+  const hidWindow = Number(q.get("hidwindow"));
+  if (hidWindow > 0) mock.hidCheckWindowMs = hidWindow * 1000;
+  const hidTest = q.get("hidtest");
+  if (hidTest === "helper" || hidTest === "refused" || hidTest === "timeout") mock.hidSelfTestFails = hidTest;
+  if (q.get("hidhealth") === "failed") {
+    mock.setHidOn();
+    mock.setHidHealth({ state: "failed", reason: "refused" });
+  }
+  // ?names=A|B|C: the saved devices' names (long names on Home)
+  const names = q.get("names");
+  if (names) mock.nameSaved(names.split("|"));
   // ?hung: the adapter hung after a crash (issue #86)
   if (q.has("hung")) mock.setHung();
   // ?winpaired: headphones Windows paired through the adapter (the setup's import)

@@ -42,15 +42,17 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
 
 use btstack_sys::consts::ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
 use le_audio::defs::{CCID_GMCS, CONTEXT_CONVERSATIONAL, UUID_CHR_CCID, UUID_SERVICE_GMCS};
 use le_audio::mcp_model::{
-    ATT_ERROR_VALUE_CHANGED_DURING_READ_LONG, MAX_TEXT, MediaBackend, MediaInfo, RESULT_COMMAND_CANNOT_BE_COMPLETED,
-    SimulatedPlayer, UUID_CHR_MEDIA_CONTROL_POINT, UUID_CHR_MEDIA_PLAYER_NAME, UUID_CHR_MEDIA_STATE,
-    UUID_CHR_OPCODES_SUPPORTED, UUID_CHR_PLAYBACK_SPEED, UUID_CHR_SEEKING_SPEED, UUID_CHR_TRACK_CHANGED,
-    UUID_CHR_TRACK_DURATION, UUID_CHR_TRACK_POSITION, UUID_CHR_TRACK_TITLE, control_point_check, cut_text, now_ms,
-    opcode_name, result_name, seek_target, text_value,
+    ATT_ERROR_VALUE_CHANGED_DURING_READ_LONG, MAX_TEXT, MediaBackend, MediaInfo, OP_FAST_FORWARD, OP_FAST_REWIND,
+    OP_NEXT_TRACK, OP_PAUSE, OP_PLAY, OP_PREVIOUS_TRACK, OP_STOP, RESULT_COMMAND_CANNOT_BE_COMPLETED, SimulatedPlayer,
+    UUID_CHR_MEDIA_CONTROL_POINT, UUID_CHR_MEDIA_PLAYER_NAME, UUID_CHR_MEDIA_STATE, UUID_CHR_OPCODES_SUPPORTED,
+    UUID_CHR_PLAYBACK_SPEED, UUID_CHR_SEEKING_SPEED, UUID_CHR_TRACK_CHANGED, UUID_CHR_TRACK_DURATION,
+    UUID_CHR_TRACK_POSITION, UUID_CHR_TRACK_TITLE, control_point_check, cut_text, now_ms, opcode_name, result_name,
+    seek_target, text_value,
 };
 
 use super::super::LeDeviceId;
@@ -62,6 +64,7 @@ use super::super::gatt_server::{
 use super::super::module::{
     ATT_ERROR_READ_NOT_PERMITTED, ATT_ERROR_WRITE_NOT_PERMITTED, LeModule, LeModuleEntry, LeModuleSetup,
 };
+use crate::{Button, HostEvent};
 
 /// Sends a control point result (con, opcode, result) in a later run loop
 /// turn; any thread
@@ -99,6 +102,8 @@ pub struct McpModule {
     last: MediaInfo,
     /// Long reads: the value given at offset 0, per (con, value handle)
     long_reads: HashMap<(u16, u16), Vec<u8>>,
+    /// The host's events: each button command for the IPC clients
+    events: Option<Sender<HostEvent>>,
 }
 
 fn le32(v: i32) -> Vec<u8> {
@@ -119,6 +124,7 @@ impl McpModule {
             h: Handles::default(),
             last: MediaInfo::default(),
             long_reads: HashMap::new(),
+            events: None,
         }
     }
 
@@ -202,6 +208,12 @@ impl McpModule {
         let mi = self.backend.info();
         tracing::info!("MCP: control point {} (0x{op:02x}) from 0x{con:04x}", opcode_name(op));
         tracing::debug!("MCP: control point value {value:02X?}, media state 0x{:02X}", mi.state);
+        // The IPC clients get the button, also when it is refused below
+        if value.len() == 1
+            && let (Some(button), Some(events)) = (mcp_button(op), &self.events)
+        {
+            let _ = events.send(HostEvent::Button { button, pressed: true, le_audio: true });
+        }
         let param = match control_point_check(&mi, value) {
             Ok((_, param)) => param,
             Err(result) => {
@@ -384,15 +396,32 @@ impl LeModule for McpModule {
 pub fn create(setup: &mut LeModuleSetup) -> LeModuleEntry {
     // None: the simulated player (dry run)
     let backend = setup.media.take().unwrap_or_else(|| Box::new(SimulatedPlayer::new()));
-    LeModuleEntry { module: Box::new(McpModule::new(backend, setup.poster.clone())), hooks: None }
+    let mut module = McpModule::new(backend, setup.poster.clone());
+    module.events = Some(setup.events.clone());
+    LeModuleEntry { module: Box::new(module), hooks: None }
+}
+
+/// The headphone button of a Media Control Point opcode; None for Move
+/// Relative (a seek, no button) and unknown opcodes
+fn mcp_button(op: u8) -> Option<Button> {
+    Some(match op {
+        OP_PLAY => Button::Play,
+        OP_PAUSE => Button::Pause,
+        OP_STOP => Button::Stop,
+        OP_NEXT_TRACK => Button::Next,
+        OP_PREVIOUS_TRACK => Button::Previous,
+        OP_FAST_FORWARD => Button::FastForward,
+        OP_FAST_REWIND => Button::Rewind,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use le_audio::mcp_model::{
-        OP_FAST_REWIND, OP_MOVE_RELATIVE, OP_NEXT_TRACK, OP_PLAY, RESULT_MEDIA_PLAYER_INACTIVE,
-        RESULT_OPCODE_NOT_SUPPORTED, RESULT_SUCCESS, SIM_DURATION, SIM_PLAYER, STATE_PAUSED, STATE_PLAYING,
+        OP_MOVE_RELATIVE, RESULT_MEDIA_PLAYER_INACTIVE, RESULT_OPCODE_NOT_SUPPORTED, RESULT_SUCCESS, SIM_DURATION,
+        SIM_PLAYER, STATE_PAUSED, STATE_PLAYING,
     };
     use std::sync::Mutex;
 
@@ -501,6 +530,24 @@ mod tests {
         assert_eq!(m.backend.info().state, STATE_PAUSED);
         m.on_position_write(&1000i32.to_le_bytes(), false).unwrap();
         assert_eq!(m.backend.info().position, 0);
+    }
+
+    #[test]
+    fn button_commands_reach_the_host_events() {
+        let (mut m, _, _) = module();
+        let (tx, rx) = std::sync::mpsc::channel();
+        m.events = Some(tx);
+        m.dry_run = false;
+        // Also refused (media keys off, an opcode not supported)
+        m.on_control_point(0x40, &[OP_PLAY], false).unwrap();
+        m.on_control_point(0x40, &[OP_FAST_REWIND], true).unwrap();
+        m.on_control_point(0x40, &[OP_NEXT_TRACK], true).unwrap();
+        // A seek is no button, nor is an unknown opcode
+        m.on_control_point(0x40, &[OP_MOVE_RELATIVE, 0, 0, 0, 0], true).unwrap();
+        m.on_control_point(0x40, &[0x77], true).unwrap();
+        let got: Vec<HostEvent> = rx.try_iter().collect();
+        let press = |button| HostEvent::Button { button, pressed: true, le_audio: true };
+        assert_eq!(got, [press(Button::Play), press(Button::Rewind), press(Button::Next)]);
     }
 
     #[test]

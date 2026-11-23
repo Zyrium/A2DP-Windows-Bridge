@@ -50,6 +50,7 @@ See the [Setup guide](https://seiyafunaokajp.github.io/BlueCaster/setup) and the
 
 - **Codec choice**: uses the best codec your headphones support, or the one you choose; ABR for LHDC V5, LDAC and aptX Adaptive
 - **LE Audio (experimental, developer mode only)**: LC3 to LE Audio headphones and earbuds with a Bluetooth 5.2 adapter. LE Audio does not work reliably on real adapters yet, including the MediaTek MT7925 ([details](https://seiyafunaokajp.github.io/BlueCaster/usage#le-audio))
+- **Auracast broadcast (experimental, developer mode only)**: LC3 to any number of Auracast receivers, as stereo, mono, left / right as two broadcasts, or a **matrix** of four speakers (front and rear, each stereo or one broadcast per speaker) from a multichannel source, with a live mixer (gains, presets, delay, polarity) and front and rear rates of their own. One broadcast per speaker needs an adapter that runs more than two BIGs: the ASUS BT600 runs two; an **nRF5340 DK** with the firmware in [tools/nrf5340-hci](tools/nrf5340-hci/README.md) runs four ([details](docs/le-audio-dev.md))
 - **Capture**: all system audio, a virtual audio device (e.g. VB-CABLE), or one application
 - **Runs in the tray**: keeps streaming when the window is closed, and reconnects after a dropped link or sleep
 - **Driver setup in the app**: switches the adapter to WinUSB and back without Zadig; headphones that Windows paired through the adapter connect without pairing again
@@ -73,6 +74,8 @@ pwsh ./build.ps1 -Release -Arch x64   # installer and portable zip (-Arch arm64 
 ```
 
 Double-clicking `build.bat` runs the first command. The other switches (debug build, tests, emulator test) are listed at the top of [build.ps1](build.ps1). See [Building](https://seiyafunaokajp.github.io/BlueCaster/building) for step-by-step instructions and [Architecture](https://seiyafunaokajp.github.io/BlueCaster/architecture) for how the programs fit together.
+
+The nRF5340 DK firmware for Auracast is a separate nRF Connect SDK project: see [tools/nrf5340-hci](tools/nrf5340-hci/README.md).
 
 ## License
 

@@ -89,6 +89,29 @@ pub fn create_server(name: &str, first: bool) -> std::io::Result<NamedPipeServer
     server
 }
 
+/// The process ID of the client connected to the server end `pipe`
+/// (GetNamedPipeClientProcessId): who is on the other side, for the
+/// session agent's authorization
+pub fn client_process_id(pipe: std::os::windows::io::BorrowedHandle<'_>) -> std::io::Result<u32> {
+    use std::os::windows::io::AsRawHandle;
+    let mut pid = 0u32;
+    // SAFETY: the handle is a pipe handle borrowed for the call; `pid` is a
+    // valid out pointer.
+    unsafe { windows::Win32::System::Pipes::GetNamedPipeClientProcessId(HANDLE(pipe.as_raw_handle()), &mut pid) }
+        .map_err(std::io::Error::other)?;
+    Ok(pid)
+}
+
+/// The Remote Desktop Services session (logon session number) process
+/// `pid` runs in (ProcessIdToSessionId); 0 is the services' session
+pub fn process_session_id(pid: u32) -> std::io::Result<u32> {
+    let mut session = 0u32;
+    // SAFETY: plain value in, valid out pointer.
+    unsafe { windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(pid, &mut session) }
+        .map_err(std::io::Error::other)?;
+    Ok(session)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +120,12 @@ mod tests {
     fn sid_looks_like_one() {
         let sid = current_user_sid().unwrap();
         assert!(sid.starts_with("S-1-"), "{sid}");
+    }
+
+    #[test]
+    fn this_process_has_a_session() {
+        // Tests run in the signed-in user's session or a service's (0)
+        assert!(process_session_id(std::process::id()).is_ok());
+        assert!(process_session_id(3).is_err(), "PIDs are multiples of 4");
     }
 }

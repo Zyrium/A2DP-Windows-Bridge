@@ -102,11 +102,19 @@ pub fn load_le(dir: &Path) -> Vec<SavedDevice> {
 fn save_kind(dir: &Path, address: &str, name: &str, le_audio: bool) -> std::io::Result<()> {
     let mut devices = load_all(dir);
     let address = address.to_uppercase();
+    // Another earbud of a saved pair: the same device
+    let set_member = le_audio
+        && !devices.iter().any(|d| d.address == address && d.le_audio)
+        && saved_set_member(dir, &devices, &address);
     match devices.iter_mut().find(|d| d.address == address && d.le_audio == le_audio) {
         Some(d) => {
             if !name.is_empty() {
                 d.name = name.to_string();
             }
+        }
+        None if set_member => {
+            tracing::debug!("devices: not adding a member of a saved LE Audio set");
+            return Ok(());
         }
         None => {
             tracing::debug!("devices: adding {address} \"{name}\" (LE Audio {le_audio})");
@@ -116,6 +124,14 @@ fn save_kind(dir: &Path, address: &str, name: &str, le_audio: bool) -> std::io::
     let r = write_all(dir, &devices);
     tracing::debug!("devices: saved {} device(s) to {}: {r:?}", devices.len(), dir.display());
     r
+}
+
+/// `address` is a member of a set learned (crate::le_sets) whose other
+/// member is saved as an LE Audio device
+fn saved_set_member(dir: &Path, devices: &[SavedDevice], address: &str) -> bool {
+    let sets = crate::le_sets::KnownSets::of(crate::le_sets::load(dir));
+    let saved_le: Vec<SavedDevice> = devices.iter().filter(|d| d.le_audio).cloned().collect();
+    sets.saved_entry(address, &saved_le).is_some()
 }
 
 fn remove_kind(dir: &Path, address: &str, le_audio: bool) -> std::io::Result<()> {
@@ -396,6 +412,22 @@ mod tests {
         assert!(load(&dir).is_empty() && load_le(&dir).is_empty());
         assert!(!paths::le_devices_file(&dir).exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_other_earbud_of_a_saved_set_is_not_saved_again() {
+        let dir = temp_dir("set");
+        save_le(&dir, "C0:00:00:00:00:01", "Buds").unwrap();
+        // Not known as one set yet: two entries
+        save_le(&dir, "C0:00:00:00:00:03", "Other").unwrap();
+        crate::le_sets::remember(&dir, &["C0:00:00:00:00:01".into(), "C0:00:00:00:00:02".into()]).unwrap();
+        save_le(&dir, "c0:00:00:00:00:02", "Buds").unwrap();
+        let le: Vec<_> = load_le(&dir).into_iter().map(|d| d.address).collect();
+        assert_eq!(le, ["C0:00:00:00:00:01", "C0:00:00:00:00:03"]);
+        // A classic entry of that address is another device
+        save(&dir, "C0:00:00:00:00:02", "Buds").unwrap();
+        assert_eq!(load(&dir).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

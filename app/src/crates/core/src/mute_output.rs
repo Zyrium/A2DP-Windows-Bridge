@@ -17,6 +17,12 @@
 //! [`OutputMute`] lives on the session thread, like the
 //! [`VolumeSyncer`](crate::volume_sync::VolumeSyncer), and uses the same
 //! [`EndpointProvider`], so the logic is tested with fakes.
+//!
+//! Through the session agent, the agent holds the mute
+//! ([`Endpoint::keeps_mute`]): it watches the keys itself, mutes the device
+//! again and reports the key ([`session_host::volume::on_mute_key`]), so
+//! the watcher thread here does not run. The agent unmutes what it holds
+//! when the core goes away, and a new agent gets the mute again.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -80,6 +86,12 @@ fn key_pressed<E: Endpoint>(endpoint: &E, watched: &mut Watched, silence: &Atomi
         tracing::warn!("output mute: unmuted in Windows and cannot be muted again");
         return;
     }
+    key_taken(silence, changed);
+}
+
+/// A key on the device this session muted, which is muted again: the mute
+/// key turns the headphones' silence over, a volume key (`changed`) ends it
+fn key_taken(silence: &AtomicBool, changed: bool) {
     let silent = if changed {
         silence.store(false, Ordering::Release);
         false
@@ -216,7 +228,13 @@ pub struct OutputMute<P: EndpointProvider = WindowsEndpoints> {
 impl OutputMute<WindowsEndpoints> {
     pub fn new() -> Self {
         let mut m = OutputMute::with_provider(WindowsEndpoints, &HANDOVER, &KEY_SILENCE);
-        m.watch = KeyWatch::start(m.ours.clone());
+        if session_host::volume::host_keeps_mute() {
+            // The session agent watches the keys and reports them
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| session_host::volume::on_mute_key(|changed| key_taken(&KEY_SILENCE, changed)));
+        } else {
+            m.watch = KeyWatch::start(m.ours.clone());
+        }
         m
     }
 }
@@ -254,8 +272,9 @@ impl<P: EndpointProvider> OutputMute<P> {
             return;
         };
         if let Some(a) = self.attached.as_ref().filter(|a| a.endpoint.device_id() == id) {
-            // Unmuted in Windows (its mute key): the watcher may have been first
-            if a.ours {
+            // Unmuted in Windows (its mute key): the watcher may have been
+            // first; through the agent, the agent looks
+            if a.ours && !a.endpoint.keeps_mute() {
                 key_pressed(&a.endpoint, &mut lock(&self.ours), self.silence);
             }
             return;
@@ -341,6 +360,8 @@ mod tests {
         refuse: RefCell<bool>,
         /// Device -> volume scalar
         volume: RefCell<HashMap<String, f32>>,
+        /// The mute is kept on the endpoints' side (the session agent)
+        agent: RefCell<bool>,
     }
 
     impl Devices {
@@ -387,6 +408,9 @@ mod tests {
             }
             self.devices.set(&self.id, muted);
             true
+        }
+        fn keeps_mute(&self) -> bool {
+            *self.devices.agent.borrow()
         }
     }
 
@@ -474,6 +498,29 @@ mod tests {
         d.volume.borrow_mut().insert("a".into(), 0.4);
         m.tick(true);
         assert!(d.muted("a") && !m.silence.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_mute_the_agent_keeps_is_not_watched_here() {
+        let d = Devices::with(&["a"]);
+        *d.agent.borrow_mut() = true;
+        let mut m = session(&d, handover());
+        m.tick(true);
+        assert!(d.muted("a"));
+        // The agent looks at the keys: nothing is taken twice here
+        d.set("a", false);
+        m.tick(true);
+        assert!(!d.muted("a") && !m.silence.load(Ordering::Acquire));
+        // What the agent reports turns the silence over
+        key_taken(m.silence, false);
+        assert!(m.silence.load(Ordering::Acquire));
+        key_taken(m.silence, true);
+        assert!(!m.silence.load(Ordering::Acquire));
+        key_taken(m.silence, false);
+        // Let go of: unmuted (the agent's release), the silence ends
+        d.set("a", true);
+        drop(m);
+        assert!(!d.muted("a"));
     }
 
     #[test]

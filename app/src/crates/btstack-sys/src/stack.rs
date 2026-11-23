@@ -53,6 +53,8 @@ pub(crate) const INIT_ATT: u32 = 64;
 const INIT_HFP: u32 = 128;
 /// RFCOMM (Stack::rfcomm_init: for HFP, or the first client channel)
 const INIT_RFCOMM: u32 = 256;
+/// HID host (Stack::hid_host_init)
+const INIT_HID: u32 = 512;
 
 /// Largest codec information of a stream endpoint or a SET_CONFIGURATION
 /// (shim.c BLUECASTER_CODEC_INFO_MAX): aptX Adaptive's 40 bytes
@@ -185,6 +187,86 @@ impl Stack {
         // SAFETY: on the BTstack thread, after l2cap / sdp / rfcomm init.
         unsafe { ffi::bluecaster_hfp_ag_init(voice as c_int) };
         mark(INIT_HFP);
+    }
+
+    /// HID host (after l2cap_init and sdp_init): keyboards and mice can
+    /// then open their two channels; events come as [`crate::Source::Hid`]
+    pub fn hid_host_init(&self) {
+        tracing::debug!(target: "btstack", "hid host init");
+        // SAFETY: on the BTstack thread, after l2cap / sdp init; the
+        // descriptor storage is static in C.
+        unsafe { ffi::bluecaster_hid_host_init() };
+        mark(INIT_HID);
+    }
+
+    /// Opens the HID channels to `addr` in report mode. The result comes as
+    /// HID_SUBEVENT_CONNECTION_OPENED for the returned hid_cid.
+    pub fn hid_host_connect(&self, addr: &[u8; 6]) -> Result<u16, u8> {
+        let mut cid = 0u16;
+        // SAFETY: on the BTstack thread after hid_host_init; addr is 6
+        // bytes, cid writable.
+        let status = unsafe { ffi::bluecaster_hid_host_connect(addr.as_ptr(), &mut cid) };
+        tracing::debug!(target: "btstack", "hid host connect: 0x{status:02X}, cid 0x{cid:04X}");
+        if status == 0 { Ok(cid) } else { Err(status) }
+    }
+
+    /// Classic pairing of a keyboard that shows a passkey: `addr` is
+    /// answered as a display (HCI_EVENT_USER_PASSKEY_NOTIFICATION follows
+    /// when the device can type), every other device as before (no input,
+    /// no output). None: no such device any more.
+    pub fn hid_pairing_target(&self, addr: Option<&[u8; 6]>) {
+        // SAFETY: on the BTstack thread; addr is 6 bytes (C copies it) or null.
+        unsafe { ffi::bluecaster_hid_pairing_target(addr.map_or(std::ptr::null(), |a| a.as_ptr())) };
+    }
+
+    /// LE: the pairings SM starts from now on offer a display (true) or no
+    /// input, no output (false, the usual one)
+    pub fn sm_passkey_display(&self, display: bool) {
+        // SAFETY: on the BTstack thread; sets SM's IO capability only.
+        unsafe { ffi::bluecaster_sm_passkey_display(std::ffi::c_int::from(display)) };
+    }
+
+    /// Answers HID_SUBEVENT_INCOMING_CONNECTION
+    pub fn hid_host_accept(&self, hid_cid: u16, accept: bool) -> u8 {
+        // SAFETY: on the BTstack thread after hid_host_init.
+        unsafe {
+            if accept { ffi::bluecaster_hid_host_accept(hid_cid) } else { ffi::bluecaster_hid_host_decline(hid_cid) }
+        }
+    }
+
+    pub fn hid_host_disconnect(&self, hid_cid: u16) {
+        // SAFETY: on the BTstack thread after hid_host_init.
+        unsafe { ffi::bluecaster_hid_host_disconnect(hid_cid) };
+    }
+
+    /// The report descriptor of a connected device (after
+    /// HID_SUBEVENT_DESCRIPTOR_AVAILABLE)
+    pub fn hid_host_descriptor(&self, hid_cid: u16) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; 4096];
+        // SAFETY: on the BTstack thread after hid_host_init; buf is
+        // writable for the length passed.
+        let len = unsafe { ffi::bluecaster_hid_host_descriptor(hid_cid, buf.as_mut_ptr(), buf.len() as u16) };
+        buf.truncate(len as usize);
+        (len > 0).then_some(buf)
+    }
+
+    /// Sends an output report (DATA | Output) on the interrupt channel, the
+    /// report ID byte first when `report_id` is Some. At most 64 bytes; the
+    /// shim keeps its own copy until BTstack sends it.
+    pub fn hid_host_send_output(&self, hid_cid: u16, report_id: Option<u8>, data: &[u8]) -> u8 {
+        let Ok(len) = u16::try_from(data.len()) else {
+            return crate::consts::ERROR_CODE_INVALID_HCI_COMMAND_PARAMETERS;
+        };
+        let id = report_id.map_or(0xFFFF, u16::from);
+        // SAFETY: on the BTstack thread after hid_host_init; data is valid
+        // for len bytes and copied by the shim before this returns.
+        unsafe { ffi::bluecaster_hid_host_send_output(hid_cid, id, data.as_ptr(), len) }
+    }
+
+    /// The HID link `hid_cid` closed: the shim's output copy of it is free
+    pub fn hid_host_output_closed(&self, hid_cid: u16) {
+        // SAFETY: on the BTstack thread; only clears the shim's table.
+        unsafe { ffi::bluecaster_hid_host_output_closed(hid_cid) };
     }
 
     /// RFCOMM, once (after l2cap_init): by [`Stack::hfp_ag_init`], or
@@ -1075,6 +1157,9 @@ impl Stack {
             }
             if init & INIT_HFP != 0 {
                 ffi::bluecaster_hfp_ag_deinit();
+            }
+            if init & INIT_HID != 0 {
+                ffi::bluecaster_hid_host_deinit();
             }
             if init & INIT_RFCOMM != 0 {
                 ffi::bluecaster_rfcomm_deinit();

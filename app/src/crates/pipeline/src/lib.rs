@@ -15,6 +15,7 @@ pub mod convert;
 pub mod eq;
 pub mod le;
 pub mod le_rx;
+pub mod mix;
 pub mod packetizer;
 
 use std::sync::Arc;
@@ -1253,6 +1254,63 @@ mod tests {
                     let plain = encoded_through(&audio, input, fmt, None);
                     assert_eq!(plain, encoded_through(&audio, input, fmt, Some(off.clone())), "{input:?} {fmt:?}");
                     assert_eq!(plain, encoded_through(&audio, input, fmt, Some(flat.clone())), "{input:?} {fmt:?}");
+                }
+            }
+        }
+    }
+
+    /// What the encoder gets with one point at +1 dB against what it gets
+    /// without the EQ, per frequency: the designed bell at the point, the
+    /// preamp everywhere else, up to 19 kHz, for float and 16-bit capture,
+    /// mono, stereo and 5.1
+    #[test]
+    fn eq_on_is_flat_away_from_its_point_at_the_encoder() {
+        use std::f64::consts::PI;
+        let freqs = [50.0f64, 200.0, 1000.0, 5000.0, 10_000.0, 15_000.0, 19_000.0];
+        let band = [dsp::EqBand::peaking(1000.0, 1.0, 1.41)];
+        for sample in [SampleType::F32, SampleType::I16] {
+            for (rate, channels) in [(44_100u32, 2u16), (48_000, 1), (48_000, 2), (48_000, 6), (96_000, 2)] {
+                let input = InputFormat { sample_rate: rate, channels, sample };
+                let r = f64::from(rate);
+                let frames = rate as usize;
+                let mut audio = Vec::new();
+                for n in 0..frames {
+                    for c in 0..channels as usize {
+                        let x: f64 = freqs
+                            .iter()
+                            .enumerate()
+                            .map(|(k, f)| 0.05 * (2.0 * PI * f * n as f64 / r + (k + c) as f64).sin())
+                            .sum();
+                        match sample {
+                            SampleType::F32 => audio.extend_from_slice(&(x as f32).to_le_bytes()),
+                            _ => audio.extend_from_slice(&((x * 32767.0) as i16).to_le_bytes()),
+                        }
+                    }
+                }
+                let h = eq::EqHandle::default();
+                h.set(eq::EqSettings::new(true, &band));
+                let plain = encoded_through(&audio, input, PcmFormat::I16, None);
+                let eqd = encoded_through(&audio, input, PcmFormat::I16, Some(h));
+                // A fifth of a second once settled: every multiple of 5 Hz is its own bin
+                let bin = |x: &[i64], c: usize, f: f64| {
+                    let (mut re, mut im) = (0.0f64, 0.0f64);
+                    for (n, s) in x.as_chunks::<2>().0.iter().enumerate().skip(frames / 2).take(frames / 5) {
+                        let w = 2.0 * PI * f * n as f64 / r;
+                        re += s[c] as f64 * w.cos();
+                        im -= s[c] as f64 * w.sin();
+                    }
+                    re.hypot(im)
+                };
+                let preamp = -eq::max_boost_db(&band, r);
+                for c in 0..2 {
+                    for f in freqs {
+                        let got = 20.0 * (bin(&eqd, c, f) / bin(&plain, c, f)).log10();
+                        let want = dsp::biquad::eq_response_db(&band, f, r) + preamp;
+                        assert!(
+                            (got - want).abs() < 0.1,
+                            "{sample:?} {rate} Hz {channels} ch: {got:+.3} dB at {f} Hz (designed {want:+.3}), channel {c}"
+                        );
+                    }
                 }
             }
         }

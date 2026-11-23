@@ -49,6 +49,7 @@ const INFO: StreamInfo = {
   abr: false,
   bitrate_capped: false,
   hi_res_set: false,
+  low_latency: false,
   source: null,
   le: null,
   details: SBC,
@@ -122,7 +123,7 @@ describe("codec details", () => {
       frame_bytes: null,
       frames_per_packet: null,
       sbc: null,
-      device: { codec: "ldac", sample_rates: [44100, 48000, 96000], bit_depths: [16, 24], max_bitrate: 0 },
+      device: { codec: "ldac", sample_rates: [44100, 48000, 96000], bit_depths: [16, 24], max_bitrate: 0, lhdcv5_low_latency: false },
     };
     const info = { ...INFO, codec: "LDAC", sample_rate: 96000, bits: 24, details: ldac };
     const c = render(() => <CodecDetailsCard info={info} details={ldac} />).container;

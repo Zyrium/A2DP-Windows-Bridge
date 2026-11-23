@@ -55,8 +55,18 @@
 #define ENABLE_HFP_SUPER_WIDE_BAND_SPEECH
 
 /* Link key storage for paired devices */
-#define NVM_NUM_DEVICE_DB_ENTRIES  16
 #define NVM_NUM_LINK_KEYS          16
+
+/* LE bonds (le_device_db_tlv.c). One device takes one, an earbud pair two,
+ * and so does each classic device that gave its LE keys (src/ctkd.rs); the
+ * oldest goes when all are taken (src/le_bonds.rs). A bond costs a byte here,
+ * 68 bytes of the bonds file, and an AES block per private address that is
+ * looked up. At most 66: bond 66 would have the TLV tag of att_server's
+ * Database Hash ('BTD' + 'B'). */
+#define NVM_NUM_DEVICE_DB_ENTRIES  64
+#if NVM_NUM_DEVICE_DB_ENTRIES > 66
+#error "LE bond 66 has the TLV tag of the GATT Database Hash"
+#endif
 
 /* LE (experimental LE Audio). Compiled in always, but inert unless LE Audio
  * is enabled: only then is the controller's LE support visible to BTstack
@@ -74,6 +84,15 @@
 #define ENABLE_LE_ISOCHRONOUS_STREAMS      /* CIG / CIS as central, BIG, HCI ISO data */
 #define ENABLE_LE_PERIODIC_ADVERTISING     /* the BASE of a broadcast (Auracast source) */
 
+/* Keyboards and mice (issue #413) that advertise with resolvable private
+ * addresses: BTstack fills the controller's resolving list with the IRKs of
+ * the LE bonds and turns address resolution on, so the background
+ * connection's accept list matches their identity addresses. Inert in every
+ * other run: the transport hides LE Set Address Resolution Enable from
+ * BTstack (btstack-sys src/transport.rs, "Address resolution hidden"), and
+ * hci.c touches the resolving list only when the controller lists it. */
+#define ENABLE_LE_PRIVACY_ADDRESS_RESOLUTION
+
 /* ATT server: a read / write callback may answer "pending". btstack-sys does
  * so only while the application is busy (an ATT request processed from
  * within one of its own calls) and lets BTstack ask again right after. */
@@ -88,10 +107,15 @@
 #define MAX_NR_BIS                 2
 
 /* CCC values of bonded GATT clients att_server keeps in the bond TLV, for
- * all clients together (default 20; the oldest go first). The PC's GMCS and
- * GTBS have 23 CCCs: room for about 11 bonded clients. At most 256 (one
- * byte of the TLV tag). */
-#define NVN_NUM_GATT_SERVER_CCC    256
+ * all clients together (default 20; the oldest go first, and that client is
+ * not notified again until it writes them anew). The PC's GATT server has 23
+ * CCCs (Service Changed, GMCS 10, GTBS 12): room for all of them of every
+ * bond. The TLV tags are bluecaster_ccc_tag (shim.c), at most 2560. */
+#define BLUECASTER_GATT_SERVER_CCCS  23
+#define NVN_NUM_GATT_SERVER_CCC    (NVM_NUM_DEVICE_DB_ENTRIES * BLUECASTER_GATT_SERVER_CCCS)
+#if NVN_NUM_GATT_SERVER_CCC > 2560
+#error "bluecaster_ccc_tag has no tags for this many CCC values"
+#endif
 
 /* A2DP explicit config: disable SBC auto-selection, allow vendor codec config.
  * Required for LDAC/aptX - BTstack's auto-mode only handles SBC. */

@@ -14,6 +14,8 @@
 //! media payload header, the sink's bit rate limits applied after init, and
 //! the ABR policy of lhdcv5BT_enc.c ([`LhdcV5Encoder::abr_adjust`]).
 
+use std::time::{Duration, Instant};
+
 use lhdcv5_sys::{LhdcV5Enc, ffi};
 
 use crate::{CodecKind, Encoded, Encoder, EncoderConfig, EncoderError, Pcm, PcmFormat, Quality};
@@ -37,6 +39,95 @@ const ABR_TABLE_48K: [u32; 6] = [160, 192, 256, 320, 400, 400];
 const ABR_TABLE_96K: [u32; 6] = [256, 320, 400, 400, 400, 400];
 const ABR_TABLE_192K: [u32; 6] = [256, 320, 400, 400, 400, 400];
 
+// The queue guard of low latency without ABR. With the
+// link at its limit the send queue fills and never drains (packets go out
+// only as fast as they are made), so the delay it holds stays until the
+// next connection. The guard lowers the bit rate one step while the queue
+// stays backed up, which gives the link room to empty it, and goes back up
+// after a long calm. Android's ABR does the job too, but never above 400 kbps.
+/// The queue's average over this long decides a step
+const GUARD_WINDOW: Duration = Duration::from_secs(1);
+/// Average depth (packets) that steps down: 60 ms of 5 ms frames
+const GUARD_DOWN_AVG: u64 = 12;
+/// After a step down the queue gets this long to drain before another
+const GUARD_DOWN_HOLD: Duration = Duration::from_secs(2);
+/// Average depth at or below this counts as calm
+const GUARD_CALM_AVG: u64 = 1;
+/// Calm this long steps back up (doubled after a step up that did not hold)
+const GUARD_UP_FIRST: Duration = Duration::from_secs(60);
+const GUARD_UP_MAX: Duration = Duration::from_secs(600);
+/// A step down this soon after a step up: the step up did not hold
+const GUARD_UP_FAILED: Duration = Duration::from_secs(30);
+
+/// Queue guard state: bit rate indices of the encoder's table
+#[derive(Debug)]
+struct Guard {
+    /// Where the quality mode put the bit rate (after the sink's and the
+    /// MTU's limits): the guard never goes above it
+    target: u32,
+    /// The lowest it goes (500 kbps, or the target if that is lower)
+    floor: u32,
+    window_start: Instant,
+    sum: u64,
+    count: u64,
+    calm_since: Option<Instant>,
+    last_down: Option<Instant>,
+    last_up: Option<Instant>,
+    up_wait: Duration,
+}
+
+impl Guard {
+    fn new(target: u32, now: Instant) -> Guard {
+        Guard {
+            target,
+            floor: target.min(ffi::LHDC_QUALITY_MID),
+            window_start: now,
+            sum: 0,
+            count: 0,
+            calm_since: None,
+            last_down: None,
+            last_up: None,
+            up_wait: GUARD_UP_FIRST,
+        }
+    }
+
+    /// One packet sent with `depth` packets queued before its round, at
+    /// `now`, the encoder at index `current`: the index to switch to, if any
+    fn step(&mut self, now: Instant, depth: u32, current: u32) -> Option<u32> {
+        self.sum += u64::from(depth);
+        self.count += 1;
+        if now.saturating_duration_since(self.window_start) < GUARD_WINDOW {
+            return None;
+        }
+        // Average x10, to tell 1.0 from 1.9
+        let avg10 = self.sum * 10 / self.count.max(1);
+        self.sum = 0;
+        self.count = 0;
+        self.window_start = now;
+        if avg10 >= GUARD_DOWN_AVG * 10 {
+            self.calm_since = None;
+            let held = self.last_down.is_none_or(|t| now.saturating_duration_since(t) >= GUARD_DOWN_HOLD);
+            if current > self.floor && held {
+                if self.last_up.is_some_and(|t| now.saturating_duration_since(t) < GUARD_UP_FAILED) {
+                    self.up_wait = (self.up_wait * 2).min(GUARD_UP_MAX);
+                }
+                self.last_down = Some(now);
+                return Some(current - 1);
+            }
+        } else if avg10 <= GUARD_CALM_AVG * 10 {
+            let since = *self.calm_since.get_or_insert(now);
+            if current < self.target && now.saturating_duration_since(since) >= self.up_wait {
+                self.last_up = Some(now);
+                self.calm_since = Some(now);
+                return Some(current + 1);
+            }
+        } else {
+            self.calm_since = None;
+        }
+        None
+    }
+}
+
 /// Adaptive bit rate state (Android lhdcv5BT_enc.c)
 struct Abr {
     table: &'static [u32; 6],
@@ -59,6 +150,9 @@ pub struct LhdcV5Encoder {
     /// s24le, one frame
     packed: Vec<u8>,
     abr: Option<Abr>,
+    /// Low latency without ABR lowers the bit rate while
+    /// the send queue stays backed up ([`Guard`])
+    guard: Option<Guard>,
     /// The sink's maximum bit rate (P7) is below the quality mode's
     peer_capped: bool,
 }
@@ -165,8 +259,11 @@ impl LhdcV5Encoder {
 
         let init_err = |e: lhdcv5_sys::Error| EncoderError::Init { codec: CODEC, what: e.to_string() };
         let mut enc = LhdcV5Enc::new().map_err(init_err)?;
-        enc.init_encoder(config.sample_rate, encoder_bits, bitrate_inx, enc_mtu as u32, ffi::LHDC_ENC_INTERVAL_20MS)
-            .map_err(init_err)?;
+        // Android encodes every 10 ms instead of 20 with low latency on
+        let interval =
+            if config.peer.lhdcv5_low_latency { ffi::LHDC_ENC_INTERVAL_10MS } else { ffi::LHDC_ENC_INTERVAL_20MS };
+        enc.init_encoder(config.sample_rate, encoder_bits, bitrate_inx, enc_mtu as u32, interval).map_err(init_err)?;
+        tracing::info!("LHDC V5: encode interval {interval} ms");
 
         let block_size = match enc.block_size() {
             Ok(n) if n > 0 => n as usize,
@@ -220,7 +317,7 @@ impl LhdcV5Encoder {
             Abr { table, index: table.len() - 1, down_count: 0, down_sum: 0, up_count: 0, up_sum: 0 }
         });
 
-        let encoder = LhdcV5Encoder {
+        let mut encoder = LhdcV5Encoder {
             enc,
             format,
             channels: config.channels as usize,
@@ -228,8 +325,19 @@ impl LhdcV5Encoder {
             enc_mtu,
             packed,
             abr,
+            guard: None,
             peer_capped,
         };
+        if config.peer.lhdcv5_low_latency
+            && !config.abr
+            && let Some(target) = encoder.current_index()
+        {
+            encoder.guard = Some(Guard::new(target, Instant::now()));
+            tracing::info!(
+                "LHDC V5: queue guard on (low latency): down to {} kbps while the send queue stays backed up",
+                bitrate_table(config.sample_rate)[target.min(ffi::LHDC_QUALITY_MID) as usize]
+            );
+        }
         tracing::info!(
             "LHDC V5: initialized (rate={}, ch={}, {}-bit, mtu={}, frame={} samples, bitrate={} kbps{}, peer limits idx {}..{}{})",
             config.sample_rate,
@@ -254,6 +362,23 @@ impl LhdcV5Encoder {
     /// Index in the encoder's bit rate table of its current target
     fn current_index(&self) -> Option<u32> {
         self.enc.bitrate_index(self.enc.last_bitrate()).ok()
+    }
+
+    /// One packet of the queue guard ([`Guard`]): a step down or up when
+    /// the queue asks for it
+    fn guard_adjust(&mut self, queue_depth: u32) {
+        let Some(current) = self.current_index() else { return };
+        let Some(guard) = self.guard.as_mut() else { return };
+        let Some(next) = guard.step(Instant::now(), queue_depth, current) else { return };
+        let before = self.enc.last_bitrate();
+        match self.enc.set_bitrate_index(next, false) {
+            Ok(()) => tracing::info!(
+                "LHDC V5: queue guard {before} -> {} kbps ({})",
+                self.enc.last_bitrate(),
+                if next < current { "send queue backed up" } else { "queue calm" }
+            ),
+            Err(e) => tracing::warn!("LHDC V5: queue guard to index {next} failed: {e}"),
+        }
     }
 
     /// Repacks one frame of input into `packed`: interleaved stereo, s16le
@@ -336,6 +461,10 @@ impl Encoder for LhdcV5Encoder {
     /// throughout raise it one stage, up to 400 kbps. Does nothing when ABR
     /// is off.
     fn abr_adjust(&mut self, queue_depth: u32) {
+        if self.abr.is_none() {
+            self.guard_adjust(queue_depth);
+            return;
+        }
         let Some(mut abr) = self.abr.take() else { return };
 
         if abr.down_count >= ABR_DOWN_RATE_TIME_CNT {
@@ -395,8 +524,23 @@ impl Encoder for LhdcV5Encoder {
         self.abr.is_some()
     }
 
-    /// Back to the top of the ABR table (400 kbps), counters cleared
+    fn queue_guard_active(&self) -> bool {
+        self.guard.is_some()
+    }
+
+    /// Back to the top of the ABR table (400 kbps), counters cleared; the
+    /// queue guard back to the quality mode's bit rate
     fn abr_reset(&mut self) {
+        if let Some(guard) = self.guard.as_mut() {
+            let target = guard.target;
+            *guard = Guard::new(target, Instant::now());
+            if self.current_index() != Some(target)
+                && let Err(e) = self.enc.set_bitrate_index(target, false)
+            {
+                tracing::warn!("LHDC V5: queue guard reset to index {target} failed: {e}");
+            }
+            return;
+        }
         let Some(abr) = self.abr.as_mut() else { return };
         let top = abr.table.len() - 1;
         *abr = Abr { table: abr.table, index: top, down_count: 0, down_sum: 0, up_count: 0, up_sum: 0 };
@@ -410,5 +554,88 @@ impl Encoder for LhdcV5Encoder {
             Ok(_) => {}
             Err(e) => tracing::warn!("LHDC V5: ABR reset to {rate} kbps failed: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    /// Feeds `secs` seconds of packets (100 per second) with `depth`
+    /// queued, starting at `t`, applying each switch to `current`; returns
+    /// the time after and the switches made
+    fn feed(g: &mut Guard, t: Instant, secs: u64, depth: u32, current: &mut u32) -> (Instant, Vec<u32>) {
+        let mut switches = Vec::new();
+        let mut now = t;
+        for _ in 0..secs * 100 {
+            now += Duration::from_millis(10);
+            if let Some(next) = g.step(now, depth, *current) {
+                *current = next;
+                switches.push(next);
+            }
+        }
+        (now, switches)
+    }
+
+    #[test]
+    fn a_backed_up_queue_steps_down_to_the_floor_and_no_further() {
+        let t = Instant::now();
+        let mut g = Guard::new(ffi::LHDC_QUALITY_HIGH1, t);
+        let mut cur = ffi::LHDC_QUALITY_HIGH1;
+        let (_, sw) = feed(&mut g, t, 10, 20, &mut cur);
+        // 1000 -> 900 -> 500, at least GUARD_DOWN_HOLD apart, then it stays
+        assert_eq!(sw, vec![ffi::LHDC_QUALITY_HIGH, ffi::LHDC_QUALITY_MID]);
+        assert_eq!(cur, ffi::LHDC_QUALITY_MID);
+    }
+
+    #[test]
+    fn a_short_queue_changes_nothing() {
+        let t = Instant::now();
+        let mut g = Guard::new(ffi::LHDC_QUALITY_HIGH1, t);
+        let mut cur = ffi::LHDC_QUALITY_HIGH1;
+        let (_, sw) = feed(&mut g, t, 30, 4, &mut cur);
+        assert!(sw.is_empty(), "{sw:?}");
+    }
+
+    #[test]
+    fn a_calm_minute_steps_back_up_to_the_target_only() {
+        let t = Instant::now();
+        let mut g = Guard::new(ffi::LHDC_QUALITY_HIGH1, t);
+        let mut cur = ffi::LHDC_QUALITY_HIGH1;
+        let (t, _) = feed(&mut g, t, 4, 20, &mut cur);
+        assert_eq!(cur, ffi::LHDC_QUALITY_MID);
+        let (t, sw) = feed(&mut g, t, 59, 0, &mut cur);
+        assert!(sw.is_empty(), "not before a calm minute: {sw:?}");
+        let (t, sw) = feed(&mut g, t, 2, 0, &mut cur);
+        assert_eq!(sw, vec![ffi::LHDC_QUALITY_HIGH]);
+        let (_, sw) = feed(&mut g, t, 200, 0, &mut cur);
+        assert_eq!(sw, vec![ffi::LHDC_QUALITY_HIGH1], "back to the target, never above it");
+    }
+
+    #[test]
+    fn a_step_up_that_does_not_hold_doubles_the_wait() {
+        let t = Instant::now();
+        let mut g = Guard::new(ffi::LHDC_QUALITY_HIGH1, t);
+        let mut cur = ffi::LHDC_QUALITY_HIGH1;
+        let (t, _) = feed(&mut g, t, 2, 20, &mut cur); // down to 900
+        assert_eq!(cur, ffi::LHDC_QUALITY_HIGH);
+        let (t, _) = feed(&mut g, t, 62, 0, &mut cur); // up to 1000
+        assert_eq!(cur, ffi::LHDC_QUALITY_HIGH1);
+        let (t, _) = feed(&mut g, t, 2, 20, &mut cur); // backed up again at once
+        assert_eq!(cur, ffi::LHDC_QUALITY_HIGH);
+        assert_eq!(g.up_wait, GUARD_UP_FIRST * 2);
+        let (t, sw) = feed(&mut g, t, 100, 0, &mut cur);
+        assert!(sw.is_empty(), "waits two minutes now: {sw:?}");
+        let (_, sw) = feed(&mut g, t, 30, 0, &mut cur);
+        assert_eq!(sw, vec![ffi::LHDC_QUALITY_HIGH1]);
+    }
+
+    #[test]
+    fn a_target_below_500_kbps_is_its_own_floor() {
+        let t = Instant::now();
+        let mut g = Guard::new(ffi::LHDC_QUALITY_LOW, t);
+        let mut cur = ffi::LHDC_QUALITY_LOW;
+        let (_, sw) = feed(&mut g, t, 10, 30, &mut cur);
+        assert!(sw.is_empty(), "{sw:?}");
     }
 }

@@ -45,12 +45,14 @@ use le_audio::pacs_ascs::{
     Ase, ConfigCodec, ConfigQos, cp_ase_ids, cp_config_codec, cp_config_qos, cp_receiver_start_ready,
     cp_receiver_stop_ready, cp_with_metadata, enable_metadata, parse_ase_value, parse_pac_records,
 };
-use le_audio::plan::{PlannedAse, StreamPlan, choose_streaming_contexts, codec_config_ltvs, source_codec_config_ltvs};
+use le_audio::plan::{
+    CisPlan, PlannedAse, StreamPlan, choose_streaming_contexts, codec_config_ltvs, source_codec_config_ltvs,
+};
 
 use super::LeDeviceId;
 use super::core::{CON_HANDLE_INVALID, LeCtx, LeDevice};
 use super::gatt_client::{GattChar, PROPERTY_INDICATE, PROPERTY_NOTIFY};
-use super::iso_send::queue_depth;
+use super::iso_send::cis_queue_share;
 
 /// Completion of [`read_device`]: true when done (also without PACS /
 /// ASCS), false when the link went down or a read failed
@@ -527,7 +529,9 @@ pub trait UnicastEnv {
     fn disconnect_cis(&mut self, handle: u16) -> u8;
     /// Total_Num_ISO_Data_Packets of the controller
     fn iso_packet_count(&self) -> u8;
-    fn start_sending(&mut self, cis_handles: &[u16], queue_depth: u8, frame_us: u32);
+    /// `queue_share`: the most SDUs a CIS may queue in the controller
+    /// `max_latency_ms`: the CIG's max transport latency C->P
+    fn start_sending(&mut self, cis_handles: &[u16], queue_share: u8, frame_us: u32, max_latency_ms: u16);
     fn stop_sending(&mut self);
     /// The microphone: ISO data of these CIS (source CIS in plan order) to
     /// the receiver
@@ -537,6 +541,12 @@ pub trait UnicastEnv {
     fn cis_down(&mut self, handle: u16);
     /// The running stream broke (BtHost::le_stream_lost)
     fn stream_lost(&mut self, why: &str);
+    /// A device of the running stream lost its link (or its CIS) while
+    /// another one plays on (BtHost::le_stream_dropped)
+    fn member_lost(&mut self, device: u32, why: &str);
+    /// The last device that streamed ended its ASE, its link still up
+    /// (BtHost::le_stream_dropped has it too); stream_lost comes next
+    fn device_left(&mut self, device: u32);
     /// Audio flows (true) or stopped (false): the modules' on_stream_state
     fn stream_state(&mut self, plan: &StreamPlan, streaming: bool);
     fn arm(&mut self, timer: UnicastTimer, ms: u32);
@@ -903,20 +913,20 @@ impl Unicast {
 
             Phase::Streaming => {
                 let handles: Vec<u16> = plan.sink_cis().map(|c| c.cis_handle).collect();
-                // BTstack queues up to `queue` SDUs per CIS and sends each as
-                // one HCI ISO data packet (plan_stream made sure none needs
-                // fragmenting): queue x CIS must stay within the
-                // controller's Total_Num_ISO_Data_Packets
-                let depth = queue_depth(env.iso_packet_count(), handles.len());
+                // Each CIS queues up to its share of the controller's
+                // Total_Num_ISO_Data_Packets, one SDU per HCI ISO data packet
+                // (plan_stream made sure none needs fragmenting); the
+                // sender narrows it to what the flush timeout needs
+                let depth = cis_queue_share(env.iso_packet_count(), handles.len());
                 tracing::debug!(
-                    "LE Audio: streaming on CIS {handles:04X?}: {} ISO buffers -> queue depth {depth} per CIS",
+                    "LE Audio: streaming on CIS {handles:04X?}: {} ISO buffers -> up to {depth} queued per CIS",
                     env.iso_packet_count()
                 );
                 if depth == 0 {
                     self.fail(env, "the adapter has fewer ISO data buffers than the stream has CIS");
                     return;
                 }
-                env.start_sending(&handles, depth, u32::from(plan.preset.frame_us));
+                env.start_sending(&handles, depth, u32::from(plan.preset.frame_us), self.latency_ms);
                 self.starting = false;
                 env.stream_state(&plan, true);
                 if let Some(d) = self.start_done.take() {
@@ -1609,7 +1619,34 @@ impl Unicast {
                 // The server disabled / released it (e.g. the headset
                 // switched to another source)
                 tracing::warn!("LE Audio: {} ASE {ase_id} left Streaming ({})", d.addr, state.name());
-                env.stream_lost("an ASE left the Streaming state");
+                let streams = |c: &CisPlan| {
+                    self.cis_connected.contains(&c.cis_handle)
+                        && env
+                            .device(c.device_id)
+                            .and_then(|d| d.ase(c.ase_id))
+                            .is_some_and(|a| a.state == AseState::Streaming)
+                };
+                let sink = self
+                    .plan
+                    .as_ref()
+                    .is_some_and(|p| p.sink_cis().any(|c| c.device_id == dev.0 && c.ase_id == ase_id));
+                // Only a microphone ASE ended while audio still goes out (to
+                // this device or another one): the sound plays on, without
+                // that microphone
+                if !sink && self.plan.as_ref().is_some_and(|p| p.sink_cis().any(&streams)) {
+                    tracing::warn!("LE Audio: {} microphone ASE {ase_id} ended, the sound plays on", d.addr);
+                    return;
+                }
+                // Another device still streaming plays on (an earbud that
+                // ends its ASE before it goes in its case)
+                let others_stream =
+                    self.plan.as_ref().is_some_and(|p| p.sink_cis().any(|c| c.device_id != dev.0 && streams(c)));
+                if others_stream {
+                    env.member_lost(dev.0, "its ASE left the Streaming state");
+                } else {
+                    env.device_left(dev.0);
+                    env.stream_lost("an ASE left the Streaming state");
+                }
                 return;
             }
         }
@@ -1739,6 +1776,32 @@ impl Unicast {
         self.in_cis_event = false;
     }
 
+    /// A link went down while streaming: the stream plays on while a CIS of
+    /// another device still carries audio (an earbud put in its case: the
+    /// other one goes on), else it is lost. The CIS of a device whose ACL
+    /// went down go with it (their own events may come later or never).
+    fn on_streaming_link_lost(&mut self, env: &mut dyn UnicastEnv, handle: u16, is_cis: bool) {
+        let Some(plan) = self.plan.clone() else { return };
+        let Some(device) = plan.cis.iter().find(|c| c.cis_handle == handle || c.acl == handle).map(|c| c.device_id)
+        else {
+            return;
+        };
+        if !is_cis {
+            for c in plan.cis.iter().filter(|c| c.acl == handle) {
+                if self.cis_connected.contains(&c.cis_handle) {
+                    self.cis_connected.retain(|&h| h != c.cis_handle);
+                    env.cis_down(c.cis_handle);
+                }
+            }
+        }
+        let plays_on = plan.sink_cis().any(|c| c.device_id != device && self.cis_connected.contains(&c.cis_handle));
+        if plays_on {
+            env.member_lost(device, if is_cis { "its CIS went down" } else { "its link went down" });
+        } else {
+            env.stream_lost("a link of the stream went down");
+        }
+    }
+
     /// An ACL or CIS of the stream went down
     pub fn on_link_lost(&mut self, env: &mut dyn UnicastEnv, handle: u16) {
         if !self.uses_handle(handle) {
@@ -1765,7 +1828,7 @@ impl Unicast {
             env.cis_down(handle);
         }
         match self.phase {
-            Phase::Streaming => env.stream_lost("a link of the stream went down"),
+            Phase::Streaming => self.on_streaming_link_lost(env, handle, is_cis),
             Phase::Disable | Phase::Release | Phase::RemoveCig => self.advance(env),
             _ => self.fail(env, "a link went down"),
         }
@@ -1858,7 +1921,7 @@ mod tests {
         fn iso_packet_count(&self) -> u8 {
             self.iso_count
         }
-        fn start_sending(&mut self, cis: &[u16], depth: u8, frame_us: u32) {
+        fn start_sending(&mut self, cis: &[u16], depth: u8, frame_us: u32, _max_latency_ms: u16) {
             self.log.push(format!("send {cis:x?} queue {depth} {frame_us} us"));
         }
         fn stop_sending(&mut self) {
@@ -1873,6 +1936,12 @@ mod tests {
         }
         fn stream_lost(&mut self, why: &str) {
             self.lost = Some(why.into());
+        }
+        fn member_lost(&mut self, device: u32, why: &str) {
+            self.log.push(format!("member lost {device}: {why}"));
+        }
+        fn device_left(&mut self, device: u32) {
+            self.log.push(format!("device left {device}"));
         }
         fn stream_state(&mut self, _plan: &StreamPlan, streaming: bool) {
             self.log.push(format!("streaming {streaming}"));
@@ -1914,6 +1983,7 @@ mod tests {
             cis_handle: 0xFFFF,
             channels: vec![ChannelPlan { allocation, source }],
             source_ase: None,
+            preset: None,
         };
         StreamPlan {
             preset,
@@ -2008,7 +2078,7 @@ mod tests {
         both(&mut u, &mut env, AseState::Streaming);
         assert_eq!(u.phase(), Phase::Streaming);
         assert!(u.streaming());
-        assert_eq!(env.take(), ["send [60, 61] queue 2 10000 us", "streaming true"]);
+        assert_eq!(env.take(), ["send [60, 61] queue 4 10000 us", "streaming true"]);
         assert_eq!(*outcome.borrow(), Some(Ok(())));
         assert!(u.uses_handle(0x41) && u.uses_handle(0x61) && !u.uses_handle(0x42));
         assert_eq!(u.plan().unwrap().contexts, CONTEXT_MEDIA);
@@ -2111,6 +2181,7 @@ mod tests {
                 cis_handle: 0xFFFF,
                 channels: Vec::new(),
                 source_ase: Some(mic(3)),
+                preset: None,
             });
         }
         let preset = table.find("32_2_1").unwrap().clone();
@@ -2226,7 +2297,7 @@ mod tests {
         env.set_state(0, 3, AseState::Streaming);
         u.on_ase_update(&mut env, LeDeviceId(0), 3);
         assert_eq!(u.phase(), Phase::Streaming);
-        assert_eq!(env.take(), ["send [60] queue 2 10000 us", "streaming true"]);
+        assert_eq!(env.take(), ["send [60] queue 8 10000 us", "streaming true"]);
         assert_eq!(*outcome.borrow(), Some(Ok(())));
 
         // Stop: the source ASE goes Disabling and waits for Receiver Stop
@@ -2345,7 +2416,40 @@ mod tests {
         );
         each(&mut u, &mut env, AseState::Streaming);
         // Only the CIS with a sink ASE: the encode thread fills one SDU
-        assert_eq!(env.take(), ["send [60] queue 2 10000 us", "streaming true"]);
+        assert_eq!(env.take(), ["send [60] queue 8 10000 us", "streaming true"]);
+    }
+
+    #[test]
+    fn a_microphone_ase_leaving_streaming_lets_the_sound_play_on() {
+        let mut env = Fake::new(vec![mic_device(0, 0x40, true), mic_device(1, 0x41, false)]);
+        let mut u = Unicast::default();
+        u.start(&mut env, conversational_plan(true), Box::new(|_| {}));
+        let each = |u: &mut Unicast, env: &mut Fake, state: AseState| {
+            for (dev, ase) in [(0, 1), (0, 3), (1, 3)] {
+                env.set_state(dev, ase, state);
+                u.on_ase_update(env, LeDeviceId(dev), ase);
+            }
+        };
+        each(&mut u, &mut env, AseState::CodecConfigured);
+        u.on_cig_created(&mut env, &cig_created(1, &[0x60, 0x61]));
+        each(&mut u, &mut env, AseState::QosConfigured);
+        each(&mut u, &mut env, AseState::Enabling);
+        u.on_cis_created(&mut env, &cis_created(1, 0x60, 0));
+        u.on_cis_created(&mut env, &cis_created(1, 0x61, 0));
+        each(&mut u, &mut env, AseState::Streaming);
+        env.take();
+        // The microphone of the device that also plays: nothing is dropped
+        env.set_state(0, 3, AseState::Disabling);
+        u.on_ase_update(&mut env, LeDeviceId(0), 3);
+        // The device with only a microphone: neither
+        env.set_state(1, 3, AseState::Disabling);
+        u.on_ase_update(&mut env, LeDeviceId(1), 3);
+        assert!(env.lost.is_none());
+        assert_eq!(env.take(), Vec::<String>::new());
+        // The last sink ASE: the stream is lost
+        env.set_state(0, 1, AseState::Releasing);
+        u.on_ase_update(&mut env, LeDeviceId(0), 1);
+        assert_eq!(env.lost.as_deref(), Some("an ASE left the Streaming state"));
     }
 
     #[test]
@@ -2356,14 +2460,44 @@ mod tests {
         env.take();
         u.on_link_lost(&mut env, 0x42);
         assert!(env.lost.is_none(), "not a link of the stream");
+        // The right earbud's CIS: the left one plays on
         u.on_link_lost(&mut env, 0x61);
+        assert!(env.lost.is_none(), "one earbud left, the other plays on");
+        assert_eq!(env.take(), ["cis down 61", "member lost 1: its CIS went down"]);
+        // The left one's ACL: its CIS go with it, nothing plays any more
+        u.on_link_lost(&mut env, 0x40);
         assert_eq!(env.lost.as_deref(), Some("a link of the stream went down"));
-        assert_eq!(env.take(), ["cis down 61"]);
-        // An ASE leaving Streaming too
-        env.lost = None;
-        env.set_state(0, 1, AseState::Disabling);
+        assert_eq!(env.take(), ["cis down 60"]);
+    }
+
+    #[test]
+    fn an_ase_leaving_streaming_drops_its_device_while_another_streams() {
+        let mut env = Fake::new(vec![device(0, 0x40, &[1], CONTEXT_MEDIA), device(1, 0x41, &[1], CONTEXT_MEDIA)]);
+        let mut u = Unicast::default();
+        bring_up(&mut u, &mut env);
+        env.take();
+        env.set_state(1, 1, AseState::Disabling);
+        u.on_ase_update(&mut env, LeDeviceId(1), 1);
+        assert!(env.lost.is_none());
+        assert_eq!(env.take(), ["member lost 1: its ASE left the Streaming state"]);
+        // The last one streaming: the stream is lost
+        env.set_state(0, 1, AseState::Releasing);
         u.on_ase_update(&mut env, LeDeviceId(0), 1);
         assert_eq!(env.lost.as_deref(), Some("an ASE left the Streaming state"));
+    }
+
+    #[test]
+    fn an_acl_lost_while_streaming_takes_its_cis_and_the_other_plays_on() {
+        let mut env = Fake::new(vec![device(0, 0x40, &[1], CONTEXT_MEDIA), device(1, 0x41, &[1], CONTEXT_MEDIA)]);
+        let mut u = Unicast::default();
+        bring_up(&mut u, &mut env);
+        env.take();
+        u.on_link_lost(&mut env, 0x41);
+        assert!(env.lost.is_none());
+        assert_eq!(env.take(), ["cis down 61", "member lost 1: its link went down"]);
+        // Its CIS event after the ACL's: nothing more
+        u.on_link_lost(&mut env, 0x61);
+        assert!(env.lost.is_none());
     }
 
     #[test]

@@ -9,6 +9,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "deny.toml"
+      - ".config/nextest.toml"
       - "extern/**"
       - "compat/**"
       - "tools/emu/**"
@@ -22,6 +23,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "deny.toml"
+      - ".config/nextest.toml"
       - "extern/**"
       - "compat/**"
       - "tools/emu/**"
@@ -73,8 +75,19 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: Unit tests
-        run: cargo test --workspace --locked
+        # About 5 minutes; a hung test fails here instead of after 6 hours.
+        # .config/nextest.toml: a failed test is run again, and one that
+        # then passes is listed as FLAKY
+        timeout-minutes: 20
+        run: cargo nextest run --workspace --locked --profile ci
+      - name: Documentation tests
+        # nextest does not run them
+        timeout-minutes: 10
+        run: cargo test --workspace --locked --doc
       - name: No unsafe outside the FFI crates
         shell: pwsh
         run: |
@@ -103,6 +116,19 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           manifest-path: Cargo.toml
+          command: check bans licenses sources
+
+  advisories:
+    # A new RustSec advisory would fail a pull request or push that has
+    # nothing to do with it: checked nightly and on demand instead
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: Cargo.toml
+          command: check advisories
 
   ui:
     runs-on: windows-latest
@@ -161,6 +187,13 @@ jobs:
           --bluecaster target/release/bluecaster-core.exe
           --decoder build/a2dp_decode/Release/bluecaster_decode.exe
           --out emu-out-le
+      # Auracast: the broadcast layouts against one sink per broadcast
+      - name: run_test.py --auracast
+        if: ${{ !cancelled() }}
+        run: >
+          tools/emu/.venv/Scripts/python.exe tools/emu/run_test.py --auracast
+          --bluecaster target/release/bluecaster-core.exe
+          --out emu-out-auracast
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -168,3 +201,4 @@ jobs:
           path: |
             emu-out
             emu-out-le
+            emu-out-auracast

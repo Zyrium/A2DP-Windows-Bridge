@@ -94,10 +94,24 @@ impl Default for StreamRequest {
 /// Where an output channel's audio comes from
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelSource {
+    /// The left side: of the stereo downmix, or the front speakers (with
+    /// the centre) when the stream also carries the rear ones
     Left,
     Right,
     #[default]
     Mono,
+    /// The rear left speaker of a multichannel source (back and side
+    /// channels; the front left if the source has no rear)
+    RearLeft,
+    RearRight,
+}
+
+impl ChannelSource {
+    /// A rear speaker: the stream takes the source's speakers one by one
+    /// instead of the stereo downmix
+    pub fn is_rear(self) -> bool {
+        matches!(self, ChannelSource::RearLeft | ChannelSource::RearRight)
+    }
 }
 
 /// One LC3 channel of a CIS
@@ -144,6 +158,9 @@ pub struct CisPlan {
     pub channels: Vec<ChannelPlan>,
     /// The microphone direction on this CIS
     pub source_ase: Option<SourceDir>,
+    /// Its own codec configuration (a broadcast whose front and rear run
+    /// at different rates, same frame duration); None: the plan's
+    pub preset: Option<StreamPreset>,
 }
 
 impl CisPlan {
@@ -212,6 +229,22 @@ pub struct StreamPlan {
 }
 
 impl StreamPlan {
+    /// The highest LC3 rate of the CIS with a sink direction (the encode
+    /// thread works at it; a CIS of a lower rate gets its audio decimated)
+    pub fn top_sampling_hz(&self) -> u32 {
+        self.sink_cis().map(|c| self.preset_of(c).sampling_hz).max().unwrap_or(self.preset.sampling_hz)
+    }
+
+    /// The largest LC3 frame of the CIS (octets per channel)
+    pub fn max_octets(&self) -> u16 {
+        self.cis.iter().map(|c| self.preset_of(c).octets).max().unwrap_or(self.preset.octets)
+    }
+
+    /// The codec configuration of `cis`: its own, else the plan's
+    pub fn preset_of<'a>(&'a self, cis: &'a CisPlan) -> &'a StreamPreset {
+        cis.preset.as_ref().unwrap_or(&self.preset)
+    }
+
     /// LC3 channels of all CIS
     pub fn channel_count(&self) -> usize {
         self.cis.iter().map(|c| c.channels.len()).sum()
@@ -387,6 +420,7 @@ pub fn plan_stream(
                         .map(|&l| ChannelPlan { allocation: l, source: ChannelSource::Mono })
                         .collect(),
                     source_ase: None,
+                    preset: None,
                 });
             };
             let one = device_supports(d, p, 1);
@@ -582,6 +616,7 @@ fn plan_source(
                     cis_handle: CIS_HANDLE_INVALID,
                     channels: Vec::new(),
                     source_ase: Some(dir),
+                    preset: None,
                 })
             }
         }

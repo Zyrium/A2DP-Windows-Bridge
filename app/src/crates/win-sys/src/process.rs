@@ -90,6 +90,12 @@ pub fn image_path(pid: u32) -> Option<String> {
 /// FileDescription from an executable's version resource, e.g.
 /// "Music Player" (the name Windows shows for it), or None
 pub fn file_description(path: &str) -> Option<String> {
+    version_string(path, "FileDescription")
+}
+
+/// A string of an executable's version resource (the first translation's
+/// table), e.g. "ProductVersion", or None
+pub fn version_string(path: &str, name: &str) -> Option<String> {
     let wpath: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
     let wpath = PCWSTR(wpath.as_ptr());
     // SAFETY: `wpath` is NUL-terminated and outlives the call.
@@ -108,7 +114,7 @@ pub fn file_description(path: &str) -> Option<String> {
     }
     let lang = u16::from_le_bytes([translation[0], translation[1]]);
     let code_page = u16::from_le_bytes([translation[2], translation[3]]);
-    let key = format!("\\StringFileInfo\\{lang:04x}{code_page:04x}\\FileDescription");
+    let key = format!("\\StringFileInfo\\{lang:04x}{code_page:04x}\\{name}");
     let desc = query_value(&data, &key)?;
     let units: Vec<u16> = desc.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
     let s = from_wide_nul(&units);
@@ -243,7 +249,13 @@ mod tests {
 
     #[test]
     fn watch_exited_process() {
-        let mut child = std::process::Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap();
+        // No terminal window (CREATE_NO_WINDOW): cmd.exe is a console program
+        let mut child = std::os::windows::process::CommandExt::creation_flags(
+            std::process::Command::new("cmd").args(["/C", "exit 0"]),
+            0x0800_0000,
+        )
+        .spawn()
+        .unwrap();
         let w = ProcessWatch::open(child.id());
         child.wait().unwrap();
         // The child may have exited before we opened it; if we did open it,

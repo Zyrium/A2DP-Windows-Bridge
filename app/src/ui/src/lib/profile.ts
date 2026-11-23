@@ -90,6 +90,7 @@ export function newProfile(): Profile {
     codec: "auto",
     quality: "hq",
     abr: false,
+    lhdcv5_low_latency: false,
     codec_fallback: true,
     codec_forced: false,
     unlisted_options: false,
@@ -215,6 +216,7 @@ export function codecValues(p: Profile): CodecValues {
     sample_rate: p.sample_rate,
     bit_depth: p.bit_depth,
     abr: p.abr,
+    lhdcv5_low_latency: p.lhdcv5_low_latency,
     sbc_bitpool: p.sbc_bitpool,
     sbcxq_bitpool: p.sbcxq_bitpool,
     sbc_min_bitpool: p.sbc_min_bitpool,
@@ -580,6 +582,7 @@ export function toneParams(p: Profile): ParamsOf<"stream.start_custom"> {
     source: "tone",
     max_media_payload: p.max_media_payload || null,
     abr: p.abr,
+    lhdcv5_low_latency: p.lhdcv5_low_latency,
     // As a profile: a codec the device does not offer falls back (issue #86)
     codec_fallback: true,
   };

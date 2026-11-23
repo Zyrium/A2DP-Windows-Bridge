@@ -7,7 +7,8 @@ Announcement, periodic advertising sync, BASE and BIGInfo, LE BIG Create Sync
 advertises is parsed with Bumble's own parsers (bap.BroadcastAudioAnnouncement,
 pbp.PublicBroadcastAnnouncement, bap.BasicAudioAnnouncement) after a strict
 length walk of the AD and BASE structures, and logged for run_test.py
-(le_audio_tests/auracast.py):
+(le_audio_tests/auracast.py). With a name suffix the sink is "Auracast sink
+<suffix>" and follows only the broadcast whose name ends with it:
 
     Auracast sink: broadcast from <addr> SID <n>: Broadcast ID 0x<id>, Broadcast Name "<name>"
     Auracast sink: Public Broadcast Announcement: features 0x<f> (<flags>), metadata <entries>
@@ -17,7 +18,8 @@ length walk of the AD and BASE structures, and logged for run_test.py
     Auracast sink: BIGInfo: <n> BIS, ...
     Auracast sink: BIG sync established: BIS <i> -> 0x<handle>, ...
     Auracast sink: BIG sync failed: <reason> (0x<status>)
-    Auracast sink: BIG sync lost (reason 0x<r>): BIS <i>: <n> SDUs, ...
+    Auracast sink: BIG sync lost (reason 0x<r>): BIS <i>: <n> SDUs of <len> octets, ...
+    Auracast sink: BIS <i>: SDU <seq>: <digest>    (the SDU with sequence number DIGEST_SEQ)
     Auracast sink: problem: <text>         (malformed data, unexpected values)
 
 The sink's HCI traffic (ISO data included) goes to the PacketLogger capture
@@ -25,6 +27,7 @@ for bluecaster_decode --le-audio --received.
 """
 
 import asyncio
+import hashlib
 import logging
 import struct
 import warnings
@@ -49,6 +52,9 @@ PUBLIC_BROADCAST_ANNOUNCEMENT = 0x1856
 BASIC_AUDIO_ANNOUNCEMENT = 0x1851
 BROADCAST_NAME = 0x30
 LOCATIONS = {0x1: 'FL', 0x2: 'FR', 0x4: 'FC', 0x8: 'LFE', 0x10: 'BL', 0x20: 'BR'}
+# The SDU whose digest is logged per BIS (3 s into a broadcast): BIS that
+# carry the same audio at the same configuration log the same digest
+DIGEST_SEQ = 300
 STATUS_NAMES = {0x3D: 'MIC failure', 0x25: 'encryption mode not acceptable', 0x12: 'invalid parameters'}
 
 
@@ -151,8 +157,12 @@ def allocation_text(allocation):
 
 
 class BroadcastSink:
-    def __init__(self, link, address, capture, broadcast_code):
+    def __init__(self, link, address, capture, broadcast_code, name_suffix=None):
         self.code = code_bytes(broadcast_code) if broadcast_code else None
+        # With name_suffix: follows only the broadcast whose name ends with it
+        # (auracast-split: one sink on "<name> L", one on "<name> R")
+        self.name_suffix = name_suffix
+        self.name = f'{SINK_NAME} {name_suffix.strip()}' if name_suffix else SINK_NAME
         self.controller = BroadcastController(CONTROLLER_NAME, link=link, public_address=address)
         host = Host(self.controller, AsyncPipeSink(self.controller))
         if capture:
@@ -171,15 +181,16 @@ class BroadcastSink:
         self.sdus = {}             # BIS index -> SDUs received
         self.seq = {}              # BIS index -> last sequence number
         self.gaps = {}
+        self.lengths = {}          # BIS index -> SDU lengths seen
 
     def problem(self, text):
-        log.warning('%s: problem: %s', SINK_NAME, text)
+        log.warning('%s: problem: %s', self.name, text)
 
     async def start(self):
         await self.device.power_on()
         self.device.on('advertisement', self.on_advertisement)
         await self.device.start_scanning(active=False, filter_duplicates=False)
-        log.info('%s: scanning for broadcasts (%s)', SINK_NAME,
+        log.info('%s: scanning for broadcasts (%s)', self.name,
                  'Broadcast_Code ' + repr(self.code.rstrip(b'\0').decode()) if self.code else 'no Broadcast_Code')
 
     def on_advertisement(self, advertisement):
@@ -192,6 +203,9 @@ class BroadcastSink:
             return
         announcement = service_data(structures, BROADCAST_AUDIO_ANNOUNCEMENT)
         if announcement is None:
+            return
+        if self.name_suffix is not None and not any(v.endswith(self.name_suffix.encode('utf-8'))
+                                                    for t, v in structures if t == BROADCAST_NAME):
             return
         self.broadcast = (advertisement.address, advertisement.sid)
         if len(announcement) != 3:
@@ -210,7 +224,7 @@ class BroadcastSink:
                 self.problem(f'Broadcast Name of {len(names[0])} bytes (PBP: 4 to 128)')
         if advertisement.is_connectable or advertisement.is_scannable or advertisement.is_legacy:
             self.problem('the broadcast is advertised connectable, scannable or with legacy PDUs')
-        log.info('%s: broadcast from %s SID %d: Broadcast ID 0x%06X, Broadcast Name "%s"', SINK_NAME,
+        log.info('%s: broadcast from %s SID %d: Broadcast ID 0x%06X, Broadcast Name "%s"', self.name,
                  advertisement.address, advertisement.sid, broadcast_id, name)
         public = service_data(structures, PUBLIC_BROADCAST_ANNOUNCEMENT)
         if public is None:
@@ -223,7 +237,7 @@ class BroadcastSink:
                 ltv_walk(public[2:], 'Public Broadcast Announcement metadata')
                 pba = pbp.PublicBroadcastAnnouncement.from_bytes(public)
                 flags = [f.name.lower() for f in pbp.PublicBroadcastAnnouncement.Features if f in pba.features]
-                log.info('%s: Public Broadcast Announcement: features 0x%02X (%s), metadata %s', SINK_NAME,
+                log.info('%s: Public Broadcast Announcement: features 0x%02X (%s), metadata %s', self.name,
                          public[0], ', '.join(flags) or 'none', metadata_text(pba.metadata))
             except (ValueError, IndexError, struct.error) as e:
                 self.problem(f'Public Broadcast Announcement {public.hex()}: {e}')
@@ -233,8 +247,8 @@ class BroadcastSink:
         self.pa_sync = await self.device.create_periodic_advertising_sync(
             advertiser_address=advertisement.address, sid=advertisement.sid, sync_timeout=1.0)
         self.pa_sync.on('establishment', lambda: log.info('%s: periodic advertising sync established',
-                                                          SINK_NAME))
-        self.pa_sync.on('loss', lambda: log.info('%s: periodic advertising sync lost', SINK_NAME))
+                                                          self.name))
+        self.pa_sync.on('loss', lambda: log.info('%s: periodic advertising sync lost', self.name))
         self.pa_sync.on('periodic_advertisement', self.on_periodic_advertisement)
         self.pa_sync.on('biginfo_advertisement', self.on_biginfo)
         await self.device.stop_scanning()
@@ -260,20 +274,20 @@ class BroadcastSink:
         except (ValueError, IndexError, struct.error) as e:
             self.problem(f'BASE {raw.hex()}: {e}')
             return
-        log.info('%s: BASE: presentation delay %d us, %d subgroup(s)', SINK_NAME, self.base.presentation_delay,
+        log.info('%s: BASE: presentation delay %d us, %d subgroup(s)', self.name, self.base.presentation_delay,
                  len(self.base.subgroups))
         for k, subgroup in enumerate(self.base.subgroups, 1):
             cfg = subgroup.codec_specific_configuration
             codec = 'LC3' if subgroup.codec_id.codec_id == hci.CodecID.LC3 else str(subgroup.codec_id)
             log.info('%s: BASE subgroup %d: %s, %s Hz, %s us, %s octets, %s block(s) per SDU, allocation %s, '
-                     'metadata %s, %d BIS', SINK_NAME, k, codec,
+                     'metadata %s, %d BIS', self.name, k, codec,
                      cfg.sampling_frequency.hz if cfg.sampling_frequency else None,
                      cfg.frame_duration.us if cfg.frame_duration else None, cfg.octets_per_codec_frame,
                      cfg.codec_frames_per_sdu or 1, allocation_text(cfg.audio_channel_allocation),
                      metadata_text(subgroup.metadata), len(subgroup.bis))
             for bis in subgroup.bis:
                 bis_cfg = bis.codec_specific_configuration
-                log.info('%s: BASE BIS %d: allocation %s', SINK_NAME, bis.index,
+                log.info('%s: BASE BIS %d: allocation %s', self.name, bis.index,
                          allocation_text(bis_cfg.audio_channel_allocation
                                          if bis_cfg.audio_channel_allocation is not None
                                          else cfg.audio_channel_allocation))
@@ -282,7 +296,7 @@ class BroadcastSink:
     def on_biginfo(self, info):
         if self.biginfo is None:
             log.info('%s: BIGInfo: %d BIS, NSE %d, ISO interval %s ms, BN %d, PTO %d, IRC %d, max PDU %d, '
-                     'SDU interval %d us, max SDU %d, PHY %s, %s, %s', SINK_NAME, info.num_bis, info.nse,
+                     'SDU interval %d us, max SDU %d, PHY %s, %s, %s', self.name, info.num_bis, info.nse,
                      info.iso_interval, info.bn, info.pto, info.irc, info.max_pdu, info.sdu_interval, info.max_sdu,
                      getattr(info.phy, 'name', info.phy), getattr(info.framing, 'name', info.framing).lower(),
                      'encrypted' if info.encryption else 'open')
@@ -301,10 +315,10 @@ class BroadcastSink:
             self.big_sync = await self.device.create_big_sync(
                 self.pa_sync, BigSyncParameters(big_sync_timeout=0x4000, bis=indices, broadcast_code=self.code))
         except hci.HCI_Error as e:
-            log.info('%s: BIG sync failed: %s (0x%02X)', SINK_NAME, STATUS_NAMES.get(e.error_code, e.error_name),
+            log.info('%s: BIG sync failed: %s (0x%02X)', self.name, STATUS_NAMES.get(e.error_code, e.error_name),
                      e.error_code)
             return
-        log.info('%s: BIG sync established: %s', SINK_NAME,
+        log.info('%s: BIG sync established: %s', self.name,
                  ', '.join(f'BIS {i} -> 0x{link.handle:04X}' for i, link in zip(indices, self.big_sync.bis_links)))
         self.big_sync.on(self.big_sync.Event.TERMINATION, self.on_big_sync_lost)
         for index, bis_link in zip(indices, self.big_sync.bis_links):
@@ -315,18 +329,23 @@ class BroadcastSink:
     def on_sdu(self, index, packet):
         self.sdus[index] += 1
         seq = packet.packet_sequence_number
+        sdu = bytes(packet.iso_sdu_fragment)
+        self.lengths.setdefault(index, set()).add(len(sdu))
+        if seq == DIGEST_SEQ:
+            log.info('%s: BIS %d: SDU %d: %s', self.name, index, seq, hashlib.sha1(sdu).hexdigest()[:16])
         last = self.seq.get(index)
         if last is not None and seq != (last + 1) & 0xFFFF:
             self.gaps[index] = self.gaps.get(index, 0) + 1
         self.seq[index] = seq
 
     def on_big_sync_lost(self, reason):
-        log.info('%s: BIG sync lost (reason 0x%02X): %s', SINK_NAME, reason,
-                 ', '.join(f'BIS {i}: {n} SDUs' + (f' ({self.gaps[i]} sequence gaps)' if self.gaps.get(i) else '')
+        log.info('%s: BIG sync lost (reason 0x%02X): %s', self.name, reason,
+                 ', '.join(f'BIS {i}: {n} SDUs of {"/".join(str(x) for x in sorted(self.lengths.get(i, [])))} octets'
+                           + (f' ({self.gaps[i]} sequence gaps)' if self.gaps.get(i) else '')
                            for i, n in sorted(self.sdus.items())))
 
 
-async def start(link, address, capture, broadcast_code):
-    sink = BroadcastSink(link, address, capture, broadcast_code)
+async def start(link, address, capture, broadcast_code, name_suffix=None):
+    sink = BroadcastSink(link, address, capture, broadcast_code, name_suffix)
     await sink.start()
     return sink

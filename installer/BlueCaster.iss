@@ -47,7 +47,16 @@
 ;     the core takes its language from while the settings have none
 ;     (settings.rs, default_language); 2.0.x's HKCU\Software\A2DPWB goes;
 ;   - an update (of this installation, of 2.0.x, of the NSIS one or of v1)
-;     says so on the wizard's title and pages (UpdateWording).
+;     says so on the wizard's title and pages (UpdateWording);
+;   - the service add-on (keyboards and mice, developer mode: its own copy of
+;     the core under Program Files\BlueCaster Service, registered as the
+;     service BlueCaster by `bluecaster-core.exe --service-setup`) is not
+;     Setup's: Setup never elevates and never touches it. Its processes run
+;     from that folder, so neither --quit (this user's pipe; the service's
+;     core is in session 0, its mutex out of reach) nor Restart Manager (only
+;     what uses this folder's files) reaches them; the window, which is this
+;     folder's, is closed by Restart Manager. The service's copy is then
+;     older than the app, which asks for the update itself.
 ; Uninstall: a page of the uninstall wizard asks whether the adapters BlueCaster
 ; put on WinUSB go back to Windows (one UAC prompt) and whether
 ; %APPDATA%\BlueCaster (settings, codecs, pairings, firmware) and the window's
@@ -61,6 +70,16 @@
 ; without its window, followed by a scan for hardware changes in the same
 ; elevated step (bluecaster-driver remove-cable, RemoveCables). Windows is
 ; offered a restart only when a removed cable's output is still in its list.
+; With the service add-on installed (its key under
+; HKLM\SYSTEM\CurrentControlSet\Services, readable without elevation), the
+; page offers to remove it, on by default (RemoveService): first of all, as
+; the service holds the adapter and the cables' capture,
+; `bluecaster-core.exe --service-setup remove` runs elevated (one UAC
+; prompt), with --remove-data when the user data goes too. A declined prompt
+; or a failure stops the uninstall before anything is removed: a service
+; without its app would keep the adapter and keep running as SYSTEM. A
+; silent uninstall removes it only when it runs elevated already, and
+; stops otherwise (no prompt in silent mode).
 ;
 ; Kept only for the step from 2.0.x (OldV2*, NsisUninstKey, V1*, OldCoreMutex,
 ; OldAppMutex, OldRunValue, OldLanguageKey, the [InstallDelete] of the old
@@ -341,6 +360,40 @@ zhcn.RemoveCableFailed=无法移除 %1。请关闭正在使用它的应用，在
 zhtw.RemoveCableFailed=無法移除 %1。請關閉正在使用它的應用程式，在「設定 > 應用程式」中移除它，然後重新啟動 Windows。
 uk.RemoveCableFailed=Не вдалося видалити %1. Закрийте програми, які ним користуються, видаліть його в розділі «Параметри» > «Програми», потім перезавантажте Windows.
 ru.RemoveCableFailed=Не удалось удалить %1. Закройте приложения, которые им пользуются, удалите его в разделе «Параметры» > «Приложения», затем перезагрузите Windows.
+
+; The service add-on (keyboards and mice) on the uninstall page (RemoveService)
+en.ServiceChoice=Remove the BlueCaster service
+ja.ServiceChoice=BlueCaster サービスを削除する
+de.ServiceChoice=BlueCaster-Dienst entfernen
+fr.ServiceChoice=Supprimer le service BlueCaster
+es.ServiceChoice=Quitar el servicio de BlueCaster
+ko.ServiceChoice=BlueCaster 서비스 제거
+zhcn.ServiceChoice=移除 BlueCaster 服务
+zhtw.ServiceChoice=移除 BlueCaster 服務
+uk.ServiceChoice=Видалити службу BlueCaster
+ru.ServiceChoice=Удалить службу BlueCaster
+
+en.ServiceChoiceText=Bluetooth keyboards and mice connected through BlueCaster will stop working. Windows asks for administrator access.
+ja.ServiceChoiceText=BlueCaster 経由で接続している Bluetooth キーボードとマウスは使えなくなります。Windows が管理者の許可を求めます。
+de.ServiceChoiceText=Über BlueCaster verbundene Bluetooth-Tastaturen und -Mäuse funktionieren dann nicht mehr. Windows fragt nach Administratorrechten.
+fr.ServiceChoiceText=Les claviers et souris Bluetooth connectés via BlueCaster cesseront de fonctionner. Windows demande les droits d'administrateur.
+es.ServiceChoiceText=Los teclados y ratones Bluetooth conectados a través de BlueCaster dejarán de funcionar. Windows pedirá permisos de administrador.
+ko.ServiceChoiceText=BlueCaster로 연결한 블루투스 키보드와 마우스는 더 이상 작동하지 않습니다. Windows가 관리자 권한을 요청합니다.
+zhcn.ServiceChoiceText=通过 BlueCaster 连接的蓝牙键盘和鼠标将停止工作。Windows 会请求管理员权限。
+zhtw.ServiceChoiceText=透過 BlueCaster 連線的藍牙鍵盤和滑鼠將停止運作。Windows 會要求系統管理員權限。
+uk.ServiceChoiceText=Клавіатури й миші Bluetooth, підключені через BlueCaster, перестануть працювати. Windows запитає права адміністратора.
+ru.ServiceChoiceText=Клавиатуры и мыши Bluetooth, подключённые через BlueCaster, перестанут работать. Windows запросит права администратора.
+
+en.ServiceRemoveFailed=The BlueCaster service could not be removed, so BlueCaster was not uninstalled. Uninstall BlueCaster again and choose Yes when Windows asks for administrator access.
+ja.ServiceRemoveFailed=BlueCaster サービスを削除できなかったため、アンインストールを中止しました。何も削除されていません。もう一度アンインストールし、Windows が管理者の許可を求めたら「はい」を選んでください。
+de.ServiceRemoveFailed=Der BlueCaster-Dienst konnte nicht entfernt werden. Die Deinstallation wurde deshalb abgebrochen, es wurde nichts entfernt. Deinstallieren Sie BlueCaster erneut, und wählen Sie „Ja“, wenn Windows nach Administratorrechten fragt.
+fr.ServiceRemoveFailed=Le service BlueCaster n'a pas pu être supprimé : la désinstallation a été annulée et rien n'a été supprimé. Désinstallez de nouveau BlueCaster et choisissez Oui lorsque Windows demande les droits d'administrateur.
+es.ServiceRemoveFailed=No se pudo quitar el servicio de BlueCaster, así que la desinstalación se detuvo y no se quitó nada. Vuelva a desinstalar BlueCaster y elija Sí cuando Windows pida permisos de administrador.
+ko.ServiceRemoveFailed=BlueCaster 서비스를 제거하지 못해 BlueCaster 제거를 중단했습니다. 아무것도 제거되지 않았습니다. BlueCaster를 다시 제거하고 Windows가 관리자 권한을 요청하면 [예]를 선택하세요.
+zhcn.ServiceRemoveFailed=无法移除 BlueCaster 服务，因此卸载已停止，未移除任何内容。请再次卸载 BlueCaster，并在 Windows 请求管理员权限时选择“是”。
+zhtw.ServiceRemoveFailed=無法移除 BlueCaster 服務，因此解除安裝已停止，未移除任何內容。請再次解除安裝 BlueCaster，並在 Windows 要求系統管理員權限時選擇「是」。
+uk.ServiceRemoveFailed=Не вдалося видалити службу BlueCaster, тому видалення зупинено й нічого не видалено. Видаліть BlueCaster ще раз і виберіть «Так», коли Windows запитає права адміністратора.
+ru.ServiceRemoveFailed=Не удалось удалить службу BlueCaster, поэтому удаление остановлено и ничего не удалено. Удалите BlueCaster ещё раз и выберите «Да», когда Windows запросит права администратора.
 
 en.RestoreFailed=The adapter could not be given back to Windows completely: it may be unplugged, or Windows chose WinUSB again. Plug it in, right-click it in Device Manager, choose Uninstall device, then unplug and replug it (see "By hand in Device Manager" in the setup guide).
 ja.RestoreFailed=アダプターを Windows に戻しきれませんでした。アダプターが抜かれているか、Windows がまた WinUSB を選んだ可能性があります。アダプターを挿した状態でデバイス マネージャーを開き、アダプターを右クリックして「デバイスのアンインストール」を選んでから、抜いて挿し直してください（セットアップガイドの「デバイス マネージャーで手動で行う」を参照）。
@@ -674,6 +727,10 @@ const
   VbCableDeviceName = 'vb-audio virtual cable';
   RootMediaKey = 'SYSTEM\CurrentControlSet\Enum\ROOT\MEDIA';
   ServicesKey = 'SYSTEM\CurrentControlSet\Services\';
+  { The service add-on (ipc::access::SERVICE_NAME; its folder under
+    Program Files, ipc::service_state::SERVICE_FOLDER_NAME) }
+  ServiceName = 'BlueCaster';
+  ServiceFolderName = 'BlueCaster Service';
   { Remove without a window: VB-CABLE's setup as community packages run it
     (BlueCaster installs it with -i -h); the Hi-Fi Cable's own setup with the
     arguments ASIO Bridge's setup passes it to remove it; ASIO Bridge's
@@ -689,6 +746,9 @@ var
     needs a restart after removing one (UninstallNeedRestart) }
   VbCableSetup, HiFiSetup: String;
   CableRestart: Boolean;
+  { The service add-on goes with the app (the uninstall page's choice;
+    in silent mode whenever it is installed) }
+  RemoveServiceChosen, ServiceFound: Boolean;
   { Setup replaces an installation: this one, 2.0.x (Inno Setup or NSIS) or v1 }
   IsUpgrade: Boolean;
   { An earlier version is uninstalled first: v1, the NSIS one of 2.0.x,
@@ -953,6 +1013,44 @@ begin
     Sleep(200);
   end;
   Log('BlueCaster still runs');
+end;
+
+{ The service add-on is registered: its key in the services' list, which
+  users may read (read-only, no elevation) }
+function ServiceInstalled: Boolean;
+begin
+  Result := RegKeyExists(HKLM, ServicesKey + ServiceName);
+end;
+
+{ With the service add-on, the window talks to the service, not to this
+  folder's core: --quit does not end it. Ends the windows of this
+  installation that still run (the path compared, so a portable copy or the
+  service's own processes are never touched). }
+procedure EndAppWindows;
+var
+  Locator, Wmi, Procs, Proc: Variant;
+  I, Ended: Integer;
+  Path: String;
+begin
+  Ended := 0;
+  try
+    Locator := CreateOleObject('WbemScripting.SWbemLocator');
+    Wmi := Locator.ConnectServer('.', 'root\CIMV2');
+    Procs := Wmi.ExecQuery('SELECT ProcessId, ExecutablePath FROM Win32_Process WHERE Name = ''{#AppExe}''');
+    for I := 0 to Procs.Count - 1 do begin
+      Proc := Procs.ItemIndex(I);
+      if not VarIsNull(Proc.ExecutablePath) then begin
+        Path := Proc.ExecutablePath;
+        if CompareText(Path, ExpandConstant('{app}\{#AppExe}')) = 0 then begin
+          Proc.Terminate(0);
+          Ended := Ended + 1;
+        end;
+      end;
+    end;
+  except
+    Log('Ending the window failed: ' + GetExceptionMessage);
+  end;
+  Log(Format('Windows of this installation ended: %d', [Ended]));
 end;
 
 { '' when v1's mutex is free (any more). Otherwise the message the
@@ -1287,6 +1385,10 @@ var
   V1Running: Boolean;
 begin
   Result := '';
+  { The service add-on keeps its own copy and its processes (not this
+    folder's): Restart Manager ends only the window here }
+  if ServiceInstalled then
+    Log('The service add-on is installed: it keeps its own copy');
   CoreWasRunning := CloseCore(ExpandConstant('{app}'));
   HadDesktopIcon := FileExists(ExpandConstant('{autodesktop}\{#AppName}.lnk')) or
     FileExists(ExpandConstant('{autodesktop}\A2DP Windows Bridge.lnk'));
@@ -1534,17 +1636,23 @@ end;
 procedure InitializeUninstallProgressForm();
 var
   Page, ProgressPage: TNewNotebookPage;
-  RestoreBox, DeleteBox, VbCableBox, HiFiBox: TNewCheckBox;
+  RestoreBox, DeleteBox, VbCableBox, HiFiBox, ServiceBox: TNewCheckBox;
   UninstallButton: TNewButton;
-  VbCable, HiFi: String;
+  VbCable, HiFi, DataDirs, Sep: String;
   PageName, PageDescription: String;
   Left, Width, Top: Integer;
+  HasService: Boolean;
 begin
   RestoreChosen := False;
   RestoreUnrecorded := False;
   DeleteData := False;
   VbCableSetup := '';
   HiFiSetup := '';
+  HasService := ServiceInstalled;
+  ServiceFound := HasService;
+  { Silent: nobody to ask, and the service must not stay behind
+    (RemoveService decides whether it can go without a prompt) }
+  RemoveServiceChosen := HasService;
   if UninstallSilent then
     Exit;
   ProgressPage := UninstallProgressForm.InnerNotebook.ActivePage;
@@ -1561,6 +1669,10 @@ begin
   if Width > Page.ClientWidth - Left then
     Width := Page.ClientWidth - Left;
   Top := 0;
+  { First: it goes first (it holds the adapter and the cables' capture) }
+  ServiceBox := nil;
+  if HasService then
+    ServiceBox := AddChoice(Page, CustomMessage('ServiceChoice'), CustomMessage('ServiceChoiceText'), True, Left, Width, Top);
   RestoreBox := nil;
   if CanRestoreDrivers then
     RestoreBox := AddChoice(Page, CustomMessage('RestoreChoice'), CustomMessage('RestoreChoiceText'), True, Left, Width, Top)
@@ -1568,9 +1680,17 @@ begin
     RestoreUnrecorded := True;
     RestoreBox := AddChoice(Page, CustomMessage('RestoreChoice'), CustomMessage('RestoreChoiceUnrecordedText'), False, Left, Width, Top);
   end;
-  { Only the settings folder itself, not one BLUECASTER_CONFIG_DIR names }
+  { Only the settings folder itself, not one BLUECASTER_CONFIG_DIR names;
+    with the service, also the service's data folder, which the set-up
+    tool deletes (--remove-data) }
+  DataDirs := ExpandConstant('{userappdata}\BlueCaster');
+  if HasService then begin
+    Sep := CustomMessage('OldSep');
+    StringChangeEx(Sep, '%_', ' ', True);
+    DataDirs := DataDirs + Sep + ExpandConstant('{commonappdata}\BlueCaster');
+  end;
   DeleteBox := AddChoice(Page, CustomMessage('DeleteChoice'),
-    FmtMessage(CustomMessage('DeleteChoiceText'), [ExpandConstant('{userappdata}\BlueCaster')]), True, Left, Width, Top);
+    FmtMessage(CustomMessage('DeleteChoiceText'), [DataDirs]), True, Left, Width, Top);
   VbCable := VbCableRemover;
   HiFi := HiFiRemover;
   VbCableBox := nil;
@@ -1607,6 +1727,7 @@ begin
   if UninstallProgressForm.ShowModal = mrCancel then
     Abort;
 
+  RemoveServiceChosen := (ServiceBox <> nil) and ServiceBox.Checked;
   RestoreChosen := (RestoreBox <> nil) and RestoreBox.Checked;
   DeleteData := DeleteBox.Checked;
   if (VbCableBox <> nil) and VbCableBox.Checked then
@@ -1615,6 +1736,7 @@ begin
     HiFiSetup := HiFi;
   Log(Format('Uninstall choices: restore drivers %d (without records %d), delete user data %d', [Ord(RestoreChosen), Ord(RestoreUnrecorded), Ord(DeleteData)]));
   Log(Format('Remove VB-CABLE %d (offered %d), Hi-Fi Cable %d (offered %d)', [Ord(VbCableSetup <> ''), Ord(VbCable <> ''), Ord(HiFiSetup <> ''), Ord(HiFi <> '')]));
+  Log(Format('Remove the service %d (offered %d)', [Ord(RemoveServiceChosen), Ord(HasService)]));
   { Back to the progress page }
   UninstallButton.Visible := False;
   UninstallProgressForm.CancelButton.Enabled := False;
@@ -1650,6 +1772,49 @@ begin
     Log(Format('%s restore --records: exit code %d', ['{#DriverExe}', Code]));
     MsgBox(CustomMessage('RestoreFailed'), mbError, MB_OK);
   end;
+end;
+
+{ Removes the service add-on before anything else (it holds the adapter and
+  captures the cables): `bluecaster-core.exe --service-setup remove` runs
+  elevated (one UAC prompt), from this installation or, if that copy is
+  gone, from the service's folder (that copy removes the service but cannot
+  delete its own folder); --remove-data deletes the service's data when the
+  user data goes too. True when the tool reports success (exit code 0) or
+  the service is gone. A silent uninstall cannot ask: it removes the service only when
+  it runs elevated already. }
+function RemoveService: Boolean;
+var
+  Exe, Params: String;
+  Code: Integer;
+begin
+  Result := False;
+  Exe := ExpandConstant('{app}\{#CoreExe}');
+  if not FileExists(Exe) then
+    Exe := ExpandConstant('{commonpf64}') + '\' + ServiceFolderName + '\{#CoreExe}';
+  if not FileExists(Exe) then begin
+    Log('No copy of the core to remove the service with');
+    Exit;
+  end;
+  if UninstallSilent and not IsAdmin then begin
+    Log('Silent uninstall without administrator rights: the service cannot be removed without a prompt');
+    Exit;
+  end;
+  Params := '--service-setup remove';
+  if DeleteData then
+    Params := Params + ' --remove-data';
+  Log('Removing the service: ' + Params);
+  if not ShellExec('runas', Exe, Params, '', SW_HIDE, ewWaitUntilTerminated, Code) then begin
+    { 1223: UAC cancelled }
+    Log(Format('The set-up tool did not start (%d)', [Code]));
+    Exit;
+  end;
+  Log(Format('--service-setup remove: exit code %d', [Code]));
+  { The service gone is what counts: the service folder's copy cannot
+    delete its own folder (it stays, without a service), and a folder or
+    data the tool could not delete keeps nothing running }
+  Result := (Code = 0) or not ServiceInstalled;
+  if Result and (Code <> 0) then
+    Log('The service is gone; its folder or data may remain');
 end;
 
 { An active output of the cable in Windows' list (Sound settings), as the
@@ -1776,6 +1941,25 @@ begin
   case CurUninstallStep of
     usUninstall:
       begin
+        { Nothing is removed yet: a service that stays would keep the
+          adapter and run as SYSTEM without its app, so the uninstall stops
+          instead }
+        if RemoveServiceChosen then begin
+          if not RemoveService then begin
+            SuppressibleMsgBox(CustomMessage('ServiceRemoveFailed'), mbError, MB_OK, IDOK);
+            Abort;
+          end;
+        end else if ServiceFound then
+          Log('The service stays installed');
+        { The window talked to the service, not to this folder's core: it
+          ends on the stopping service's Bye, or is ended here. Before
+          --quit, which then also stops a core that window started when the
+          service went. }
+        if ServiceFound then begin
+          WaitForAppExit;
+          if CheckForMutexes(AppMutexes) then
+            EndAppWindows;
+        end;
         CloseCore(ExpandConstant('{app}'));
         WaitForAppExit;
         if RestoreChosen then

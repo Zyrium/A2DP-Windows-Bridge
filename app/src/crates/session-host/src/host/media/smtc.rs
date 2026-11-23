@@ -1,9 +1,9 @@
 //! LE Audio (experimental), MCP: the Windows side of the media control
 //! server (v1 le_audio_mcp_media.cpp). The MCP module of bt-host (GMCS on
 //! the PC) asks it what plays and hands it the headset's Media Control
-//! Point commands; [`windows_backend`] goes into `LeConfig::media` unless
-//! the MCP dry run is on (`--mcp-dry-run`, implied by `--hci-tcp`: then
-//! le-audio's simulated player answers).
+//! Point commands. [`WindowsMedia`] runs where the session host does: in
+//! the core ([`crate::LocalHost`]) or in the session agent (the `media`
+//! handler; the core then holds a [`super::RemoteMedia`]).
 //!
 //! One thread of its own (never the BTstack thread):
 //! - reads the current Windows media session (System Media Transport
@@ -42,11 +42,6 @@ const RETRY_MANAGER: Duration = Duration::from_secs(30);
 const WINRT_TIMEOUT: Duration = Duration::from_secs(2);
 /// 100 ns units per 0.01 s
 const TICKS_PER_CENTISECOND: i64 = 100_000;
-
-/// The backend for a real adapter; None: the simulated player (dry run)
-pub(crate) fn windows_backend() -> Option<Box<dyn MediaBackend>> {
-    Some(Box::new(WindowsMedia::default()))
-}
 
 /// The clock of [`MediaInfo::updated_ms`], shared with the MCP module
 fn now_ms() -> u64 {
@@ -293,7 +288,8 @@ impl Worker {
             .ok()
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| name_from_aumid(aumid));
-        tracing::debug!("MCP media: player {aumid} is \"{name}\"");
+        // Quoted: the session agent does not forward names (crate::redact)
+        tracing::debug!("MCP media: player \u{201C}{aumid}\u{201D} is \"{name}\"");
         self.names.insert(aumid.to_string(), name.clone());
         name
     }

@@ -35,28 +35,38 @@ pub trait InputEndpoints: Send + Sync {
     fn capture_side(&self, render_id: &str) -> Option<String>;
     /// Makes `id` the default input for `role`; false when it failed
     fn set_default_input(&self, id: &str, role: Role) -> bool;
+    /// What is switched after each change: `ours` for the roles in
+    /// `restore`, each with its device before (None: nothing). The session
+    /// agent restores it if the core goes away.
+    fn held(&self, ours: Option<&str>, restore: &[(Role, String)]) {
+        let _ = (ours, restore);
+    }
 }
 
-/// Windows' own endpoints
+/// Windows' own endpoints (through the session host)
 pub struct WindowsInputs;
 
 impl InputEndpoints for WindowsInputs {
     fn default_input(&self, role: Role) -> Option<String> {
-        audio_capture::default_capture_device(role)
+        session_host::default_device::default_capture_device(role)
     }
 
     fn capture_side(&self, render_id: &str) -> Option<String> {
-        audio_capture::paired_capture_device(render_id)
+        session_host::default_device::paired_capture_device(render_id)
     }
 
     fn set_default_input(&self, id: &str, role: Role) -> bool {
-        match audio_capture::set_default_capture_device(id, role) {
+        match session_host::default_device::set_default_capture_device(id, role) {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!("default input: could not switch ({role:?}): {e}");
                 false
             }
         }
+    }
+
+    fn held(&self, ours: Option<&str>, restore: &[(Role, String)]) {
+        session_host::default_device::hold_capture_default(ours, restore);
     }
 }
 
@@ -176,6 +186,7 @@ fn switch(s: &mut State, endpoints: &dyn InputEndpoints, render: String) {
         tracing::info!("default input ({role:?}): the microphone's recording side while connected");
         endpoints.set_default_input(&capture, role);
     }
+    endpoints.held(Some(&capture), &s.restore);
     s.render = Some(render);
     s.capture = Some(capture);
 }
@@ -192,6 +203,7 @@ fn release(s: &mut State, endpoints: &dyn InputEndpoints) {
             tracing::info!("default input ({role:?}): changed meanwhile, left as it is");
         }
     }
+    endpoints.held(None, &[]);
 }
 
 #[cfg(test)]
@@ -203,6 +215,7 @@ mod tests {
     struct Fake {
         default: Mutex<HashMap<Role, String>>,
         sets: Mutex<Vec<(String, Role)>>,
+        held: Mutex<Vec<(Option<String>, usize)>>,
     }
 
     impl InputEndpoints for Fake {
@@ -220,6 +233,9 @@ mod tests {
             self.default.lock().unwrap().insert(role, id.into());
             self.sets.lock().unwrap().push((id.into(), role));
             true
+        }
+        fn held(&self, ours: Option<&str>, restore: &[(Role, String)]) {
+            self.held.lock().unwrap().push((ours.map(Into::into), restore.len()));
         }
     }
 
@@ -323,8 +339,26 @@ mod tests {
         // Disconnected for good: restored after the grace
         d.follow(Want::Release);
         assert_eq!(now(&f), all("{cable-out}"));
-        std::thread::sleep(Duration::from_millis(300));
+        // The grace runs on its own thread, which a busy machine starts late
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while now(&f) != before() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert_eq!(now(&f), before());
+    }
+
+    #[test]
+    fn the_switch_is_held_until_released() {
+        let f = fake();
+        let d = DefaultInput::new(f.clone(), Duration::ZERO);
+        d.follow(Want::Switch("{cable-in}".into()));
+        d.follow(Want::Switch("{hifi-in}".into()));
+        d.follow(Want::Release);
+        // Nothing switched: nothing held or released
+        d.follow(Want::Switch("{speakers}".into()));
+        d.follow(Want::Release);
+        let held = f.held.lock().unwrap().clone();
+        assert_eq!(held, [(Some("{cable-out}".into()), 3), (Some("{hifi-out}".into()), 3), (None, 0)]);
     }
 
     #[test]

@@ -220,7 +220,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.zip");
         std::fs::write(&path, z.finish()).unwrap();
-        let status = std::process::Command::new("tar").arg("-xf").arg(&path).arg("-C").arg(&dir).status().unwrap();
+        // CREATE_NO_WINDOW: no terminal window pops up on the desktop
+        let status = std::os::windows::process::CommandExt::creation_flags(
+            std::process::Command::new("tar").arg("-xf").arg(&path).arg("-C").arg(&dir),
+            0x0800_0000,
+        )
+        .status()
+        .unwrap();
         assert!(status.success());
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), text);
         assert_eq!(std::fs::read(dir.join("dir").join("b.bin")).unwrap(), [1, 2, 3]);

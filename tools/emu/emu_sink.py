@@ -466,11 +466,13 @@ class AvrcpKeys:
     """Headphone buttons: once BlueCaster opens AVRCP, FAST FORWARD (no
     Windows media key, so nothing on this PC reacts) is pressed and released
     `count` times. Each answer must carry the state flag of its command
-    (AV/C pass through; issue #420: releases came back as presses)."""
+    (AV/C pass through; issue #420: releases came back as presses). Another
+    `key` (--avrcp-key PLAY) only with a BlueCaster that keeps media keys a
+    dry run over --hci-tcp (logs "media key ...: dry run, not sent")."""
 
-    def __init__(self, device, count):
+    def __init__(self, device, count, key='FAST_FORWARD'):
         from bumble import avc, avrcp
-        self.avc, self.count = avc, count
+        self.avc, self.count, self.key = avc, count, key
         self.protocol = avrcp.Protocol()
         self.protocol.listen(device)
         device.sdp_service_records[0x00010004] = avrcp.ControllerServiceSdpRecord(0x00010004).to_service_attributes()
@@ -485,7 +487,7 @@ class AvrcpKeys:
 
     async def press(self):
         await asyncio.sleep(1)
-        key = self.avc.PassThroughFrame.OperationId.FAST_FORWARD
+        key = self.avc.PassThroughFrame.OperationId[self.key]
         matched = 0
         for _ in range(self.count):
             for pressed in (True, False):
@@ -608,6 +610,22 @@ class OppoEarbuds:
                 reply(b'\0')
 
 
+class EchoService:
+    """An SPP-style service on a test UUID that sends back what it receives,
+    for the IPC's RFCOMM passthrough (rfcomm.open / send / close)."""
+
+    UUID = '5D6A7B8C-0E1F-4A2B-9C3D-4E5F60718293'
+
+    def __init__(self, device):
+        served = Server(device).listen(self.on_dlc, 0)
+        device.sdp_service_records[0x00010006] = make_service_sdp_records(0x00010006, served, UUID(self.UUID))
+
+    def on_dlc(self, dlc):
+        print('echo: channel open', flush=True)
+        dlc.sink = lambda data: (print(f'echo: {len(data)} bytes', flush=True), dlc.write(data))
+        dlc.on('close', lambda: print('echo: channel closed', flush=True))
+
+
 def refuse_dual_channel(sink):
     """The SBC endpoint lists dual channel but rejects a SET_CONFIGURATION
     with it, as some headsets do (SBC XQ then has to fall back to SBC)."""
@@ -670,11 +688,13 @@ async def main(args):
         from hfp_audio import HfSide
         HfSide(device, args.hfp)
     if args.avrcp_keys:
-        AvrcpKeys(device, args.avrcp_keys)
+        AvrcpKeys(device, args.avrcp_keys, args.avrcp_key)
     huawei = None
     if args.huawei:
         huawei = HuaweiEarbuds(device, args.huawei == 'on', args.huawei_drop, args.huawei_silent,
                                args.huawei_no_ldac, args.huawei_channel)
+    if args.echo:
+        EchoService(device)
     oppo = None
     if args.oppo:
         oppo = OppoEarbuds(device, args.oppo == 'on', args.oppo_drop, args.oppo_product, args.oppo_no_change,
@@ -972,6 +992,8 @@ if __name__ == '__main__':
                              '96 kHz by its 0x80 bit only; 0x51: a Bose QC Ultra, no 96 kHz; issue #86)')
     parser.add_argument('--aptxll-ext', action='store_true',
                         help='aptX LL with the extended capabilities (17 bytes, as a FiiO BTR13; issue #520)')
+    parser.add_argument('--avrcp-key', default='FAST_FORWARD', metavar='OP',
+                        help='the AV/C operation --avrcp-keys presses (e.g. PLAY: a dry run of the keys only)')
     parser.add_argument('--avrcp-keys', type=int, default=0, metavar='N',
                         help='press and release FAST FORWARD N times over AVRCP, checking each answer')
     parser.add_argument('--huawei', choices=['off', 'on'],
@@ -984,6 +1006,8 @@ if __name__ == '__main__':
                         help='sound quality first is taken, and LDAC is never listed')
     parser.add_argument('--huawei-channel', type=int,
                         help='serve the control channel on this RFCOMM channel, not listed in SDP')
+    parser.add_argument('--echo', action='store_true',
+                        help=f'serve an echo service on RFCOMM ({EchoService.UUID})')
     parser.add_argument('--oppo', choices=['off', 'on'],
                         help='serve the control channel of Enco Free4 earbuds, Hi-Res as given; '
                              'LHDC V5 lists 400 kbps at 44.1 / 48 kHz until a write asks for it')

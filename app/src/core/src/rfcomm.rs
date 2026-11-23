@@ -146,8 +146,15 @@ impl Channels {
             let e = bad_request("rfcomm.bad_request", METHOD, format!("uuid \"{uuid}\""));
             return self.answer(id, METHOD, started, Err(e));
         };
+        let service = bt_host::uuid_str(&uuid);
+        if bt_host::is_voice_service(&uuid) {
+            // BlueCaster's own headset microphone link
+            let e = err("rfcomm.service_reserved", "ipc.error.rfcomm_service_reserved");
+            return answer_open(&self.out, &self.client, id, &service, started, Err(e));
+        }
         let Some(host) = self.state.service.host() else {
-            return self.answer(id, METHOD, started, Err(open_error(RfcommError::NotConnected)));
+            let e = open_error(RfcommError::NotConnected);
+            return answer_open(&self.out, &self.client, id, &service, started, Err(e));
         };
         let sink = {
             let (state, out, inner, pending) =
@@ -196,18 +203,18 @@ impl Channels {
             };
             let opened = match opened {
                 Ok(o) => o,
-                Err(e) => return answer(&out, &client, id, METHOD, started, Err(open_error(e))),
+                Err(e) => return answer_open(&out, &client, id, &service, started, Err(open_error(e))),
             };
             let mut g = inner.lock().unwrap_or_else(|e| e.into_inner());
             if g.ended {
                 drop(g);
-                tracing::debug!("IPC: {client} gone before RFCOMM #{} opened, closing it", opened.id);
+                tracing::info!("IPC: {client} rfcomm.open of {service}: client gone before #{} opened", opened.id);
                 let _ = host.rfcomm_close(opened.id);
                 return;
             }
             g.owned.insert(opened.id);
             let result = RfcommOpened { channel_id: opened.id, mtu: opened.mtu };
-            answer(&out, &client, id, METHOD, started, Ok(serde_json::to_value(result).unwrap_or(Value::Null)));
+            answer_open(&out, &client, id, &service, started, Ok(result));
             // What came before the answer, its rfcomm_closed included (which
             // ends the ownership again)
             let held = std::mem::take(&mut g.held);
@@ -284,6 +291,31 @@ fn answer(
         }
         Err(e) => {
             tracing::info!("IPC: {client} #{id} {method} failed in {ms} ms: {} ({})", e.code, e.message.key);
+            ServerMessage::Response { id, result: None, error: Some(e) }
+        }
+    };
+    let _ = out.send(Queued { msg, bytes: 0 });
+}
+
+/// rfcomm.open's answer, with its one log line: the client, the service
+/// and the outcome (no address)
+fn answer_open(
+    out: &mpsc::UnboundedSender<Queued>,
+    client: &str,
+    id: u64,
+    service: &str,
+    started: Instant,
+    r: Result<RfcommOpened, ErrorInfo>,
+) {
+    let ms = started.elapsed().as_millis();
+    let msg = match r {
+        Ok(opened) => {
+            tracing::info!("IPC: {client} #{id} rfcomm.open of {service}: opened #{} in {ms} ms", opened.channel_id);
+            let result = serde_json::to_value(opened).unwrap_or(Value::Null);
+            ServerMessage::Response { id, result: Some(result), error: None }
+        }
+        Err(e) => {
+            tracing::info!("IPC: {client} #{id} rfcomm.open of {service}: refused in {ms} ms: {}", e.code);
             ServerMessage::Response { id, result: None, error: Some(e) }
         }
     };

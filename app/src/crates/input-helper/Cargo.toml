@@ -1,0 +1,16 @@
+[package]
+name = "input-helper"
+description = "The input helper: a process in the user's session that passes keyboard and mouse input to Windows on every desktop, and the core's side of it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+win-sys.workspace = true
+hid-input.workspace = true
+tracing.workspace = true
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+
+[lints]
+workspace = true

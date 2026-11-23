@@ -79,6 +79,7 @@ fn plan() -> StreamPlan {
         cis_handle: 0x60 + u16::from(id),
         channels,
         source_ase: None,
+        preset: None,
     };
     StreamPlan {
         preset: StreamPreset {

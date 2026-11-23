@@ -34,6 +34,7 @@ mod ctkd;
 pub mod events;
 mod ffi;
 mod le;
+mod le_bonds;
 mod stack;
 mod timer_resolution;
 mod transport;
@@ -41,7 +42,8 @@ pub mod voice;
 
 pub use att::AttWriteRequest;
 pub use ctkd::{CtkdOutcome, ImportedLeBond, LeBondAdded, LeKeys, ctkd_enabled, set_ctkd};
-pub use le::{BigParams, CigParams, CisParams, ConnectionType, LeDbEntry, LeEncryption};
+pub use le::{BROADCAST_SLOTS, BigParams, CigParams, CisParams, ConnectionType, LeDbEntry, LeEncryption};
+pub use le_bonds::{EvictedLeBond, ccc_device_index, ccc_slots, ccc_tag, service_changed_tag};
 pub use stack::{AclState, AvdtpState, HciState, Stack};
 pub use timer_resolution::HighTimerResolution;
 pub use transport::{
@@ -90,6 +92,9 @@ pub enum Source {
     /// SCO data (HCI_SCO_DATA_PACKET: handle and packet status flag,
     /// length, payload) and HCI_EVENT_SCO_CAN_SEND_NOW (event packets)
     Sco,
+    /// HID host events (HCI_EVENT_HID_META: connections, descriptors and
+    /// input reports), after [`Stack::hid_host_init`]
+    Hid,
 }
 
 impl Source {
@@ -109,6 +114,7 @@ impl Source {
             12 => Source::SdpClient,
             13 => Source::SdpServices,
             14 => Source::Sco,
+            15 => Source::Hid,
             _ => Source::Hci,
         }
     }
@@ -289,6 +295,7 @@ where
     att::reset();
     le::reset();
     ctkd::reset();
+    le_bonds::reset();
 
     // SAFETY: first BTstack calls of this run, on this thread; nothing else
     // uses BTstack (RUNNING).

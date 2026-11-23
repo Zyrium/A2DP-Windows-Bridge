@@ -36,10 +36,16 @@
 //! measured on an MT7925, picks the setting from the descriptors and does
 //! not know the chip, so they are unconfirmed on the MT7927.
 //!
+//! The MT7663, the generation before, has a chip ID register of its own
+//! (0x80000008 reads 0x7663 on it) and other steps: [`mt7663`].
+//!
 //! Firmware: the folder first (as for the other loaders, also in its
 //! `mediatek\` subfolder), then the container MediaTek's Windows driver
 //! installed (`mtkbt_v2.dat`, see [`from_windows_driver`]): a PC with a
-//! MediaTek card has it even after the adapter moved to WinUSB.
+//! MediaTek card has it even after the adapter moved to WinUSB. The MT7663
+//! driver installs its patch as a plain file instead.
+
+mod mt7663;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -322,6 +328,8 @@ pub struct Loader {
     total_chunks: usize,
     /// Sections sent; 0 at the end: the chip had the firmware already
     sent_sections: usize,
+    /// An MT7663: its own download runs from the chip ID on
+    mt7663: Option<mt7663::Mt7663>,
 }
 
 impl Loader {
@@ -340,6 +348,7 @@ impl Loader {
             done_chunks: 0,
             total_chunks: 0,
             sent_sections: 0,
+            mt7663: None,
         }
     }
 
@@ -533,6 +542,11 @@ impl Loader {
                 self.state = State::ChipId79xx;
                 vec![Action::UsbControl(read_register(REGISTER_CHIP_ID_79XX))]
             }
+            State::ChipId79xx if value == mt7663::CHIP_ID => {
+                let (m, actions) = mt7663::Mt7663::start();
+                self.mt7663 = Some(m);
+                actions
+            }
             State::ChipId79xx => {
                 tracing::warn!("mediatek: chip ID 0x{value:08X} is not one this loader knows");
                 self.finish(Err(LoadError::Unsupported("a MediaTek chip this loader does not know")))
@@ -591,6 +605,9 @@ impl ChipLoader for Loader {
     }
 
     fn on_event(&mut self, event: &[u8]) -> Vec<Action> {
+        if let Some(m) = &mut self.mt7663 {
+            return m.on_event(event);
+        }
         match (&self.state, parse_event(event)) {
             // Answered: the firmware runs and Bluetooth is on
             (State::Version { .. }, HciEvent::Complete { opcode: OP_READ_LOCAL_VERSION, status: 0, .. }) => {
@@ -623,6 +640,9 @@ impl ChipLoader for Loader {
     }
 
     fn on_timeout(&mut self) -> Vec<Action> {
+        if let Some(m) = &mut self.mt7663 {
+            return m.on_timeout();
+        }
         match std::mem::replace(&mut self.state, State::Idle) {
             State::Version { tries } if tries < VERSION_TRIES => {
                 tracing::info!("mediatek: no answer to Read Local Version, sending it again");
@@ -652,6 +672,18 @@ impl ChipLoader for Loader {
     }
 
     fn on_control(&mut self, result: Result<Vec<u8>, String>) -> Vec<Action> {
+        if let Some(m) = &mut self.mt7663 {
+            return m.on_control(result, &mut self.read_file);
+        }
+        // The first chip ID register unreadable: the second may still name
+        // the chip (MediaTek's driver never reads the first on an MT7663)
+        if matches!(self.state, State::ChipId) && !matches!(&result, Ok(d) if d.len() == 4) {
+            tracing::info!(
+                "mediatek: chip ID register 0x{REGISTER_CHIP_ID:08X} unreadable ({result:02X?}), reading 0x{REGISTER_CHIP_ID_79XX:08X}"
+            );
+            self.state = State::ChipId79xx;
+            return vec![Action::UsbControl(read_register(REGISTER_CHIP_ID_79XX))];
+        }
         let reading_register =
             matches!(self.state, State::ChipId | State::ChipId79xx | State::FwVersion { .. } | State::Flavor { .. });
         // The ROM version and the flavor only pick the file: without them,
@@ -687,12 +719,18 @@ impl ChipLoader for Loader {
     }
 
     fn missing_file_hint(&self, file: &str) -> String {
+        if self.mt7663.is_some() {
+            return format!("{file}, from MediaTek's MT7663 Windows Bluetooth driver (read from it when installed)");
+        }
         format!(
             "{file}, from MediaTek's Windows Bluetooth driver (read from it when installed) or linux-firmware (mediatek/)"
         )
     }
 
     fn step(&self) -> &'static str {
+        if let Some(m) = &self.mt7663 {
+            return m.step();
+        }
         match self.state {
             State::Version { .. } => "version",
             State::ChipId | State::ChipId79xx | State::FwVersion { .. } | State::Flavor { .. } => "chip ID",
@@ -703,6 +741,9 @@ impl ChipLoader for Loader {
     }
 
     fn progress(&self) -> Option<(usize, usize)> {
+        if let Some(m) = &self.mt7663 {
+            return m.progress();
+        }
         match self.state {
             State::Waiting { what: Wmt::Query(_) | Wmt::Chunk, .. } | State::Pause { then: Wmt::Query(_) } => {
                 Some((self.done_chunks, self.total_chunks))
@@ -752,19 +793,23 @@ fn driver_containers(windows: &Path) -> Vec<PathBuf> {
     )
 }
 
-/// A firmware file from MediaTek's Windows driver, if it is installed
+/// A firmware file from MediaTek's Windows driver, if it is installed: from
+/// its container, or the MT7663 driver's plain patch file
 pub fn from_windows_driver(name: &str) -> Option<Vec<u8>> {
     let windows = std::env::var_os("SystemRoot").map(PathBuf::from)?;
-    driver_containers(&windows).iter().find_map(|path| {
-        let data = std::fs::read(path).ok()?;
-        let file = driver_container_file(&data, name)?;
-        tracing::info!(
-            "mediatek: {name} from MediaTek's driver ({}), {} bytes",
-            crate::driver_files::file_name(path),
-            file.len()
-        );
-        Some(file)
-    })
+    driver_containers(&windows)
+        .iter()
+        .find_map(|path| {
+            let data = std::fs::read(path).ok()?;
+            let file = driver_container_file(&data, name)?;
+            tracing::info!(
+                "mediatek: {name} from MediaTek's driver ({}), {} bytes",
+                crate::driver_files::file_name(path),
+                file.len()
+            );
+            Some(file)
+        })
+        .or_else(|| mt7663::from_windows_driver(name, &windows))
 }
 
 #[cfg(test)]
@@ -1110,7 +1155,7 @@ mod tests {
 
     #[test]
     fn an_unknown_chip_is_left_alone() {
-        let r = run(&mut Chip { id_79xx: 0x7663, ..Chip::new() }, files(&[10]));
+        let r = run(&mut Chip { id_79xx: 0x7668, ..Chip::new() }, files(&[10]));
         assert!(matches!(r.result, Err(LoadError::Unsupported(_))), "{:?}", r.result);
         assert!(r.opcodes().iter().all(|&o| o != OP_WMT), "nothing sent to it");
     }
@@ -1302,6 +1347,100 @@ mod tests {
             loaded += 1;
         }
         assert!(loaded > 0, "no MT79xx file in the container");
+    }
+
+    /// What an MT79xx run sends, as one fingerprint: commands (pipe and
+    /// bytes) and control transfers, in order
+    fn sequence(r: &sim::SimRun) -> (usize, usize, u64) {
+        let mut text = String::new();
+        for c in &r.commands {
+            text += &format!("{} {:02x?}\n", c.bulk, c.bytes);
+        }
+        for c in &r.controls {
+            text += &format!("{c:?}\n");
+        }
+        let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+        (r.commands.len(), r.controls.len(), hash)
+    }
+
+    /// The MT79xx sequences are those of the loader before the MT7663 came
+    /// (fingerprints taken at commit 7f5ad7d5 with this same function)
+    #[test]
+    fn the_mt79xx_sequence_is_unchanged() {
+        let a = run(&mut Chip::new(), files(&[600, 250, 1]));
+        let b = run(&mut Chip { chip_id: 0x7925, id_79xx: 0, ..Chip::new() }, files(&[10]));
+        let both = HashMap::from([
+            ("BT_RAM_CODE_MT7961_1_2_hdr.bin".to_owned(), firmware(&[10])),
+            ("BT_RAM_CODE_MT7961_1a_2_hdr.bin".to_owned(), firmware(&[20])),
+        ]);
+        let c = run(&mut Chip { id_79xx: 0x7961, fw_version: Ok(1), flavor: Ok(0x80), ..Chip::new() }, both);
+        let d = run(&mut Chip { has: vec![0], busy: 2, lost_versions: 1, ..Chip::new() }, files(&[600, 300]));
+        assert_eq!(sequence(&a), (10, 30, 1196921624536549366));
+        assert_eq!(sequence(&b), (4, 11, 2799098120537372090));
+        assert_eq!(sequence(&c), (4, 13, 14035482706166086166));
+        assert_eq!(sequence(&d), (9, 24, 14989985001770669069));
+    }
+
+    /// Read Local Version refused (either event, any error status) or never
+    /// answered: the chip ID is read and the download goes on
+    #[test]
+    fn any_version_failure_goes_on_to_the_chip_id() {
+        struct Refusing(Chip, Vec<u8>);
+        impl SimController for Refusing {
+            fn command(&mut self, c: &[u8]) -> Vec<Vec<u8>> {
+                if sim::opcode(c) == OP_READ_LOCAL_VERSION {
+                    return vec![self.1.clone()];
+                }
+                self.0.command(c)
+            }
+            fn control(&mut self, r: &ControlRequest) -> Result<Vec<u8>, String> {
+                self.0.control(r)
+            }
+        }
+        for answer in [
+            command_complete(OP_READ_LOCAL_VERSION, 0x01, &[]),
+            command_complete(OP_READ_LOCAL_VERSION, 0x0C, &[]),
+            sim::command_status(OP_READ_LOCAL_VERSION, 0x0C),
+        ] {
+            let mut chip = Refusing(Chip::new(), answer);
+            let files = files(&[10]);
+            let mut loader = Loader::new(Box::new(move |name| files.get(name).cloned()));
+            let r = sim::run(&mut loader, &mut chip);
+            assert_eq!(r.result, Ok(Outcome::Loaded { firmware: NAME.into(), detail: None }));
+            assert!(chip.0.bluetooth_on);
+        }
+        let r = run(&mut Chip { lost_versions: u32::MAX, ..Chip::new() }, files(&[10]));
+        assert!(r.result.is_ok(), "{:?}", r.result);
+    }
+
+    /// The first chip ID register failing or of another size: the second
+    /// is read; neither naming a known chip: refused before any WMT command
+    #[test]
+    fn an_unreadable_first_chip_id_register_is_not_the_end() {
+        struct Stalling(Chip, Result<Vec<u8>, String>);
+        impl SimController for Stalling {
+            fn command(&mut self, c: &[u8]) -> Vec<Vec<u8>> {
+                self.0.command(c)
+            }
+            fn control(&mut self, r: &ControlRequest) -> Result<Vec<u8>, String> {
+                if (r.request, r.value, r.index) == (REQUEST_READ_REGISTER, 0x7001, 0x0200) {
+                    return self.1.clone();
+                }
+                self.0.control(r)
+            }
+        }
+        for first in [Err("stall".to_owned()), Ok(Vec::new()), Ok(vec![1, 2])] {
+            let files = files(&[10]);
+            let mut loader = Loader::new(Box::new(move |name| files.get(name).cloned()));
+            let mut chip = Stalling(Chip::new(), first.clone());
+            let r = sim::run(&mut loader, &mut chip);
+            assert_eq!(r.result, Ok(Outcome::Loaded { firmware: NAME.into(), detail: None }), "{first:?}");
+            let mut loader = Loader::new(Box::new(|_| None));
+            let mut chip = Stalling(Chip { id_79xx: 0x1234, ..Chip::new() }, first.clone());
+            let r = sim::run(&mut loader, &mut chip);
+            assert!(matches!(r.result, Err(LoadError::Unsupported(_))), "{:?}", r.result);
+            assert!(r.opcodes().iter().all(|&o| o != OP_WMT), "nothing sent to it");
+        }
     }
 
     #[test]

@@ -269,7 +269,7 @@ function captureFormat(props: CaptureFormatProps, snap: Snapshot) {
 }
 
 /** "48000 Hz / 24-bit" */
-function formatText(rate: number, bits: number): string {
+export function formatText(rate: number, bits: number): string {
   const depth = bits === 16 || bits === 24 ? t(`bitdepth.${bits}`) : `${bits}-bit`;
   return bits ? `${rate} Hz / ${depth}` : `${rate} Hz`;
 }

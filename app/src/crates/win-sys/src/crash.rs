@@ -255,13 +255,17 @@ mod tests {
     fn an_invalid_parameter_writes_a_report() {
         let dir = std::env::temp_dir().join(format!("bluecaster-invalid-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "crash::tests::invalid_parameter_child", "--ignored", "--nocapture"])
-            .env("BLUECASTER_CRASH_TEST_DIR", &dir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
+        // The test program is a console program: no terminal window
+        let status = std::os::windows::process::CommandExt::creation_flags(
+            &mut std::process::Command::new(std::env::current_exe().unwrap()),
+            0x0800_0000,
+        )
+        .args(["--exact", "crash::tests::invalid_parameter_child", "--ignored", "--nocapture"])
+        .env("BLUECASTER_CRASH_TEST_DIR", &dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
         let texts: Vec<String> = std::fs::read_dir(&dir)
             .map(|e| {
                 e.flatten()
@@ -276,12 +280,33 @@ mod tests {
         assert!(texts[0].contains("invalid parameter"), "{}", texts[0]);
     }
 
+    /// Run by [`writes_a_dump_of_this_process`] in a child process
+    #[test]
+    #[ignore = "run by writes_a_dump_of_this_process in a process of its own"]
+    fn dump_child() {
+        let Some(path) = std::env::var_os("BLUECASTER_DUMP_TEST_PATH") else { return };
+        assert!(write_dump(Path::new(&path), std::ptr::null()));
+    }
+
+    /// A dump suspends every other thread of the process; one of the other
+    /// tests holding the heap or loader lock then hangs the whole test run,
+    /// so the dump is written by a child that runs this one test only
     #[test]
     fn writes_a_dump_of_this_process() {
         let path = std::env::temp_dir().join(format!("bluecaster-dump-{}.dmp", std::process::id()));
-        assert!(write_dump(&path, std::ptr::null()));
-        let data = std::fs::read(&path).unwrap();
+        let status = std::os::windows::process::CommandExt::creation_flags(
+            &mut std::process::Command::new(std::env::current_exe().unwrap()),
+            0x0800_0000,
+        )
+        .args(["--exact", "crash::tests::dump_child", "--ignored", "--test-threads=1"])
+        .env("BLUECASTER_DUMP_TEST_PATH", &path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+        let data = std::fs::read(&path).unwrap_or_default();
         let _ = std::fs::remove_file(&path);
-        assert_eq!(&data[..4], b"MDMP");
+        assert!(status.success());
+        assert_eq!(data.get(..4), Some(&b"MDMP"[..]));
     }
 }

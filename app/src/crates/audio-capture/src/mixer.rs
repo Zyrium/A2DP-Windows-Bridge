@@ -12,7 +12,7 @@ use win_sys::process;
 pub const SYSTEM_SOUNDS: &str = "*system";
 
 /// An app in the mixer
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MixerApp {
     /// Lowercase executable name, or [`SYSTEM_SOUNDS`]
     pub key: String,

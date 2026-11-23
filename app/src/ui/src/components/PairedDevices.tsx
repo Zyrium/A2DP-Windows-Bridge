@@ -7,6 +7,7 @@
 import { For, Show } from "solid-js";
 import type { AppContext } from "../app/context";
 import { t } from "../i18n";
+import { titleWhenCut } from "./controls";
 import { Icon } from "./Icon";
 import type { AdapterInfo, WindowsPairedDevice } from "../ipc/types";
 
@@ -33,7 +34,9 @@ export function PairedDevicesNote(props: { devices: readonly WindowsPairedDevice
             {(d) => (
               <li>
                 <Icon name={d.audio ? "headphones" : "bluetooth"} />
-                <strong class="ellipsis">{d.name || d.address}</strong>
+                <strong class="clamp-2" ref={titleWhenCut(() => d.name || d.address)}>
+                  {d.name || d.address}
+                </strong>
               </li>
             )}
           </For>

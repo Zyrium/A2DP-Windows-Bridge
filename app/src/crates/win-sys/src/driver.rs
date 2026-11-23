@@ -30,6 +30,13 @@
 //! not picked again. Either way the driver afterwards is compared with the
 //! record.
 //!
+//! When Windows cannot stop the old driver to load the new one (Windows'
+//! Bluetooth with a device connected, issue #86), the adapter's USB port is
+//! reset instead of asking for a restart of Windows: Windows handles that as
+//! unplugging the adapter, which no driver can refuse. Before the switch,
+//! Windows' Bluetooth is turned off if devices were connected, so they cannot
+//! reconnect; the restore turns it on again.
+//!
 //! Both need administrator rights (`bluecaster-driver.exe`, started elevated);
 //! `driver_state` is read-only and needs none.
 //!
@@ -41,6 +48,10 @@
 
 use std::time::{Duration, Instant};
 
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_Get_DevNode_PropertyW, CM_Get_Device_IDW,
+    CM_Get_Device_Interface_List_SizeW, CM_Get_Device_Interface_ListW,
+};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_Parent, CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW, CM_Query_And_Remove_SubTreeW,
     CM_REENUMERATE_ASYNCHRONOUS, CM_REENUMERATE_FLAGS, CM_REENUMERATE_SYNCHRONOUS, CM_REMOVE_NO_RESTART,
@@ -54,16 +65,24 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiSetDeviceRegistryPropertyW, SetupDiSetSelectedDriverW,
 };
 use windows::Win32::Devices::Properties::{
-    DEVPKEY_Device_SafeRemovalRequiredOverride, DEVPROP_TYPE_BOOLEAN, DEVPROP_TYPE_EMPTY,
+    DEVPKEY_Device_Address, DEVPKEY_Device_SafeRemovalRequiredOverride, DEVPROP_TYPE_BOOLEAN, DEVPROP_TYPE_EMPTY,
+    DEVPROP_TYPE_UINT32, DEVPROPTYPE,
 };
-use windows::Win32::Foundation::{ERROR_INVALID_DEVINST_NAME, ERROR_NO_MORE_ITEMS, ERROR_NO_SUCH_DEVINST, HWND};
-use windows::Win32::System::Registry::{KEY_READ, REG_MULTI_SZ};
+use windows::Win32::Devices::Usb::{GUID_DEVINTERFACE_USB_HUB, IOCTL_USB_HUB_CYCLE_PORT, USB_CYCLE_PORT_PARAMS};
+use windows::Win32::Foundation::{
+    ERROR_INVALID_DEVINST_NAME, ERROR_NO_MORE_ITEMS, ERROR_NO_SUCH_DEVINST, GENERIC_WRITE, HWND,
+};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
+use windows::Win32::System::IO::DeviceIoControl;
+use windows::Win32::System::Registry::{KEY_READ, REG_DWORD, REG_MULTI_SZ};
 use windows::Win32::System::SystemInformation::GetWindowsDirectoryW;
 use windows::core::{BOOL, GUID, HSTRING, PCWSTR};
 
 use crate::autostart::RegKey;
 use crate::elevation::is_elevated;
-use crate::usb_adapters::{DevInfoSet, format_guid, parse_multi_sz, problem_code};
+use crate::usb_adapters::{DevInfoSet, OwnedHandle, format_guid, parse_multi_sz, problem_code};
 
 /// The device interface GUID BlueCaster registers for adapters it puts on
 /// WinUSB (`DeviceInterfaceGUIDs`), so its own adapters can be told apart
@@ -84,6 +103,12 @@ const RESTORE_POLL: Duration = Duration::from_millis(250);
 const PROBLEM_SETTLE: Duration = Duration::from_secs(3);
 /// How long a restore waits for driver installs Windows is running already
 const PENDING_INSTALL_WAIT_MS: u32 = 10_000;
+/// How long a USB port reset may take to remove the adapter
+const REPLUG_GONE_WAIT: Duration = Duration::from_secs(3);
+/// Hardware key value: the switch to WinUSB turned Windows' Bluetooth off
+const RADIO_OFF_VALUE: &str = "BlueCasterSwitchedBluetoothOff";
+/// How long turning Windows' Bluetooth back on waits for its radio
+const RADIO_BACK_WAIT: Duration = Duration::from_secs(15);
 
 /// Which kind of driver owns a device
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +220,14 @@ impl DriverRecord {
         self.inf_name.eq_ignore_ascii_case(&info.inf_name)
             && self.version == info.version
             && self.service.eq_ignore_ascii_case(&info.service)
+    }
+
+    /// The recorded driver is back, perhaps in a newer version: the same INF
+    /// and service. Windows Update replaces inbox INFs (usb.inf, bth.inf) in
+    /// place while the adapter is on WinUSB, so `restore` installs a newer
+    /// build of the same driver (#86)
+    pub fn is_back(&self, info: &DriverInfo) -> bool {
+        self.inf_name.eq_ignore_ascii_case(&info.inf_name) && self.service.eq_ignore_ascii_case(&info.service)
     }
 }
 
@@ -350,6 +383,22 @@ pub fn assign_winusb(instance_id: &str) -> Result<AssignOutcome, DriverError> {
     // Windows cannot stop its Bluetooth on a radio with a connected device
     // (an audio link above all): the install would hang
     let disconnected = crate::bt_radios::disconnect_through(instance_id);
+    // Earbuds often reconnect right after the disconnect (issue #86). With
+    // Windows' Bluetooth off they cannot; the restore turns it on again.
+    let radio_off = !disconnected.is_empty() && crate::bt_radios::set_switch(false);
+    if radio_off {
+        mark_radio_off(instance_id, true);
+    }
+    // While Windows still runs the adapter (a restart is needed, or the
+    // switch failed), its Bluetooth goes back on
+    let radio_back_on = || {
+        if radio_off {
+            mark_radio_off(instance_id, false);
+            // After a rollback that reinstalled the adapter, the radio
+            // comes back a moment later
+            crate::bt_radios::switch_on_when_back(RADIO_BACK_WAIT);
+        }
+    };
     tracing::info!(
         "driver: assigning WinUSB to {instance_id} (now {} {} {})",
         before.service,
@@ -390,21 +439,32 @@ pub fn assign_winusb(instance_id: &str) -> Result<AssignOutcome, DriverError> {
         Ok(done) => done,
         Err(_) => {
             // WinUSB is on the device, but its old driver never stopped:
-            // Windows loads it at the next restart
-            let state = driver_state(instance_id)?;
+            // a port reset loads it, otherwise the next restart of Windows
             tracing::warn!(
-                "driver: installing WinUSB on {instance_id} did not finish in {INSTALL_LIMIT:?}; now {} ({:?}), problem {:?}: restart needed",
-                state.driver.service,
-                state.kind,
-                state.problem_code
+                "driver: installing WinUSB on {instance_id} did not finish in {INSTALL_LIMIT:?}; resetting the USB port"
             );
+            let replugged = replug(instance_id).filter(running_on_winusb);
+            let reboot_required = replugged.is_none();
+            let state = match replugged {
+                Some(state) => state,
+                None => driver_state(instance_id)?,
+            };
+            if reboot_required {
+                tracing::warn!(
+                    "driver: {instance_id} now {} ({:?}), problem {:?}: restart needed",
+                    state.driver.service,
+                    state.kind,
+                    state.problem_code
+                );
+                radio_back_on();
+            }
             let class_changed = !state.driver.class_guid.eq_ignore_ascii_case(&before.class_guid);
             hide_from_safe_removal(instance_id, true);
             return Ok(AssignOutcome {
                 previous,
                 already_winusb: false,
                 class_changed,
-                reboot_required: true,
+                reboot_required,
                 state,
                 disconnected,
             });
@@ -420,7 +480,16 @@ pub fn assign_winusb(instance_id: &str) -> Result<AssignOutcome, DriverError> {
         }
     );
     match result {
-        Ok(reboot_required) => {
+        Ok(mut reboot_required) => {
+            drop(set); // the port reset removes the device
+            if reboot_required {
+                // Windows could not restart the device, and a driver
+                // cannot refuse a port reset
+                reboot_required = replug(instance_id).filter(running_on_winusb).is_none();
+                if reboot_required {
+                    radio_back_on();
+                }
+            }
             hide_from_safe_removal(instance_id, true);
             let state = driver_state(instance_id)?;
             tracing::info!(
@@ -434,6 +503,7 @@ pub fn assign_winusb(instance_id: &str) -> Result<AssignOutcome, DriverError> {
         Err(failure) => {
             drop(set); // release the device before putting it back
             let rollback = undo_assign(instance_id, &previous, class_changed, guids_before);
+            radio_back_on();
             tracing::debug!("driver: rollback of {instance_id}: {rollback:?}");
             Err(match failure {
                 Failure::ModelNotFound(class) => DriverError::WinUsbModelNotFound { class, rollback },
@@ -465,12 +535,14 @@ pub fn restore(instance_id: &str, previous: Option<&DriverRecord>) -> Result<Res
         return Ok(RestoreOutcome {
             already_restored: true,
             reboot_required: false,
-            matches_previous: previous.map(|p| p.matches(&now)),
+            matches_previous: previous.map(|p| p.is_back(&now)),
             state: Some(driver_state(instance_id)?),
         });
     }
     tracing::info!("driver: restoring {instance_id} from WinUSB");
     hide_from_safe_removal(instance_id, false);
+    // Read before the restore: removing the device deletes its key
+    let radio_was_switched_off = take_radio_off_mark(instance_id);
     tracing::debug!(
         "driver: now {} {} {} (class {}), record {:?}",
         now.service,
@@ -487,7 +559,7 @@ pub fn restore(instance_id: &str, previous: Option<&DriverRecord>) -> Result<Res
             InPlace::Failed(set, data)
         }
     };
-    let (reboot_required, state) = match in_place {
+    let (mut reboot_required, mut state) = match in_place {
         InPlace::Done(reboot) => {
             let state = wait_for_driver(instance_id);
             let recorded = state.as_ref().is_some_and(|s| {
@@ -523,10 +595,30 @@ pub fn restore(instance_id: &str, previous: Option<&DriverRecord>) -> Result<Res
             (reboot, wait_for_driver(instance_id))
         }
     };
+    if reboot_required {
+        tracing::info!("driver: Windows asks for a restart; resetting the USB port");
+        if let Some(back) = replug(instance_id).filter(|s| s.kind != DriverKind::WinUsb && s.problem_code.is_none()) {
+            reboot_required = false;
+            state = Some(back);
+        }
+    }
+    if radio_was_switched_off {
+        if reboot_required {
+            tracing::info!("driver: Windows' Bluetooth was switched off for WinUSB; it stays off until the restart");
+        } else {
+            crate::bt_radios::switch_on_when_back(RADIO_BACK_WAIT);
+        }
+    }
     let matches_previous = match (previous, &state) {
-        (Some(p), Some(s)) => Some(p.matches(&s.driver)),
+        (Some(p), Some(s)) => Some(p.is_back(&s.driver)),
         _ => None,
     };
+    if let (Some(p), Some(s)) = (previous, &state)
+        && p.is_back(&s.driver)
+        && p.version != s.driver.version
+    {
+        tracing::info!("driver: recorded version {}, Windows installed {}", p.version, s.driver.version);
+    }
     if let Some(s) = &state {
         tracing::info!(
             "driver: {instance_id} is now on {} {} {} (matches the record: {matches_previous:?})",
@@ -1141,6 +1233,183 @@ fn hide_from_safe_removal(instance_id: &str, hide: bool) {
     tracing::debug!("driver: safe removal override {}: {}", if hide { "set" } else { "removed" }, cr.0);
 }
 
+/// Marks (or unmarks) in the device's hardware key that the switch to WinUSB
+/// turned Windows' Bluetooth off, so that the restore turns it on again
+fn mark_radio_off(instance_id: &str, marked: bool) {
+    let Ok((set, data)) = open(instance_id) else { return };
+    // SAFETY: valid set and element; the hardware key (created if missing).
+    let key = unsafe { SetupDiCreateDevRegKeyW(set.0, &data, DICS_FLAG_GLOBAL.0, 0, DIREG_DEV, None, PCWSTR::null()) };
+    let Ok(key) = key else { return };
+    let key = RegKey(key);
+    let r = if marked {
+        key.set(RADIO_OFF_VALUE, REG_DWORD, &[1, 0])
+    } else {
+        key.delete_value(RADIO_OFF_VALUE).map(|_| ())
+    };
+    tracing::debug!("driver: {RADIO_OFF_VALUE} {}: {r:?}", if marked { "set" } else { "removed" });
+}
+
+/// Whether the switch to WinUSB turned Windows' Bluetooth off; the mark is
+/// removed
+fn take_radio_off_mark(instance_id: &str) -> bool {
+    let Ok((set, data)) = open(instance_id) else { return false };
+    // SAFETY: valid set and element; read access only.
+    let marked = unsafe { SetupDiOpenDevRegKey(set.0, &data, DICS_FLAG_GLOBAL.0, 0, DIREG_DEV, KEY_READ.0) }
+        .ok()
+        .map(RegKey)
+        .is_some_and(|key| matches!(key.query(RADIO_OFF_VALUE), Ok(Some(_))));
+    drop(set);
+    if marked {
+        mark_radio_off(instance_id, false);
+    }
+    marked
+}
+
+/// Resets the adapter's USB port (IOCTL_USB_HUB_CYCLE_PORT), which Windows
+/// handles as unplugging and plugging the adapter in again. A driver that
+/// would not stop for a reinstall (Windows' Bluetooth with a device
+/// connected) cannot refuse that, so the driver just installed loads
+/// without a restart of Windows. Returns the state once the device is back.
+fn replug(instance_id: &str) -> Option<DriverState> {
+    let devinst = locate(instance_id)?;
+    let Some((hub, port)) = hub_port(devinst) else {
+        tracing::info!("driver: no USB hub port found for the adapter; cannot reset it");
+        return None;
+    };
+    // SAFETY: NUL-terminated interface path; the hub's IOCTLs need write
+    // access (administrator rights).
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(hub.as_ptr()),
+            GENERIC_WRITE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    };
+    let handle = match handle {
+        Ok(h) => OwnedHandle(h),
+        Err(e) => {
+            tracing::warn!("driver: cannot open the USB hub: {e}");
+            return None;
+        }
+    };
+    let mut params = USB_CYCLE_PORT_PARAMS { ConnectionIndex: port, StatusReturned: 0 };
+    let mut returned = 0u32;
+    let size = size_of::<USB_CYCLE_PORT_PARAMS>() as u32;
+    let started = Instant::now();
+    // SAFETY: valid handle; the parameters are both input and output, with
+    // their size passed.
+    let r = unsafe {
+        DeviceIoControl(
+            handle.0,
+            IOCTL_USB_HUB_CYCLE_PORT,
+            Some(std::ptr::from_ref(&params).cast()),
+            size,
+            Some(std::ptr::from_mut(&mut params).cast()),
+            size,
+            Some(&mut returned),
+            None,
+        )
+    };
+    drop(handle);
+    let status = params.StatusReturned;
+    if let Err(e) = r {
+        tracing::warn!("driver: resetting USB port {port} failed: {e} (status {status})");
+        return None;
+    }
+    tracing::info!("driver: USB port {port} reset (status {status}); waiting for the adapter");
+    // The adapter leaves first; the state before that is the old one
+    while locate(instance_id).is_some() && started.elapsed() < REPLUG_GONE_WAIT {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    tracing::debug!(
+        "driver: adapter {} after {} ms",
+        if locate(instance_id).is_some() { "still listed" } else { "gone" },
+        started.elapsed().as_millis()
+    );
+    wait_for_driver(instance_id)
+}
+
+/// The interface path of the USB hub the device is plugged into (NUL
+/// included) and the port number. A composite adapter's interface sits
+/// below its USB device, so the tree is walked up to the hub.
+fn hub_port(devinst: u32) -> Option<(Vec<u16>, u32)> {
+    let mut dev = devinst;
+    for _ in 0..4 {
+        let mut parent = 0u32;
+        // SAFETY: valid devinst and out pointer.
+        if unsafe { CM_Get_Parent(&mut parent, dev, 0) } != CR_SUCCESS {
+            return None;
+        }
+        if let Some(path) = hub_interface(parent) {
+            // A USB device's address is its port number on the hub
+            let mut ty = DEVPROPTYPE::default();
+            let mut buf = [0u8; 4];
+            let mut size = 4u32;
+            // SAFETY: valid key, out type and a buffer of the size passed.
+            let cr = unsafe {
+                CM_Get_DevNode_PropertyW(dev, &DEVPKEY_Device_Address, &mut ty, Some(buf.as_mut_ptr()), &mut size, 0)
+            };
+            if cr != CR_SUCCESS || ty != DEVPROP_TYPE_UINT32 {
+                tracing::debug!("driver: no port number (CR {}, type {})", cr.0, ty.0);
+                return None;
+            }
+            return Some((path, u32::from_le_bytes(buf)));
+        }
+        dev = parent;
+    }
+    None
+}
+
+/// The first USB hub interface of a device node, None if it is no hub
+fn hub_interface(devinst: u32) -> Option<Vec<u16>> {
+    let mut id = [0u16; 512];
+    // SAFETY: valid devinst; the buffer length is passed.
+    if unsafe { CM_Get_Device_IDW(devinst, &mut id, 0) } != CR_SUCCESS {
+        return None;
+    }
+    let mut len = 0u32;
+    // SAFETY: NUL-terminated ID that lives for the call; out pointer.
+    let cr = unsafe {
+        CM_Get_Device_Interface_List_SizeW(
+            &mut len,
+            &GUID_DEVINTERFACE_USB_HUB,
+            PCWSTR(id.as_ptr()),
+            CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+        )
+    };
+    if cr != CR_SUCCESS || len <= 1 {
+        return None;
+    }
+    let mut list = vec![0u16; len as usize];
+    // SAFETY: as above, with a buffer of the size Windows gave.
+    let cr = unsafe {
+        CM_Get_Device_Interface_ListW(
+            &GUID_DEVINTERFACE_USB_HUB,
+            PCWSTR(id.as_ptr()),
+            &mut list,
+            CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+        )
+    };
+    if cr != CR_SUCCESS {
+        return None;
+    }
+    let end = list.iter().position(|&c| c == 0)?;
+    if end == 0 {
+        return None;
+    }
+    list.truncate(end + 1);
+    Some(list)
+}
+
+/// Present on WinUSB and working: the switch is done
+fn running_on_winusb(state: &DriverState) -> bool {
+    state.present && state.kind == DriverKind::WinUsb && state.problem_code.is_none()
+}
+
 /// The devinst of a present device
 fn locate(instance_id: &str) -> Option<u32> {
     let mut devinst = 0u32;
@@ -1253,7 +1522,11 @@ mod tests {
         assert!(rec.matches(&info));
         assert!(rec.matches(&DriverInfo { inf_name: "BTH.INF".into(), service: "bthusb".into(), ..info.clone() }));
         assert!(!rec.matches(&DriverInfo { version: "10.0.26100.2".into(), ..info.clone() }));
-        assert!(!rec.matches(&DriverInfo { service: "WINUSB".into(), inf_name: "winusb.inf".into(), ..info }));
+        assert!(!rec.matches(&DriverInfo { service: "WINUSB".into(), inf_name: "winusb.inf".into(), ..info.clone() }));
+        // Windows Update replaced the inbox INF while the adapter was on WinUSB
+        assert!(rec.is_back(&DriverInfo { version: "10.0.26100.2".into(), ..info.clone() }));
+        assert!(!rec.is_back(&DriverInfo { service: "WINUSB".into(), inf_name: "winusb.inf".into(), ..info.clone() }));
+        assert!(!rec.is_back(&DriverInfo { inf_name: "oem12.inf".into(), ..info }));
     }
 
     #[test]

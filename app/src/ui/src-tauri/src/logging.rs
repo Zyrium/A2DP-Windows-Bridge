@@ -10,13 +10,16 @@
 //! Filter: `BLUECASTER_LOG` (EnvFilter syntax, default "info"), as the core.
 //! Verbose logging the core keeps in `logs\verbose.json`, and developer
 //! mode's verbose logging that stays on (settings.json), also turn this
-//! process' own modules up, from its next start.
+//! process' own modules up, from its next start. A core that runs as a
+//! Windows service keeps those files where this process cannot read them:
+//! then the same two switches come from the core's state over the
+//! connection ([`follow_core`]), and take effect at once.
 //!
 //! Panics and crashes in native code (WebView2's host side) leave crash
 //! reports in `logs\crash\` (win_sys::crash).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use tauri::{AppHandle, Manager, WebviewWindow};
@@ -80,14 +83,11 @@ pub fn init() -> Option<WorkerGuard> {
     let (writer, guard) = tracing_appender::non_blocking(file);
     let verbose = verbose_level(&config).max(always_verbose(&config));
     let base = std::env::var("BLUECASTER_LOG").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "info".into());
-    let directives = match verbose {
-        Some(l) => format!("{base},bluecaster={l},frontend={l},win_sys={l}"),
-        None => base,
-    };
-    let filter = tracing_subscriber::EnvFilter::try_new(directives)
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let (filter, handle) = tracing_subscriber::reload::Layer::new(filter_for(&base, verbose));
     let layer = tracing_subscriber::fmt::layer().with_writer(writer).with_ansi(false).with_timer(LocalTimer { offset });
-    let _ = tracing_subscriber::registry().with(filter).with(layer).try_init();
+    if tracing_subscriber::registry().with(filter).with(layer).try_init().is_ok() {
+        let _ = FILTER.set(Filter { handle, base, followed: Mutex::new(Followed::default()) });
+    }
     if let Some(note) = paths::take_folder_note() {
         tracing::info!("{note}");
     }
@@ -107,6 +107,102 @@ pub fn init() -> Option<WorkerGuard> {
         default_hook(info);
     }));
     Some(guard)
+}
+
+/// The filter: `base`, BlueCaster's own modules at `verbose` when set
+fn filter_for(base: &str, verbose: Option<&str>) -> tracing_subscriber::EnvFilter {
+    let directives = match verbose {
+        Some(l) => format!("{base},bluecaster={l},frontend={l},win_sys={l}"),
+        None => base.to_string(),
+    };
+    tracing_subscriber::EnvFilter::try_new(directives).unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
+type FilterHandle = tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+
+/// The installed filter, to change it while the process runs
+struct Filter {
+    handle: FilterHandle,
+    base: String,
+    followed: Mutex<Followed>,
+}
+
+static FILTER: OnceLock<Filter> = OnceLock::new();
+
+/// The core's two switches as last seen over the connection
+#[derive(Debug, Default, PartialEq)]
+struct Followed {
+    /// diag.set_verbose (the snapshot's `verbose`)
+    verbose: Option<&'static str>,
+    /// Developer mode's verbose logging that stays on (the settings)
+    always: Option<&'static str>,
+    /// The level set last; None: not set yet (the files' level is in force)
+    applied: Option<Option<&'static str>>,
+}
+
+impl Followed {
+    /// Takes in a server message; Some(level): the filter must change
+    fn take(&mut self, msg: &serde_json::Value) -> Option<Option<&'static str>> {
+        match msg.get("type").and_then(serde_json::Value::as_str) {
+            Some("snapshot") => {
+                self.verbose = verbose_of(msg.pointer("/state/verbose"));
+                self.always = always_of(msg.pointer("/state/settings"));
+            }
+            Some("event") => match msg.pointer("/event/kind").and_then(serde_json::Value::as_str) {
+                Some("verbose") => self.verbose = verbose_of(msg.pointer("/event/value")),
+                Some("settings") => self.always = always_of(msg.pointer("/event/value")),
+                _ => return None,
+            },
+            _ => return None,
+        }
+        let level = self.verbose.max(self.always);
+        if self.applied == Some(level) {
+            return None;
+        }
+        self.applied = Some(level);
+        Some(level)
+    }
+}
+
+fn level_name(v: Option<&serde_json::Value>) -> Option<&'static str> {
+    match v?.as_str()? {
+        "debug" => Some("debug"),
+        "trace" => Some("trace"),
+        _ => None,
+    }
+}
+
+/// The snapshot's VerboseState (None or null: off)
+fn verbose_of(v: Option<&serde_json::Value>) -> Option<&'static str> {
+    let v = v?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
+    if v.get("until_ms")?.as_u64()? <= now {
+        return None;
+    }
+    level_name(v.get("level"))
+}
+
+/// The IPC settings' verbose logging that stays on, in force only in
+/// developer mode
+fn always_of(settings: Option<&serde_json::Value>) -> Option<&'static str> {
+    let s = settings?;
+    if s.get("developer_mode")?.as_bool() != Some(true) {
+        return None;
+    }
+    level_name(s.pointer("/dev_log/always_verbose"))
+}
+
+/// Service mode: this process' verbose logging follows the core's state
+/// (a server message: the snapshot, or a verbose or settings event)
+pub fn follow_core(msg: &serde_json::Value) {
+    let Some(f) = FILTER.get() else { return };
+    let Some(level) = f.followed.lock().unwrap_or_else(|e| e.into_inner()).take(msg) else { return };
+    if f.handle.reload(filter_for(&f.base, level)).is_ok() {
+        match level {
+            Some(l) => tracing::info!("verbose logging ({l}) as the core's"),
+            None => tracing::info!("verbose logging off, as the core's"),
+        }
+    }
 }
 
 /// The level of the core's verbose logging while it is on ("debug",
@@ -223,6 +319,40 @@ pub fn ui_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Service mode: the core's state over the connection sets the level
+    #[test]
+    fn the_level_follows_the_cores_state() {
+        use serde_json::json;
+        let later =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 60_000;
+        let mut f = Followed::default();
+        let snap = |verbose: serde_json::Value, dev: bool, always: serde_json::Value| {
+            json!({ "type": "snapshot", "rev": 1, "state": {
+                "verbose": verbose,
+                "settings": { "developer_mode": dev, "dev_log": { "always_verbose": always } } } })
+        };
+        // The first snapshot sets the level, off included
+        assert_eq!(f.take(&snap(json!(null), false, json!(null))), Some(None));
+        assert_eq!(f.take(&snap(json!(null), false, json!(null))), None, "no change");
+        let on = json!({ "type": "event", "rev": 2, "event": { "kind": "verbose",
+            "value": { "level": "debug", "until_ms": later } } });
+        assert_eq!(f.take(&on), Some(Some("debug")));
+        // Developer mode's switch, higher: trace wins
+        let dev = json!({ "type": "event", "rev": 3, "event": { "kind": "settings",
+            "value": { "developer_mode": true, "dev_log": { "always_verbose": "trace" } } } });
+        assert_eq!(f.take(&dev), Some(Some("trace")));
+        // Developer mode off: the switch is not in force
+        let off = json!({ "type": "event", "rev": 4, "event": { "kind": "settings",
+            "value": { "developer_mode": false, "dev_log": { "always_verbose": "trace" } } } });
+        assert_eq!(f.take(&off), Some(Some("debug")));
+        // An expired one is off; other messages change nothing
+        let expired = json!({ "type": "event", "rev": 5, "event": { "kind": "verbose",
+            "value": { "level": "trace", "until_ms": 1 } } });
+        assert_eq!(f.take(&expired), Some(None));
+        assert_eq!(f.take(&json!({ "type": "event", "event": { "kind": "stream", "value": {} } })), None);
+        assert_eq!(f.take(&json!({ "type": "response", "id": 1 })), None);
+    }
 
     #[test]
     fn always_verbose_only_in_developer_mode() {

@@ -19,4 +19,8 @@ bit_depths: Array<number>,
 /**
  * Its largest bit rate in bps (0 = not said)
  */
-max_bitrate: number, };
+max_bitrate: number, 
+/**
+ * LHDC V5: it lists low latency (issue #543)
+ */
+lhdcv5_low_latency: boolean, };

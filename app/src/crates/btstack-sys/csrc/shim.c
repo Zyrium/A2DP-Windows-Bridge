@@ -32,6 +32,7 @@
 #include "hci.h"
 #include "hci_cmd.h"
 #include "hci_dump.h"
+#include "hci_event.h"
 #include "hci_transport.h"
 #include "l2cap.h"
 #include "classic/a2dp_source.h"
@@ -44,6 +45,7 @@
 #include "classic/avrcp_target.h"
 #include "classic/btstack_link_key_db.h"
 #include "classic/hfp_ag.h"
+#include "classic/hid_host.h"
 #include "classic/rfcomm.h"
 #include "classic/btstack_link_key_db_memory.h"
 #include "classic/sdp_client.h"
@@ -95,6 +97,12 @@ void bluecaster_ctkd_from_le(int why, int addr_type, const unsigned char *addr, 
                              int key_type) {
     bluecaster_rs_ctkd_from_le(why, addr_type, addr, key, key_type);
 }
+/* Called by the patched le_device_db_tlv.c (patched_le_device_db) */
+void bluecaster_rs_le_bond_evicted(int index, int addr_type, const uint8_t *addr);
+int bluecaster_le_bond_in_use(int index);
+void bluecaster_le_bond_evicted(int index, int addr_type, const unsigned char *addr);
+/* Called by the patched att_server.c (patched_att_server) */
+uint32_t bluecaster_ccc_tag(uint32_t slot);
 
 static void cig_slot_release(uint8_t cig_id);
 
@@ -340,9 +348,25 @@ enum {
     SOURCE_SDP_CLIENT = 12,
     SOURCE_SDP_SERVICES = 13,
     SOURCE_SCO = 14,
+    SOURCE_HID = 15,
 };
 
-static void handler_hci(uint8_t t, uint16_t c, uint8_t *p, uint16_t s) { bluecaster_rs_on_packet(SOURCE_HCI, t, c, p, s); }
+/* A keyboard being added that may ask for a passkey (bluecaster_hid_pairing_target) */
+static int hid_pairing_armed;
+static bd_addr_t hid_pairing_addr;
+
+static void handler_hci(uint8_t t, uint16_t c, uint8_t *p, uint16_t s) {
+    /* BTstack answers the IO Capability Request in hci_run, after this
+     * handler: that device as a display (it shows the passkey to type),
+     * every other one as before (no input, no output) */
+    if (t == HCI_EVENT_PACKET && s >= 8 && p[0] == HCI_EVENT_IO_CAPABILITY_REQUEST) {
+        bd_addr_t a;
+        reverse_bd_addr(&p[2], a);
+        int display = hid_pairing_armed && bd_addr_cmp(a, hid_pairing_addr) == 0;
+        gap_ssp_set_io_capability(display ? SSP_IO_CAPABILITY_DISPLAY_ONLY : SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
+    }
+    bluecaster_rs_on_packet(SOURCE_HCI, t, c, p, s);
+}
 static void handler_a2dp(uint8_t t, uint16_t c, uint8_t *p, uint16_t s) { bluecaster_rs_on_packet(SOURCE_A2DP, t, c, p, s); }
 static void handler_avdtp_sink(uint8_t t, uint16_t c, uint8_t *p, uint16_t s) { bluecaster_rs_on_packet(SOURCE_AVDTP_SINK, t, c, p, s); }
 static void handler_avrcp(uint8_t t, uint16_t c, uint8_t *p, uint16_t s) { bluecaster_rs_on_packet(SOURCE_AVRCP, t, c, p, s); }
@@ -358,6 +382,9 @@ static void handler_sdp_client(uint8_t t, uint16_t c, uint8_t *p, uint16_t s) { 
 static void handler_sdp_services(uint8_t t, uint16_t c, uint8_t *p, uint16_t s) { bluecaster_rs_on_packet(SOURCE_SDP_SERVICES, t, c, p, s); }
 /* SCO data (HCI_SCO_DATA_PACKET) and HCI_EVENT_SCO_CAN_SEND_NOW */
 static void handler_sco(uint8_t t, uint16_t c, uint8_t *p, uint16_t s) { bluecaster_rs_on_packet(SOURCE_SCO, t, c, p, s); }
+
+/* HID host events (HCI_EVENT_HID_META), reports included */
+static void handler_hid(uint8_t t, uint16_t c, uint8_t *p, uint16_t s) { bluecaster_rs_on_packet(SOURCE_HID, t, c, p, s); }
 
 static btstack_packet_callback_registration_t hci_event_registration;
 
@@ -382,6 +409,101 @@ void bluecaster_avrcp_init(void) {
     avrcp_controller_register_packet_handler(&handler_avrcp_ct);
     avrcp_target_init();
     avrcp_target_register_packet_handler(&handler_avrcp_tg);
+}
+
+/* ======================================================================== */
+/* HID host (experimental, developer mode): keyboards and mice              */
+/* ======================================================================== */
+
+/* The report descriptors of the connected devices, read over SDP */
+static uint8_t hid_descriptor_storage[4096];
+
+/* Output reports (the keyboard lights): hid_host_send_report keeps the
+ * pointer until the interrupt channel can send, so each link has its own
+ * copy here. A report sent again before the last one went out replaces it. */
+#define BLUECASTER_HID_OUTPUT_LINKS 8
+#define BLUECASTER_HID_OUTPUT_MAX 64
+static struct {
+    uint16_t cid;
+    uint8_t data[BLUECASTER_HID_OUTPUT_MAX];
+} hid_output[BLUECASTER_HID_OUTPUT_LINKS];
+
+void bluecaster_hid_host_init(void) {
+    hid_host_init(hid_descriptor_storage, sizeof(hid_descriptor_storage));
+    hid_host_register_packet_handler(&handler_hid);
+}
+
+void bluecaster_hid_host_deinit(void) {
+    hid_host_deinit();
+    memset(hid_output, 0, sizeof(hid_output));
+}
+
+/* Classic: the device answered as a display in its pairing (see
+ * handler_hci); NULL: none, and the IO capability is the usual one again */
+void bluecaster_hid_pairing_target(const uint8_t *addr) {
+    hid_pairing_armed = addr != NULL;
+    if (addr) {
+        memcpy(hid_pairing_addr, addr, sizeof(bd_addr_t));
+    } else {
+        gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
+    }
+}
+
+/* LE: the next pairing SM starts offers a display (1) or no input, no
+ * output (0, the usual one). MITM stays as configured: a device that does
+ * not ask for it pairs with Just Works either way. */
+void bluecaster_sm_passkey_display(int display) {
+    sm_set_io_capabilities(display ? IO_CAPABILITY_DISPLAY_ONLY : IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
+}
+
+uint8_t bluecaster_hid_host_connect(const uint8_t *addr, uint16_t *out_cid) {
+    bd_addr_t a;
+    memcpy(a, addr, sizeof(a));
+    return hid_host_connect(a, HID_PROTOCOL_MODE_REPORT, out_cid);
+}
+
+uint8_t bluecaster_hid_host_accept(uint16_t hid_cid) {
+    return hid_host_accept_connection(hid_cid, HID_PROTOCOL_MODE_REPORT);
+}
+
+uint8_t bluecaster_hid_host_decline(uint16_t hid_cid) {
+    return hid_host_decline_connection(hid_cid);
+}
+
+void bluecaster_hid_host_disconnect(uint16_t hid_cid) {
+    hid_host_disconnect(hid_cid);
+}
+
+/* The device's report descriptor, copied to `out`; 0 when there is none or
+ * it does not fit */
+uint16_t bluecaster_hid_host_descriptor(uint16_t hid_cid, uint8_t *out, uint16_t max) {
+    const uint8_t *data = hid_descriptor_storage_get_descriptor_data(hid_cid);
+    uint16_t len = hid_descriptor_storage_get_descriptor_len(hid_cid);
+    if (data == NULL || len == 0 || len > max) return 0;
+    memcpy(out, data, len);
+    return len;
+}
+
+/* An output report on the interrupt channel; report_id 0xFFFF: the device
+ * has no report IDs */
+uint8_t bluecaster_hid_host_send_output(uint16_t hid_cid, uint16_t report_id, const uint8_t *data, uint16_t len) {
+    int slot = -1;
+    if (hid_cid == 0 || len > BLUECASTER_HID_OUTPUT_MAX) return ERROR_CODE_INVALID_HCI_COMMAND_PARAMETERS;
+    for (int i = 0; i < BLUECASTER_HID_OUTPUT_LINKS; i++) {
+        if (hid_output[i].cid == hid_cid) { slot = i; break; }
+        if (slot < 0 && hid_output[i].cid == 0) slot = i;
+    }
+    if (slot < 0) return ERROR_CODE_MEMORY_CAPACITY_EXCEEDED;
+    hid_output[slot].cid = hid_cid;
+    memcpy(hid_output[slot].data, data, len);
+    return hid_host_send_report(hid_cid, report_id, hid_output[slot].data, len);
+}
+
+/* The link is closed: its output copy is free again */
+void bluecaster_hid_host_output_closed(uint16_t hid_cid) {
+    for (int i = 0; i < BLUECASTER_HID_OUTPUT_LINKS; i++) {
+        if (hid_output[i].cid == hid_cid) hid_output[i].cid = 0;
+    }
 }
 
 /* ======================================================================== */
@@ -705,6 +827,7 @@ static char local_name[249];
 void bluecaster_gap_setup(uint32_t class_of_device, uint16_t page_timeout, const char *name) {
     /* SSP: Just Works (no display, no keyboard), General Bonding without MITM */
     gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
+    hid_pairing_armed = 0;
     gap_ssp_set_authentication_requirement(SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING);
     /* BTstack 1.8.2 changed these defaults (auto accept off, key size 16):
      * kept as they were, so that pairing and older sinks behave as before */
@@ -1051,24 +1174,36 @@ static void cig_slots_reset(void) {
     memset(cig_slots, 0, sizeof(cig_slots));
 }
 
-/* ---- Broadcast storage (Auracast source): one extended + periodic
- * advertising set and one BIG. BTstack keeps pointers to the advertising
- * data, the set and the BIG parameters until the set is removed / the BIG
- * terminated. ---- */
+/* ---- Broadcast storage (Auracast source): per broadcast one extended +
+ * periodic advertising set and one BIG, in slot `big_handle` (several
+ * broadcasts at once, e.g. left and right as broadcasts of their own).
+ * BTstack keeps pointers to the advertising data, the set and the BIG
+ * parameters until the set is removed / the BIG terminated. ---- */
 
 #define BLUECASTER_ADV_DATA_MAX 251
-static le_advertising_set_t bc_adv_set;
-static uint8_t bc_adv_data[BLUECASTER_ADV_DATA_MAX];
-static uint8_t bc_pa_data[BLUECASTER_ADV_DATA_MAX];
-static int bc_adv_in_use;
-static uint8_t bc_adv_handle;
-static le_audio_big_t bc_big;
-static le_audio_big_params_t bc_big_params;
-static int bc_big_in_use;
+#define BLUECASTER_BROADCASTS 4
+typedef struct {
+    le_advertising_set_t adv_set;
+    uint8_t adv_data[BLUECASTER_ADV_DATA_MAX];
+    uint8_t pa_data[BLUECASTER_ADV_DATA_MAX];
+    int adv_in_use;
+    uint8_t adv_handle;
+    le_audio_big_t big;
+    le_audio_big_params_t big_params;
+    int big_in_use;
+} bc_slot_t;
+static bc_slot_t bc_slots[BLUECASTER_BROADCASTS];
 
 static void broadcast_reset(void) {
-    bc_adv_in_use = 0;
-    bc_big_in_use = 0;
+    for (int i = 0; i < BLUECASTER_BROADCASTS; i++) {
+        bc_slots[i].adv_in_use = 0;
+        bc_slots[i].big_in_use = 0;
+    }
+}
+
+/* The slot of a BIG handle, NULL when out of range */
+static bc_slot_t *bc_slot(uint8_t big_handle) {
+    return big_handle < BLUECASTER_BROADCASTS ? &bc_slots[big_handle] : NULL;
 }
 
 /* ---- Housekeeping on HCI events (registered by bluecaster_le_init) ---- */
@@ -1091,9 +1226,14 @@ static void le_hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
         if (size >= 5 && packet[2] == GAP_SUBEVENT_CIG_CREATED && packet[3] != ERROR_CODE_SUCCESS)
             cig_slot_release(packet[4]);
         /* Nor a BIG that failed or ended */
-        if (size >= 5 && packet[2] == GAP_SUBEVENT_BIG_CREATED && packet[3] != ERROR_CODE_SUCCESS)
-            bc_big_in_use = 0;
-        if (size >= 4 && packet[2] == GAP_SUBEVENT_BIG_TERMINATED) bc_big_in_use = 0;
+        if (size >= 5 && packet[2] == GAP_SUBEVENT_BIG_CREATED && packet[3] != ERROR_CODE_SUCCESS) {
+            bc_slot_t *s = bc_slot(packet[4]);
+            if (s != NULL) s->big_in_use = 0;
+        }
+        if (size >= 4 && packet[2] == GAP_SUBEVENT_BIG_TERMINATED) {
+            bc_slot_t *s = bc_slot(packet[3]);
+            if (s != NULL) s->big_in_use = 0;
+        }
         break;
     case BTSTACK_EVENT_STATE:
         /* HCI reset its state (power off): no CIG, BIG or advertising set is
@@ -1193,6 +1333,30 @@ uint8_t bluecaster_gap_connect(const uint8_t *addr, uint8_t addr_type) {
     return gap_connect(a, (bd_addr_type_t)addr_type);
 }
 
+/* Keyboards and mice (issue #413): the controller connects by itself to a
+ * device of its accept list once that device advertises. One LE connection
+ * attempt at a time: gap_connect is refused while this runs. */
+uint8_t bluecaster_gap_auto_connection_start(uint8_t addr_type, const uint8_t *addr) {
+    bd_addr_t a;
+    memcpy(a, addr, 6);
+    return gap_auto_connection_start((bd_addr_type_t)addr_type, a);
+}
+
+uint8_t bluecaster_gap_auto_connection_stop_all(void) {
+    return gap_auto_connection_stop_all();
+}
+
+/* How much of the time a connection attempt listens for its device; the
+ * other parameters as bluecaster_le_init sets them */
+void bluecaster_gap_connection_scan(uint16_t interval, uint16_t window) {
+    gap_set_connection_parameters(interval, window, 0x0008, 0x0018, 0, 500, 0, 0);
+}
+
+/* The controller has LE (only meaningful while LE is not hidden) */
+int bluecaster_le_supported(void) {
+    return hci_le_supported() ? 1 : 0;
+}
+
 int bluecaster_gap_connection_type(uint16_t con) {
     return (int)gap_get_connection_type(con);
 }
@@ -1235,6 +1399,44 @@ void bluecaster_tlv_delete(uint32_t tag) {
     if (tlv != NULL) tlv->delete_tag(context, tag);
 }
 
+/* ---- LE bonds (le_device_db_tlv) and the CCC values of their clients ---- */
+
+/* The bond belongs to an LE link that is up */
+int bluecaster_le_bond_in_use(int index) {
+    btstack_linked_list_iterator_t it;
+    hci_connections_get_iterator(&it);
+    while (btstack_linked_list_iterator_has_next(&it)) {
+        hci_con_handle_t con = ((hci_connection_t *)btstack_linked_list_iterator_next(&it))->con_handle;
+        /* (a classic link's index is not set before key derivation) */
+        if (gap_get_connection_type(con) == GAP_CONNECTION_LE && sm_le_device_index(con) == index) return 1;
+    }
+    return 0;
+}
+
+/* le_device_db_add has no free entry and dropped the oldest bond: what was
+ * kept beside it goes too, and the rest of BTstack and the application learn
+ * of it as of any deleted bond (gap_delete_bonding) */
+void bluecaster_le_bond_evicted(int index, int addr_type, const unsigned char *addr) {
+    uint8_t buffer[20];
+    bd_addr_t a;
+    memcpy(a, addr, 6);
+    bluecaster_rs_le_bond_evicted(index, addr_type, a);
+    uint16_t size = hci_event_create_from_template_and_arguments(
+        buffer, sizeof(buffer), &gap_subevent_bonding_deleted, addr_type, a, index, HCI_CON_HANDLE_INVALID);
+    hci_emit_btstack_event(buffer, size, 1);
+}
+
+/* The TLV tag of a CCC value att_server keeps: 'BTC' + slot as in BTstack,
+ * slots from 256 on 'AW1' + slot .. 'AW9' + slot (the next letter, 'BTD', are
+ * the bonds) */
+uint32_t bluecaster_ccc_tag(uint32_t slot) {
+    uint32_t page = slot >> 8;
+    if (page == 0) return ((uint32_t)'B' << 24) | ((uint32_t)'T' << 16) | ((uint32_t)'C' << 8) | slot;
+    return ((uint32_t)'A' << 24) | ((uint32_t)'W' << 16) | (((uint32_t)'0' + page) << 8) | (slot & 0xFF);
+}
+
+uint32_t bluecaster_ccc_slots(void) { return NVN_NUM_GATT_SERVER_CCC; }
+
 /* ---- GATT client (events of queries and listeners: SOURCE_GATT_CLIENT) ---- */
 
 uint8_t bluecaster_gatt_discover_primary_services(uint16_t con) {
@@ -1261,6 +1463,13 @@ uint8_t bluecaster_gatt_discover_characteristics(uint16_t con, uint16_t start, u
 
 uint8_t bluecaster_gatt_read_long_value(uint16_t con, uint16_t value_handle) {
     return gatt_client_read_long_value_of_characteristic_using_value_handle(&handler_gatt_client, con, value_handle);
+}
+
+/* Every attribute of this type in the range (ATT Read By Type), each as
+ * GATT_EVENT_CHARACTERISTIC_VALUE_QUERY_RESULT with its handle: descriptors
+ * too (the Report Reference of each HID report) */
+uint8_t bluecaster_gatt_read_by_type(uint16_t con, uint16_t start, uint16_t end, uint16_t uuid16) {
+    return gatt_client_read_value_of_characteristics_by_uuid16(&handler_gatt_client, con, start, end, uuid16);
 }
 
 /* BTstack keeps the value pointer until the write is done: a copy in the
@@ -1406,7 +1615,11 @@ uint8_t bluecaster_cig_create(uint8_t cig_id, uint32_t sdu_interval_c_to_p, uint
 }
 
 /* One HCI ISO data packet with a complete SDU: handle | PB 0b10, no time
- * stamp, SDU header (sequence number, length). For CIS can-send-now. */
+ * stamp, SDU header (sequence number, length). The caller keeps the
+ * controller's queue (bt-host iso_send counts completions; BTstack does not
+ * check ISO space). BTSTACK_ACL_BUFFERS_FULL while BTstack's one outgoing
+ * packet buffer is taken: nothing sent, send it again after
+ * HCI_EVENT_TRANSPORT_PACKET_SENT. */
 uint8_t bluecaster_iso_send(uint16_t cis_handle, uint16_t sequence_number, const uint8_t *sdu, uint16_t len) {
     if ((uint32_t)len + 4u > HCI_ISO_PAYLOAD_SIZE) return ERROR_CODE_INVALID_HCI_COMMAND_PARAMETERS;
     if (hci_is_packet_buffer_reserved()) return BTSTACK_ACL_BUFFERS_FULL;
@@ -1423,16 +1636,20 @@ uint8_t bluecaster_iso_send(uint16_t cis_handle, uint16_t sequence_number, const
 /* ---- Broadcast (Auracast source) ---- */
 
 /* Extended advertising (non-connectable, non-scannable) with `adv` and
- * periodic advertising with `pa` (the BASE), both started. Intervals in
- * 0.625 ms (extended) and 1.25 ms (periodic) units. */
-uint8_t bluecaster_broadcast_advertise(uint8_t sid, uint16_t adv_interval_min, uint16_t adv_interval_max,
-                                   uint16_t pa_interval_min, uint16_t pa_interval_max, const uint8_t *adv,
-                                   uint16_t adv_len, const uint8_t *pa, uint16_t pa_len, uint8_t *out_handle) {
-    if (bc_adv_in_use) return ERROR_CODE_COMMAND_DISALLOWED;
+ * periodic advertising with `pa` (the BASE), both started, in broadcast
+ * slot `slot` (the BIG handle its BIG will get). Intervals in 0.625 ms
+ * (extended) and 1.25 ms (periodic) units. */
+uint8_t bluecaster_broadcast_advertise(uint8_t slot, uint8_t sid, uint16_t adv_interval_min,
+                                   uint16_t adv_interval_max, uint16_t pa_interval_min, uint16_t pa_interval_max,
+                                   const uint8_t *adv, uint16_t adv_len, const uint8_t *pa, uint16_t pa_len,
+                                   uint8_t *out_handle) {
+    bc_slot_t *s = bc_slot(slot);
+    if (s == NULL) return ERROR_CODE_INVALID_HCI_COMMAND_PARAMETERS;
+    if (s->adv_in_use) return ERROR_CODE_COMMAND_DISALLOWED;
     if (adv_len > BLUECASTER_ADV_DATA_MAX || pa_len > BLUECASTER_ADV_DATA_MAX)
         return ERROR_CODE_INVALID_HCI_COMMAND_PARAMETERS;
-    memcpy(bc_adv_data, adv, adv_len);
-    memcpy(bc_pa_data, pa, pa_len);
+    memcpy(s->adv_data, adv, adv_len);
+    memcpy(s->pa_data, pa, pa_len);
     le_extended_advertising_parameters_t params;
     memset(&params, 0, sizeof(params));
     params.advertising_event_properties = 0; /* non-connectable, non-scannable, undirected */
@@ -1446,67 +1663,87 @@ uint8_t bluecaster_broadcast_advertise(uint8_t sid, uint16_t adv_interval_min, u
     params.advertising_sid = sid;
     bd_addr_t local;
     gap_local_bd_addr(local);
-    int random = btstack_is_null_bd_addr(local);
+    /* Slot 0 advertises from the public address; every other slot from a
+     * static random address of its own (receivers such as Android list
+     * broadcasters by address: two sets from one address show as one
+     * broadcast whose name keeps changing). Derived from the public
+     * address, so it stays the same from run to run. */
+    int random = btstack_is_null_bd_addr(local) || slot > 0;
     if (random) params.own_address_type = BD_ADDR_TYPE_LE_RANDOM;
-    uint8_t status = gap_extended_advertising_setup(&bc_adv_set, &params, &bc_adv_handle);
+    uint8_t status = gap_extended_advertising_setup(&s->adv_set, &params, &s->adv_handle);
     if (status != ERROR_CODE_SUCCESS) return status;
-    bc_adv_in_use = 1;
+    s->adv_in_use = 1;
     if (random) {
-        /* A static random address (top bits 0b11) */
-        bd_addr_t addr = {0xC2, 0xA2, 0xD0, 0x00, 0x00, 0x01};
-        gap_extended_advertising_set_random_address(bc_adv_handle, addr);
+        bd_addr_t addr;
+        if (btstack_is_null_bd_addr(local)) {
+            static const bd_addr_t fallback = {0xC2, 0xA2, 0xD0, 0x00, 0x00, 0x01};
+            memcpy(addr, fallback, 6);
+        } else {
+            memcpy(addr, local, 6);
+        }
+        /* Static random: top bits 0b11 (addr[0] is the most significant
+         * octet), one per slot */
+        addr[0] |= 0xC0;
+        addr[5] = (uint8_t)(addr[5] ^ (0x5A + slot));
+        gap_extended_advertising_set_random_address(s->adv_handle, addr);
     }
-    gap_extended_advertising_set_adv_data(bc_adv_handle, adv_len, bc_adv_data);
+    gap_extended_advertising_set_adv_data(s->adv_handle, adv_len, s->adv_data);
     le_periodic_advertising_parameters_t pa_params;
     pa_params.periodic_advertising_interval_min = pa_interval_min;
     pa_params.periodic_advertising_interval_max = pa_interval_max;
     pa_params.periodic_advertising_properties = 0;
-    gap_periodic_advertising_set_params(bc_adv_handle, &pa_params);
-    gap_periodic_advertising_set_data(bc_adv_handle, pa_len, bc_pa_data);
-    gap_periodic_advertising_start(bc_adv_handle, 0);
-    status = gap_extended_advertising_start(bc_adv_handle, 0, 0);
-    *out_handle = bc_adv_handle;
+    gap_periodic_advertising_set_params(s->adv_handle, &pa_params);
+    gap_periodic_advertising_set_data(s->adv_handle, pa_len, s->pa_data);
+    gap_periodic_advertising_start(s->adv_handle, 0);
+    status = gap_extended_advertising_start(s->adv_handle, 0, 0);
+    *out_handle = s->adv_handle;
     return status;
 }
 
-/* Stops periodic and extended advertising and removes the set */
-uint8_t bluecaster_broadcast_advertise_stop(void) {
-    if (!bc_adv_in_use) return ERROR_CODE_SUCCESS;
-    gap_periodic_advertising_stop(bc_adv_handle);
-    gap_extended_advertising_stop(bc_adv_handle);
-    uint8_t status = gap_extended_advertising_remove(bc_adv_handle);
-    bc_adv_in_use = 0;
+/* Stops periodic and extended advertising of slot `slot` and removes its
+ * set */
+uint8_t bluecaster_broadcast_advertise_stop(uint8_t slot) {
+    bc_slot_t *s = bc_slot(slot);
+    if (s == NULL || !s->adv_in_use) return ERROR_CODE_SUCCESS;
+    gap_periodic_advertising_stop(s->adv_handle);
+    gap_extended_advertising_stop(s->adv_handle);
+    uint8_t status = gap_extended_advertising_remove(s->adv_handle);
+    s->adv_in_use = 0;
     return status;
 }
 
-/* LE Create BIG on the advertising set (GAP_SUBEVENT_BIG_CREATED follows,
- * after BTstack set up the ISO data paths). `code`: 16 bytes, or NULL for
- * an unencrypted BIG. */
+/* LE Create BIG `big_handle` on the advertising set of slot `big_handle`
+ * (GAP_SUBEVENT_BIG_CREATED follows, after BTstack set up the ISO data
+ * paths). `code`: 16 bytes, or NULL for an unencrypted BIG. */
 uint8_t bluecaster_big_create(uint8_t big_handle, uint8_t num_bis, uint32_t sdu_interval_us, uint16_t max_sdu,
                           uint16_t max_transport_latency_ms, uint8_t rtn, uint8_t phy, uint8_t framing,
                           const uint8_t *code) {
-    if (!bc_adv_in_use || bc_big_in_use) return ERROR_CODE_COMMAND_DISALLOWED;
+    bc_slot_t *s = bc_slot(big_handle);
+    if (s == NULL) return ERROR_CODE_INVALID_HCI_COMMAND_PARAMETERS;
+    if (!s->adv_in_use || s->big_in_use) return ERROR_CODE_COMMAND_DISALLOWED;
     if (num_bis == 0 || num_bis > MAX_NR_BIS) return ERROR_CODE_INVALID_HCI_COMMAND_PARAMETERS;
-    memset(&bc_big_params, 0, sizeof(bc_big_params));
-    bc_big_params.big_handle = big_handle;
-    bc_big_params.advertising_handle = bc_adv_handle;
-    bc_big_params.num_bis = num_bis;
-    bc_big_params.sdu_interval_us = sdu_interval_us;
-    bc_big_params.max_sdu = max_sdu;
-    bc_big_params.max_transport_latency_ms = max_transport_latency_ms;
-    bc_big_params.rtn = rtn;
-    bc_big_params.phy = phy;
-    bc_big_params.packing = 0; /* sequential */
-    bc_big_params.framing = framing;
-    bc_big_params.encryption = code != NULL;
-    if (code != NULL) memcpy(bc_big_params.broadcast_code, code, 16);
-    uint8_t status = gap_big_create(&bc_big, &bc_big_params);
-    if (status == ERROR_CODE_SUCCESS) bc_big_in_use = 1;
+    le_audio_big_params_t *p = &s->big_params;
+    memset(p, 0, sizeof(*p));
+    p->big_handle = big_handle;
+    p->advertising_handle = s->adv_handle;
+    p->num_bis = num_bis;
+    p->sdu_interval_us = sdu_interval_us;
+    p->max_sdu = max_sdu;
+    p->max_transport_latency_ms = max_transport_latency_ms;
+    p->rtn = rtn;
+    p->phy = phy;
+    p->packing = 0; /* sequential */
+    p->framing = framing;
+    p->encryption = code != NULL;
+    if (code != NULL) memcpy(p->broadcast_code, code, 16);
+    uint8_t status = gap_big_create(&s->big, p);
+    if (status == ERROR_CODE_SUCCESS) s->big_in_use = 1;
     return status;
 }
 
 /* LE Terminate BIG (GAP_SUBEVENT_BIG_TERMINATED follows) */
 uint8_t bluecaster_big_terminate(uint8_t big_handle) {
-    if (!bc_big_in_use) return ERROR_CODE_COMMAND_DISALLOWED;
+    bc_slot_t *s = bc_slot(big_handle);
+    if (s == NULL || !s->big_in_use) return ERROR_CODE_COMMAND_DISALLOWED;
     return gap_big_terminate(big_handle);
 }
