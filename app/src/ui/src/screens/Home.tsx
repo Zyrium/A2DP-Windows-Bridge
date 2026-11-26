@@ -45,7 +45,7 @@ import {
   type AudioEntry,
   type HeadsetMode,
 } from "../lib/profile";
-import { chooseCodec, codecShown, pickedCodec, saveHeadsetMic, settle, settling, streamingCodec } from "./Codecs";
+import { chooseCodec, chooseQuality, codecShown, pickedCodec, saveHeadsetMic, settle, settling, streamingCodec } from "./Codecs";
 
 /** Adapters whose firmware files are missing from the settings folder or
  *  invalid (v1's "Firmware not found!" / "Firmware file is invalid!" bar).
@@ -569,17 +569,10 @@ function BitratePicker(props: { entry: AudioEntry }) {
   const sampleRate = () => (autoAll() ? 0 : (e().profile?.sample_rate ?? 0));
   const currentQuality = () => (autoAll() ? "hq" : (e().profile?.quality ?? "hq"));
   const abr = () => !autoAll() && (e().profile?.abr ?? false);
-  const maxBitrate = () => {
-    const id = codecId();
-    if (!id) return 0;
-    const known = knownCodecs(snap().devices, e().address);
-    const cap = known.find((c) => c.codec === id);
-    return cap?.max_bitrate ?? 0;
-  };
   const qualities = () => {
     const id = codecId();
     if (!id || qualityIgnored(id, abr())) return [];
-    const list = offeredQualities(id, sampleRate(), maxBitrate(), currentQuality());
+    const list = offeredQualities(id, sampleRate(), 0, currentQuality());
     return list.length > 1 ? list : [];
   };
   const [busy, setBusy] = createSignal(false);
@@ -593,7 +586,7 @@ function BitratePicker(props: { entry: AudioEntry }) {
     setBusy(true);
     const ok =
       (!autoAll() || (await saveSettings(app, { auto_codec: false }))) &&
-      (await chooseCodec(app, e(), id, { quality: q })) !== null;
+      (await chooseQuality(app, e(), id, q)) !== null;
     setBusy(false);
     if (ok && running && mounted) settle(app);
     if (!ok && select) select.value = currentQuality();

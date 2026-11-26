@@ -239,6 +239,19 @@ export function chooseCodec(
   });
 }
 
+/** Saves the device's profile with `codec` and `quality` (bitrate) chosen. */
+export function chooseQuality(
+  app: ReturnType<typeof useApp>,
+  entry: AudioEntry,
+  codec: string,
+  quality: string,
+): Promise<string | null> {
+  return saveEntry(app, entry, (base) => {
+    if (entry.le_audio) return base;
+    return { ...withCodec(base, codec), quality };
+  });
+}
+
 /** A codec order as a profile keeps it: none for the default one */
 function orderKeys(order: readonly CodecId[]): string[] {
   return isDefaultOrder(order) ? [] : [...order];
