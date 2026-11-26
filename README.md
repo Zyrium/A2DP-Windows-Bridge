@@ -4,11 +4,16 @@ Fork of **[SeiyaFunaokaJP/BlueCaster](https://github.com/SeiyaFunaokaJP/BlueCast
 
 ## Fork Additions
 
-- **QCY MeloBuds N70 control (`Fones` / `Earbuds` screen)** via the [`qcy-protocol`](app/src/crates/qcy-protocol) crate and plain BLE GATT links (no pairing required, without interrupting A2DP/LDAC playback):
+- **QCY MeloBuds N70 control (`Fones` / `Earbuds` screen)** via the [`qcy-protocol`](app/src/crates/qcy-protocol) crate and plain BLE GATT links (no pairing required, works alongside Classic A2DP/LDAC without needing LE Audio or Developer mode):
+  - Automatic state refresh when the earbuds connect
   - Live battery levels (left, right, case, charging state) and firmware version
   - Noise control: Off, Noise Cancelling (ANC with Adaptive, Indoor, Commuting, Noisy, and Anti-wind scenes), and Transparency
   - Modes: Game mode, Sleep mode, and Wind reduction
-  - Wear detection (with read-back confirmation) and Prompt volume (read-only)
+  - Equalizer & gestures: 10-band parametric EQ (8 presets + custom) and touch gesture mapping (double tap / long press)
+  - Earbud settings: Wear detection, LDAC toggle, Multipoint toggle, Auto power-off (Never / 5 / 15 / 30 / 60 min), and Prompt volume (read-only)
+- **Home screen bitrate / quality selector**:
+  - Quick bitrate picker right on the **Home** (`Início`) device card for codecs with multiple quality levels
+  - Quality/bitrate levels exposed for **SBC XQ** (`~552` / `~512` / `~385` kbps), **SBC** (`~345` / `~229` / `~133` kbps), and **AAC** (`256` / `192` / `128` kbps), in addition to **LDAC** and **LHDC V5**
 - **Brazilian Portuguese (`pt-BR`)**: complete UI translation ([`app/lang/pt-BR.json`](app/lang/pt-BR.json)) updated for **v3.0.4**.
 - **Automated Windows x64 releases**: GitHub Actions workflow ([`.github/workflows/release.yml`](.github/workflows/release.yml)) building `-win64-setup.exe`, `-win64-portable.zip`, and `-win64-symbols.zip`.
 
@@ -22,7 +27,7 @@ Fork of **[SeiyaFunaokaJP/BlueCaster](https://github.com/SeiyaFunaokaJP/BlueCast
 
 ![BlueCaster's Codecs screen, streaming LDAC 990 kbps / 96 kHz to Sony WH-1000XM4, with its card above Windows Quick Settings](docs/images/app_sample.png)
 
-**[Download (Fork Releases)](https://github.com/Zyrium/A2DP-Windows-Bridge/releases)** (installer `-win64-setup.exe` or `-win64-portable.zip`) | **[Upstream](https://github.com/SeiyaFunaokaJP/BlueCaster)** | **[Documentation](https://seiyafunaokajp.github.io/BlueCaster/)**
+**[Download (Fork Releases)](https://github.com/Zyrium/A2DP-Windows-Bridge/releases)** (installer `-win64-setup.exe` or `-win64-portable.zip`) | **[Changelog](CHANGELOG.md)** | **[Upstream](https://github.com/SeiyaFunaokaJP/BlueCaster)** | **[Documentation](https://seiyafunaokajp.github.io/BlueCaster/)**
 
 ## Codecs
 
