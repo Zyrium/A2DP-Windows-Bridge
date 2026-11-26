@@ -2458,6 +2458,7 @@ impl CoreState {
                 if le_scanning != s.le_scanning {
                     self.publish(Event::LeScanning(le_scanning));
                 }
+                let was_streaming = stream.state == StreamState::Streaming;
                 stream.state = match state {
                     CoreStreamState::Idle => StreamState::Idle,
                     CoreStreamState::Connecting => StreamState::Connecting,
@@ -2535,7 +2536,7 @@ impl CoreState {
                 if state == CoreStreamState::Connecting {
                     stream.profile = self.starting_profile.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 }
-                if state == CoreStreamState::Streaming && stream.state != StreamState::Streaming {
+                if state == CoreStreamState::Streaming && !was_streaming {
                     let name = streamed_device(&s).unwrap_or("");
                     let addr = s
                         .stream
