@@ -33,7 +33,7 @@ import {
 } from "../components/stream";
 import { t, tm } from "../i18n";
 import { IpcError, type AdapterInfo, type Snapshot, type StreamState } from "../ipc/types";
-import { CARD_ORDER, cardOf, cardOrder, codecSpec, offeredCodecs } from "../lib/codecs";
+import { CARD_ORDER, cardOf, cardOrder, codecSpec, offeredCodecs, offeredQualities, qualityIgnored } from "../lib/codecs";
 import {
   audioEntries,
   codecsOnRequest,
@@ -346,7 +346,7 @@ function DeviceCard(props: { entry: AudioEntry; onError: (e: unknown) => void })
             </div>
           </div>
           <Show when={live()}>
-            <CodecBadge picker={<CodecPicker entry={props.entry} />} />
+            <CodecBadge picker={<CodecPicker entry={props.entry} />} aside={<BitratePicker entry={props.entry} />} />
             <MicRow entry={props.entry} />
           </Show>
           {/* The application it captures is not playing yet (the source is
@@ -542,6 +542,76 @@ export function CodecPicker(props: { entry: AudioEntry }) {
             {(id) => (
               <option value={id} selected={value() === id}>
                 {t(codecSpec(id).label)}
+              </option>
+            )}
+          </For>
+        </select>
+        <Icon name="chevron_down" class="select-chevron" />
+      </div>
+    </Show>
+  );
+}
+
+/** Bitrate / quality picker shown next to the codec details on Home when the
+ *  active codec supports more than one quality level. */
+function BitratePicker(props: { entry: AudioEntry }) {
+  const app = useApp();
+  const snap = () => app.core.state.snap!;
+  const e = () => props.entry;
+  const autoAll = () => snap().settings.auto_codec;
+  const order = () => cardOrder(e().profile?.codec_order ?? []);
+  const codecId = () => {
+    if (e().le_audio) return null;
+    const live = streamingCodec(snap(), e());
+    if (live) return live;
+    return pickedCodec(snap(), e(), autoAll(), order());
+  };
+  const sampleRate = () => (autoAll() ? 0 : (e().profile?.sample_rate ?? 0));
+  const currentQuality = () => (autoAll() ? "hq" : (e().profile?.quality ?? "hq"));
+  const abr = () => !autoAll() && (e().profile?.abr ?? false);
+  const maxBitrate = () => {
+    const id = codecId();
+    if (!id) return 0;
+    const known = knownCodecs(snap().devices, e().address);
+    const cap = known.find((c) => c.codec === id);
+    return cap?.max_bitrate ?? 0;
+  };
+  const qualities = () => {
+    const id = codecId();
+    if (!id || qualityIgnored(id, abr())) return [];
+    const list = offeredQualities(id, sampleRate(), maxBitrate(), currentQuality());
+    return list.length > 1 ? list : [];
+  };
+  const [busy, setBusy] = createSignal(false);
+  let select: HTMLSelectElement | undefined;
+  let mounted = true;
+  onCleanup(() => (mounted = false));
+  const choose = async (q: string) => {
+    const id = codecId();
+    if (!id || q === currentQuality()) return;
+    const running = entryState(snap(), e()) !== "idle" && entryState(snap(), e()) !== "error";
+    setBusy(true);
+    const ok =
+      (!autoAll() || (await saveSettings(app, { auto_codec: false }))) &&
+      (await chooseCodec(app, e(), id, { quality: q })) !== null;
+    setBusy(false);
+    if (ok && running && mounted) settle(app);
+    if (!ok && select) select.value = currentQuality();
+  };
+  return (
+    <Show when={qualities().length > 0}>
+      <div class="select codec-picker">
+        <select
+          ref={select}
+          aria-label={t("connection.quality")}
+          disabled={busy() || settling()}
+          aria-busy={busy() || settling() ? "true" : undefined}
+          onChange={(ev) => void choose(ev.currentTarget.value)}
+        >
+          <For each={qualities()}>
+            {(q) => (
+              <option value={q.id} selected={currentQuality() === q.id}>
+                {q.kbps ? `${q.kbps} kbps` : t(q.label)}
               </option>
             )}
           </For>

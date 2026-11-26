@@ -174,7 +174,11 @@ export const CODECS: CodecSpec[] = [
     id: "aac",
     label: "codec.aac",
     bars: { quality: 3, latency: 2, stability: 4 },
-    qualities: [{ id: "hq", label: HQ, kbps: "256" }],
+    qualities: [
+      { id: "hq", label: HQ, kbps: "256" },
+      { id: "sq", label: MEDIUM, kbps: "192" },
+      { id: "mq", label: LOW, kbps: "128" },
+    ],
     abr: false,
     vbr: true,
     hiRes: false,
@@ -186,7 +190,11 @@ export const CODECS: CodecSpec[] = [
     label: "codec.sbc_xq",
     bars: { quality: 3, latency: 3, stability: 3 },
     // High: the highest bitpool the device takes (or the one set)
-    qualities: [{ id: "hq", label: HQ, kbps: "~552" }],
+    qualities: [
+      { id: "hq", label: HQ, kbps: "~552" },
+      { id: "sq", label: MEDIUM, kbps: "~512" },
+      { id: "mq", label: LOW, kbps: "~385" },
+    ],
     // Adaptive bitpool, down to Mobile's (core: SBC ABR only when the
     // profile asks for SBC / SBC XQ itself)
     abr: true,
@@ -197,7 +205,11 @@ export const CODECS: CodecSpec[] = [
     id: "sbc",
     label: "codec.sbc",
     bars: { quality: 2, latency: 3, stability: 5 },
-    qualities: [{ id: "hq", label: HQ, kbps: "~345" }],
+    qualities: [
+      { id: "hq", label: HQ, kbps: "~345" },
+      { id: "sq", label: MEDIUM, kbps: "~229" },
+      { id: "mq", label: LOW, kbps: "~133" },
+    ],
     abr: true,
     bitpool: true,
     hiRes: false,
